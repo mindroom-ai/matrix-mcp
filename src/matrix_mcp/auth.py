@@ -5,8 +5,8 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
-from nio import AsyncClient, LoginResponse
-from pydantic import BaseModel, ConfigDict
+from nio import AsyncClient, AsyncClientConfig, LoginResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.config import MatrixMCPConfig
 
@@ -24,6 +24,7 @@ class LoginResult(BaseModel):
     user_id: str
     device_id: str | None
     access_token: str
+    http_headers: dict[str, str] = Field(default_factory=dict)
 
     def to_config(self) -> MatrixMCPConfig:
         return MatrixMCPConfig(
@@ -31,6 +32,7 @@ class LoginResult(BaseModel):
             user_id=self.user_id,
             device_id=self.device_id,
             access_token=self.access_token,
+            http_headers=self.http_headers,
         )
 
 
@@ -54,11 +56,27 @@ def parse_sso_providers(login_response: dict[str, Any]) -> list[SSOProvider]:
     return providers
 
 
-def fetch_sso_providers(homeserver: str) -> list[SSOProvider]:
+def fetch_sso_providers(
+    homeserver: str,
+    *,
+    http_headers: dict[str, str] | None = None,
+) -> list[SSOProvider]:
     url = f"{homeserver.rstrip('/')}/_matrix/client/v3/login"
-    response = httpx.get(url, timeout=10)
+    response = httpx.get(url, headers=http_headers, timeout=10)
+    _raise_for_redirect(response)
     response.raise_for_status()
     return parse_sso_providers(response.json())
+
+
+def parse_http_headers(header_values: list[str] | None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for raw_header in header_values or []:
+        name, separator, value = raw_header.partition(":")
+        if not separator or not name.strip() or not value.strip():
+            msg = f"Invalid header {raw_header!r}; expected 'Name: value'"
+            raise ValueError(msg)
+        headers[name.strip()] = value.strip()
+    return headers
 
 
 def extract_login_token(query: str) -> str:
@@ -113,8 +131,13 @@ async def login_with_password(
     user: str,
     password: str,
     device_name: str = "matrix-mcp",
+    http_headers: dict[str, str] | None = None,
 ) -> LoginResult:
-    client = AsyncClient(homeserver.rstrip("/"), user)
+    client = AsyncClient(
+        homeserver.rstrip("/"),
+        user,
+        config=AsyncClientConfig(custom_headers=http_headers or None),
+    )
     try:
         response = await client.login(password=password, device_name=device_name)
     finally:
@@ -125,6 +148,7 @@ async def login_with_password(
             user_id=response.user_id,
             device_id=response.device_id,
             access_token=response.access_token,
+            http_headers=http_headers or {},
         )
     msg = f"Matrix password login failed: {response}"
     raise RuntimeError(msg)
@@ -135,6 +159,7 @@ async def login_with_token(
     homeserver: str,
     login_token: str,
     device_name: str = "matrix-mcp",
+    http_headers: dict[str, str] | None = None,
     http_client: httpx.AsyncClient | None = None,
 ) -> LoginResult:
     normalized_homeserver = homeserver.rstrip("/")
@@ -144,14 +169,16 @@ async def login_with_token(
             homeserver=normalized_homeserver,
             login_token=login_token,
             device_name=device_name,
+            http_headers=http_headers or {},
         )
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(headers=http_headers, timeout=10) as client:
         return await _login_with_token_http(
             http_client=client,
             homeserver=normalized_homeserver,
             login_token=login_token,
             device_name=device_name,
+            http_headers=http_headers or {},
         )
 
 
@@ -161,15 +188,18 @@ async def _login_with_token_http(
     homeserver: str,
     login_token: str,
     device_name: str,
+    http_headers: dict[str, str],
 ) -> LoginResult:
     response = await http_client.post(
         f"{homeserver}/_matrix/client/v3/login",
+        headers=http_headers,
         json={
             "type": "m.login.token",
             "token": login_token,
             "initial_device_display_name": device_name,
         },
     )
+    _raise_for_redirect(response)
     response.raise_for_status()
     data = _response_json_object(response, context="Matrix token login response")
 
@@ -181,6 +211,7 @@ async def _login_with_token_http(
             http_client=http_client,
             homeserver=homeserver,
             access_token=access_token,
+            http_headers=http_headers,
         )
 
     return LoginResult(
@@ -188,6 +219,7 @@ async def _login_with_token_http(
         user_id=user_id,
         device_id=device_id if isinstance(device_id, str) else None,
         access_token=access_token,
+        http_headers=http_headers,
     )
 
 
@@ -196,14 +228,30 @@ async def _fetch_user_id(
     http_client: httpx.AsyncClient,
     homeserver: str,
     access_token: str,
+    http_headers: dict[str, str],
 ) -> str:
     response = await http_client.get(
         f"{homeserver}/_matrix/client/v3/account/whoami",
-        headers={"Authorization": f"Bearer {access_token}"},
+        headers={**http_headers, "Authorization": f"Bearer {access_token}"},
     )
+    _raise_for_redirect(response)
     response.raise_for_status()
     data = _response_json_object(response, context="Matrix whoami response")
     return _required_string(data, "user_id", context="Matrix whoami response")
+
+
+def _raise_for_redirect(response: httpx.Response) -> None:
+    if not response.is_redirect:
+        return
+    location = response.headers.get("location")
+    msg = (
+        "Matrix API request was redirected before authentication completed. "
+        "This usually means the CLI cannot reach the Matrix API directly or must send "
+        "additional HTTP headers for an upstream access gateway."
+    )
+    if location:
+        msg = f"{msg} Redirect location: {location}"
+    raise RuntimeError(msg)
 
 
 def _response_json_object(response: httpx.Response, *, context: str) -> dict[str, Any]:

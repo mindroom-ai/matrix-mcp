@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from typer.testing import CliRunner
 
 from matrix_mcp.cli import app
+from matrix_mcp.config import MatrixMCPConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,9 +36,40 @@ def test_auth_logout_is_idempotent(tmp_path: Path) -> None:
     assert "No Matrix MCP credentials found" in result.output
 
 
+def test_auth_token_stores_extra_http_headers(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--device-id",
+            "TESTDEVICE",
+            "--header",
+            "X-Access: secret",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = MatrixMCPConfig.load(config)
+    assert saved.http_headers == {"X-Access": "secret"}
+
+
 def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_fetch_sso_providers(homeserver: str) -> list[SimpleNamespace]:
+    def fake_fetch_sso_providers(
+        homeserver: str,
+        *,
+        http_headers: dict[str, str] | None = None,
+    ) -> list[SimpleNamespace]:
         assert homeserver == "https://matrix.example.com"
+        assert http_headers == {"X-Access": "secret"}
         return [
             SimpleNamespace(id="google", name="Google", brand="google"),
             SimpleNamespace(id="github", name="GitHub", brand="github"),
@@ -46,7 +78,16 @@ def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("matrix_mcp.cli._fetch_sso_providers", fake_fetch_sso_providers)
     runner = CliRunner()
 
-    result = runner.invoke(app, ["auth", "providers", "https://matrix.example.com"])
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "providers",
+            "https://matrix.example.com",
+            "--header",
+            "X-Access: secret",
+        ],
+    )
 
     assert result.exit_code == 0
     assert "google\tGoogle" in result.output

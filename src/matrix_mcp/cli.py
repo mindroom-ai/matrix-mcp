@@ -32,17 +32,20 @@ def auth_token(
     user_id: str = typer.Argument(..., help="Matrix user ID, e.g. @alice:example.com"),
     access_token: str = typer.Argument(..., help="Matrix access token"),
     device_id: str | None = typer.Option(None, help="Optional Matrix device ID"),
+    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
     """Store an existing Matrix access token."""
     from matrix_mcp.config import MatrixMCPConfig
 
     config_path = _resolve_config_path(config)
+    http_headers = _parse_http_headers(header)
     MatrixMCPConfig(
         homeserver=homeserver.rstrip("/"),
         user_id=user_id,
         device_id=device_id,
         access_token=access_token,
+        http_headers=http_headers,
     ).save(config_path)
     typer.echo(f"Saved Matrix MCP credentials to {config_path}")
 
@@ -53,18 +56,21 @@ def auth_password(
     user: str = typer.Argument(..., help="Matrix user ID or localpart"),
     password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=False),
     device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
+    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
     """Login using Matrix password auth and store the resulting access token."""
     from matrix_mcp.auth import login_with_password
 
     config_path = _resolve_config_path(config)
+    http_headers = _parse_http_headers(header)
     result = asyncio.run(
         login_with_password(
             homeserver=homeserver,
             user=user,
             password=password,
             device_name=device_name,
+            http_headers=http_headers,
         ),
     )
     result.to_config().save(config_path)
@@ -90,9 +96,10 @@ def auth_sso_url(
 @auth_app.command("providers")
 def auth_providers(
     homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
+    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
 ) -> None:
     """List Matrix SSO provider IDs for a homeserver."""
-    providers = _fetch_sso_providers(homeserver)
+    providers = _fetch_sso_providers(homeserver, http_headers=_parse_http_headers(header))
     if not providers:
         typer.echo("No Matrix SSO providers advertised by this homeserver.")
         return
@@ -108,12 +115,14 @@ def auth_sso(
     callback_host: str = typer.Option("127.0.0.1", help="Local callback bind host"),
     callback_port: int = typer.Option(8767, help="Local callback bind port"),
     device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
+    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
     """Login through Matrix SSO in a browser and save the resulting access token."""
     from matrix_mcp.auth import SSOCallbackServer, build_sso_redirect_url, login_with_token
 
     config_path = _resolve_config_path(config)
+    http_headers = _parse_http_headers(header)
     callback = SSOCallbackServer(host=callback_host, port=callback_port)
     url = build_sso_redirect_url(
         homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
@@ -126,6 +135,7 @@ def auth_sso(
             homeserver=homeserver,
             login_token=login_token,
             device_name=device_name,
+            http_headers=http_headers,
         ),
     )
     result.to_config().save(config_path)
@@ -137,17 +147,20 @@ def auth_login_token(
     homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
     login_token: str = typer.Argument(..., help="Single-use Matrix m.login.token value"),
     device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
+    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
     """Exchange a Matrix SSO loginToken for an access token and save it."""
     from matrix_mcp.auth import login_with_token
 
     config_path = _resolve_config_path(config)
+    http_headers = _parse_http_headers(header)
     result = asyncio.run(
         login_with_token(
             homeserver=homeserver,
             login_token=login_token,
             device_name=device_name,
+            http_headers=http_headers,
         ),
     )
     result.to_config().save(config_path)
@@ -175,16 +188,26 @@ def _resolve_config_path(config: Path | None) -> Path:
     return default_config_path()
 
 
+def _parse_http_headers(header_values: list[str] | None) -> dict[str, str]:
+    from matrix_mcp.auth import parse_http_headers
+
+    return parse_http_headers(header_values)
+
+
 class ProviderLike(Protocol):
     id: str
     name: str | None
     brand: str | None
 
 
-def _fetch_sso_providers(homeserver: str) -> list[ProviderLike]:
+def _fetch_sso_providers(
+    homeserver: str,
+    *,
+    http_headers: dict[str, str] | None = None,
+) -> list[ProviderLike]:
     from matrix_mcp.auth import fetch_sso_providers
 
-    return list(fetch_sso_providers(homeserver))
+    return list(fetch_sso_providers(homeserver, http_headers=http_headers))
 
 
 def _provider_label(provider: ProviderLike) -> str:

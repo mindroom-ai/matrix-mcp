@@ -6,6 +6,7 @@ from typing import Protocol, cast
 
 from nio import (
     AsyncClient,
+    AsyncClientConfig,
     JoinedRoomsResponse,
     MessageDirection,
     RoomGetEventResponse,
@@ -75,7 +76,11 @@ class NioMatrixDriver:
             msg = "Matrix credentials are incomplete. Run `matrix-mcp auth` first."
             raise RuntimeError(msg)
         self._config = config
-        self._client = AsyncClient(config.normalized_homeserver, config.user_id)
+        self._client = AsyncClient(
+            config.normalized_homeserver,
+            config.user_id,
+            config=AsyncClientConfig(custom_headers=config.http_headers or None),
+        )
         self._client.restore_login(
             user_id=config.user_id,
             device_id=config.device_id,

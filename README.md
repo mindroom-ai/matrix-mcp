@@ -46,6 +46,15 @@ Then pass the provider ID explicitly:
 matrix-mcp auth sso https://matrix.example.com --idp-id github
 ```
 
+If your homeserver is behind an access gateway that requires extra request headers, pass them during login.
+They are stored with the Matrix credentials and reused by MCP tools:
+
+```bash
+matrix-mcp auth sso https://matrix.example.com \
+  --header "X-Access-Client-Id: ..." \
+  --header "X-Access-Client-Secret: ..."
+```
+
 Existing Matrix access token:
 
 ```bash
