@@ -10,7 +10,7 @@ class FakeMatrixClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str | None]] = []
 
-    async def whoami(self) -> dict[str, str]:
+    async def whoami(self) -> dict[str, str | None]:
         return {"user_id": "@alice:example.com", "device_id": "CLAUDECODE"}
 
     async def list_rooms(self) -> list[MatrixRoom]:
@@ -37,9 +37,12 @@ class FakeMatrixClient:
 @pytest.mark.asyncio
 async def test_tools_return_pydantic_models() -> None:
     matrix = FakeMatrixClient()
-    tools = MatrixMCPTools(client_factory=lambda: matrix)  # type: ignore[arg-type]
+    tools = MatrixMCPTools(client_factory=lambda: matrix)
 
-    assert await tools.matrix_whoami() == {"user_id": "@alice:example.com", "device_id": "CLAUDECODE"}
+    assert await tools.matrix_whoami() == {
+        "user_id": "@alice:example.com",
+        "device_id": "CLAUDECODE",
+    }
     assert await tools.matrix_list_rooms() == [MatrixRoom(room_id="!mind:example.com", name="Mind")]
     assert await tools.matrix_read_room_recent("!mind:example.com", limit=5) == [
         MatrixEvent(

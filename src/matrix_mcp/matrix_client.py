@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, cast
 
 from nio import (
     AsyncClient,
@@ -40,14 +40,21 @@ class MatrixDriver(Protocol):
 
     async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]: ...
 
-    async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str: ...
+    async def send_message(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        thread_id: str | None = None,
+    ) -> str: ...
 
 
 class NioMatrixDriver:
     def __init__(self, config: MatrixMCPConfig) -> None:
         token = config.access_token_value()
         if not token or not config.user_id or not config.device_id:
-            raise RuntimeError("Matrix credentials are incomplete. Run `matrix-mcp auth` first.")
+            msg = "Matrix credentials are incomplete. Run `matrix-mcp auth` first."
+            raise RuntimeError(msg)
         self._config = config
         self._client = AsyncClient(config.normalized_homeserver, config.user_id)
         self._client.restore_login(
@@ -61,12 +68,13 @@ class NioMatrixDriver:
 
     async def list_rooms(self) -> list[MatrixRoom]:
         response = await self._client.joined_rooms()
-        if not isinstance(response, JoinedRoomsResponse):
-            raise RuntimeError(f"Matrix joined_rooms failed: {response}")
-        rooms: list[MatrixRoom] = []
-        for room_id in response.rooms:
-            rooms.append(MatrixRoom(room_id=room_id, name=await self._room_name(room_id)))
-        return rooms
+        if isinstance(response, JoinedRoomsResponse):
+            return [
+                MatrixRoom(room_id=room_id, name=await self._room_name(room_id))
+                for room_id in response.rooms
+            ]
+        msg = f"Matrix joined_rooms failed: {response}"
+        raise RuntimeError(msg)
 
     async def _room_name(self, room_id: str) -> str | None:
         response = await self._client.room_get_state_event(room_id, "m.room.name")
@@ -81,9 +89,10 @@ class NioMatrixDriver:
             direction=MessageDirection.back,
             limit=max(1, min(limit, 100)),
         )
-        if not isinstance(response, RoomMessagesResponse):
-            raise RuntimeError(f"Matrix room_messages failed: {response}")
-        return [event for raw in response.chunk if (event := _event_from_nio(raw)) is not None]
+        if isinstance(response, RoomMessagesResponse):
+            return [event for raw in response.chunk if (event := _event_from_nio(raw)) is not None]
+        msg = f"Matrix room_messages failed: {response}"
+        raise RuntimeError(msg)
 
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         content: dict[str, object] = {
@@ -97,9 +106,10 @@ class NioMatrixDriver:
                 "rel_type": "m.thread",
             }
         response = await self._client.room_send(room_id, "m.room.message", content)
-        if not isinstance(response, RoomSendResponse):
-            raise RuntimeError(f"Matrix room_send failed: {response}")
-        return response.event_id
+        if isinstance(response, RoomSendResponse):
+            return cast("str", response.event_id)
+        msg = f"Matrix room_send failed: {response}"
+        raise RuntimeError(msg)
 
     async def aclose(self) -> None:
         await self._client.close()
@@ -112,9 +122,10 @@ class MatrixAPIClient:
         *,
         driver: MatrixDriver | None = None,
     ) -> None:
-        if driver is None and config is None:
-            config = MatrixMCPConfig.load()
-        self._driver = driver or NioMatrixDriver(config)  # type: ignore[arg-type]
+        if driver is not None:
+            self._driver = driver
+            return
+        self._driver = NioMatrixDriver(config or MatrixMCPConfig.load())
 
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()

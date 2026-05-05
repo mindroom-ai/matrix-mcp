@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "matrix-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A Matrix MCP server for connecting coding agents to Matrix and MindRoom conversations."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{ name = "MindRoom" }]
 dependencies = [
   "fastmcp>=2.12",
-  "matrix-nio>=0.25",
+  "mindroom-nio>=0.25",
   "platformdirs>=4.3",
   "pydantic>=2.11",
   "pydantic-settings>=2.9",
@@ -22,13 +22,22 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "mypy>=1.14",
+  "pre-commit>=4",
   "pytest>=8.4",
   "pytest-asyncio>=1.0",
   "ruff>=0.13",
+  "ty",
 ]
 
 [project.scripts]
 matrix-mcp = "matrix_mcp.cli:app"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/matrix_mcp/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/matrix_mcp"]
@@ -38,14 +47,50 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 110
+line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["ALL"]
+ignore = [
+  "D",       # pydocstyle
+  "ANN",     # annotations
+  "COM812",  # trailing comma
+  "ISC001",  # implicit string concat
+  "T20",     # print statements are acceptable for CLI output
+]
 
 [tool.ruff.lint.per-file-ignores]
-"src/matrix_mcp/cli.py" = ["B008"]
+"src/matrix_mcp/cli.py" = [
+  "B008",    # Typer uses Option/Argument defaults intentionally
+  "FBT001",  # Typer boolean options are command-line flags
+  "FBT003",  # Typer boolean option defaults are command-line flag defaults
+  "PLR0913", # CLI commands naturally expose several command-line options
+  "TC003",   # Typer resolves annotations at runtime
+]
+"src/matrix_mcp/config.py" = [
+  "S105", # redaction placeholder is intentionally not a real token
+]
+"tests/*" = [
+  "S101",    # assert usage is fine in tests
+  "PLR2004", # magic values are fine in tests
+  "S105",    # test tokens
+  "S106",    # test tokens
+]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+packages = ["matrix_mcp"]
+
+[[tool.mypy.overrides]]
+module = ["nio"]
+ignore_missing_imports = true
+
+[tool.ty.rules]
+unused-ignore-comment = "ignore"

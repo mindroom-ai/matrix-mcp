@@ -1,6 +1,14 @@
 # Matrix MCP
 
-Matrix MCP is a local-first MCP server that lets Claude Code and other MCP clients read and write Matrix rooms.
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-plugins-blue)](https://docs.mindroom.chat/plugins/)
+[![MCP](https://img.shields.io/badge/MCP-server-blue)](https://modelcontextprotocol.io/)
+
+<img src="https://media.githubusercontent.com/media/mindroom-ai/mindroom/refs/heads/main/frontend/public/logo.png" alt="MindRoom Logo" align="right" width="120" />
+
+Local-first Matrix access for MCP clients.
+
+Matrix MCP lets Claude Code and other MCP clients read and write Matrix rooms.
 It is intended to make MindRoom conversations available to local coding agents without giving hosted agents access to the local filesystem.
 
 ## Install
@@ -66,5 +74,7 @@ The tool instructions tell clients to prefer read tools first and only send mess
 uv run --extra dev pytest
 uv run --extra dev ruff check .
 uv run --extra dev ruff format --check .
+uv run --extra dev mypy src tests
+uv run --extra dev ty check
 uv build
 ```

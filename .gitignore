@@ -8,3 +8,4 @@ dist/
 build/
 *.egg-info/
 .matrix-mcp/
+src/matrix_mcp/_version.py

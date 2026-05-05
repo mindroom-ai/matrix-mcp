@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from matrix_mcp.config import AuthConfig, MatrixMCPConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_config_round_trips_token_auth(tmp_path: Path) -> None:

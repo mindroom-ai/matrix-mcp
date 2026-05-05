@@ -7,7 +7,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from matrix_mcp.auth import SSOCallbackServer, build_sso_redirect_url, login_with_password, login_with_token
+from matrix_mcp.auth import (
+    SSOCallbackServer,
+    build_sso_redirect_url,
+    login_with_password,
+    login_with_token,
+)
 from matrix_mcp.config import MatrixMCPConfig, default_config_path
 from matrix_mcp.mcp_server import create_mcp_server
 
@@ -93,7 +98,9 @@ def auth_sso(
 ) -> None:
     """Login through Matrix SSO in a browser and save the resulting access token."""
     callback = SSOCallbackServer(host=callback_host, port=callback_port)
-    url = build_sso_redirect_url(homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id)
+    url = build_sso_redirect_url(
+        homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
+    )
     console.print(f"Opening Matrix SSO URL: {url}")
     webbrowser.open(url)
     login_token = callback.wait_for_token()

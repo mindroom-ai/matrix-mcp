@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 
-from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom
+from matrix_mcp.matrix_client import MatrixAPIClient, MatrixDriver, MatrixEvent, MatrixRoom
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class MatrixMCPTools:
-    def __init__(self, client_factory: Callable[[], MatrixAPIClient] = MatrixAPIClient) -> None:
+    def __init__(self, client_factory: Callable[[], MatrixDriver] = MatrixAPIClient) -> None:
         self._client_factory = client_factory
 
     async def matrix_whoami(self) -> dict[str, str | None]:
@@ -34,7 +37,7 @@ class MatrixMCPTools:
         return {"event_id": event_id}
 
 
-def create_mcp_server(client_factory: Callable[[], MatrixAPIClient] = MatrixAPIClient) -> FastMCP:
+def create_mcp_server(client_factory: Callable[[], MatrixDriver] = MatrixAPIClient) -> FastMCP:
     mcp = FastMCP(
         "matrix-mcp",
         instructions=(

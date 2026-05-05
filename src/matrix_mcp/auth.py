@@ -35,7 +35,8 @@ def extract_login_token(query: str) -> str:
     values = parse_qs(query, keep_blank_values=False)
     token = values.get("loginToken", [None])[0]
     if not token:
-        raise ValueError("Matrix SSO callback did not include loginToken")
+        msg = "Matrix SSO callback did not include loginToken"
+        raise ValueError(msg)
     return token
 
 
@@ -47,7 +48,7 @@ class SSOCallbackServer:
         owner = self
 
         class CallbackHandler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 try:
                     owner.token = extract_login_token(urlsplit(self.path).query)
                     self.send_response(200)
@@ -59,8 +60,8 @@ class SSOCallbackServer:
                     self.end_headers()
                     self.wfile.write(b"Matrix MCP login failed. Return to the terminal.")
 
-            def log_message(self, _format: str, *_args: object) -> None:
-                return
+            def log_message(self, format: str, *_args: object) -> None:  # noqa: A002
+                del format, _args
 
         self._server = HTTPServer((host, port), CallbackHandler)
         self.redirect_url = f"http://{host}:{self._server.server_port}/callback"
@@ -71,7 +72,8 @@ class SSOCallbackServer:
         if self.error is not None:
             raise self.error
         if self.token is None:
-            raise RuntimeError("Matrix SSO callback did not complete")
+            msg = "Matrix SSO callback did not complete"
+            raise RuntimeError(msg)
         return self.token
 
 
@@ -87,14 +89,15 @@ async def login_with_password(
         response = await client.login(password=password, device_name=device_name)
     finally:
         await client.close()
-    if not isinstance(response, LoginResponse):
-        raise RuntimeError(f"Matrix password login failed: {response}")
-    return LoginResult(
-        homeserver=homeserver.rstrip("/"),
-        user_id=response.user_id,
-        device_id=response.device_id,
-        access_token=response.access_token,
-    )
+    if isinstance(response, LoginResponse):
+        return LoginResult(
+            homeserver=homeserver.rstrip("/"),
+            user_id=response.user_id,
+            device_id=response.device_id,
+            access_token=response.access_token,
+        )
+    msg = f"Matrix password login failed: {response}"
+    raise RuntimeError(msg)
 
 
 async def login_with_token(
@@ -108,11 +111,12 @@ async def login_with_token(
         response = await client.login(token=login_token, device_name=device_name)
     finally:
         await client.close()
-    if not isinstance(response, LoginResponse):
-        raise RuntimeError(f"Matrix token login failed: {response}")
-    return LoginResult(
-        homeserver=homeserver.rstrip("/"),
-        user_id=response.user_id,
-        device_id=response.device_id,
-        access_token=response.access_token,
-    )
+    if isinstance(response, LoginResponse):
+        return LoginResult(
+            homeserver=homeserver.rstrip("/"),
+            user_id=response.user_id,
+            device_id=response.device_id,
+            access_token=response.access_token,
+        )
+    msg = f"Matrix token login failed: {response}"
+    raise RuntimeError(msg)
