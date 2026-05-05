@@ -16,6 +16,7 @@ def test_config_round_trips_token_auth(tmp_path: Path) -> None:
         device_id="CLAUDECODE",
         access_token="test-token",
         http_headers={"X-Test": "secret"},
+        http_header_commands={"X-Dynamic": "print-token"},
     )
 
     config.save(path)
@@ -30,10 +31,12 @@ def test_auth_config_redacts_access_token() -> None:
         device_id="CLAUDECODE",
         access_token="test-token",
         http_headers={"X-Test": "secret"},
+        http_header_commands={"X-Dynamic": "print-token"},
     )
 
     dumped = config.model_dump_safe()
 
     assert dumped["access_token"] == "<configured>"
     assert dumped["http_headers"] == {"X-Test": "<configured>"}
+    assert dumped["http_header_commands"] == {"X-Dynamic": "<configured>"}
     assert dumped["user_id"] == "@alice:example.com"

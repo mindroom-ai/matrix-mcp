@@ -22,6 +22,7 @@ class AuthConfig(BaseModel):
     device_id: str | None = None
     access_token: str | None = Field(default=None, repr=False)
     http_headers: dict[str, str] = Field(default_factory=dict, repr=False)
+    http_header_commands: dict[str, str] = Field(default_factory=dict, repr=False)
 
     def access_token_value(self) -> str | None:
         return self.access_token
@@ -32,6 +33,11 @@ class AuthConfig(BaseModel):
             dumped["access_token"] = "<configured>"
         if self.http_headers:
             dumped["http_headers"] = dict.fromkeys(self.http_headers, "<configured>")
+        if self.http_header_commands:
+            dumped["http_header_commands"] = dict.fromkeys(
+                self.http_header_commands,
+                "<configured>",
+            )
         return dumped
 
 

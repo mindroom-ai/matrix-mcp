@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import httpx
 import pytest
 
@@ -8,8 +10,13 @@ from matrix_mcp.auth import (
     build_sso_redirect_url,
     extract_login_token,
     login_with_token,
-    parse_http_headers,
     parse_sso_providers,
+)
+from matrix_mcp.http_headers import (
+    HTTPHeaderConfig,
+    parse_http_header_commands,
+    parse_http_headers,
+    resolve_http_headers,
 )
 
 
@@ -68,14 +75,31 @@ def test_parse_http_headers_rejects_invalid_values() -> None:
         parse_http_headers(["not-a-header"])
 
 
+def test_parse_http_header_commands_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="expected 'Name: command'"):
+        parse_http_header_commands(["not-a-header"])
+
+
+def test_resolve_http_headers_runs_header_commands() -> None:
+    command = f"{sys.executable} -c 'print(\"dynamic\")'"
+    headers = resolve_http_headers(
+        {"X-Static": "static"},
+        {"X-Dynamic": command},
+    )
+
+    assert headers == {"X-Static": "static", "X-Dynamic": "dynamic"}
+
+
 @pytest.mark.asyncio
 async def test_login_with_token_fetches_user_id_when_login_response_omits_it() -> None:
     requests: list[tuple[str, str]] = []
+    header_command = f"{sys.executable} -c 'print(\"command-secret\")'"
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append((request.method, request.url.path))
         if request.url.path == "/_matrix/client/v3/login":
             assert request.headers["x-extra"] == "secret"
+            assert request.headers["x-command"] == "command-secret"
             return httpx.Response(
                 200,
                 json={
@@ -86,6 +110,7 @@ async def test_login_with_token_fetches_user_id_when_login_response_omits_it() -
         if request.url.path == "/_matrix/client/v3/account/whoami":
             assert request.headers["authorization"] == "Bearer test-access-token"
             assert request.headers["x-extra"] == "secret"
+            assert request.headers["x-command"] == "command-secret"
             return httpx.Response(200, json={"user_id": "@alice:example.com"})
         return httpx.Response(404)
 
@@ -93,7 +118,10 @@ async def test_login_with_token_fetches_user_id_when_login_response_omits_it() -
         result = await login_with_token(
             homeserver="https://matrix.example.com",
             login_token="test-login-token",
-            http_headers={"X-Extra": "secret"},
+            header_config=HTTPHeaderConfig(
+                headers={"X-Extra": "secret"},
+                commands={"X-Command": header_command},
+            ),
             http_client=http_client,
         )
 
@@ -102,6 +130,7 @@ async def test_login_with_token_fetches_user_id_when_login_response_omits_it() -
     assert result.device_id == "TESTDEVICE"
     assert result.access_token == "test-access-token"
     assert result.http_headers == {"X-Extra": "secret"}
+    assert result.http_header_commands == {"X-Command": header_command}
     assert requests == [
         ("POST", "/_matrix/client/v3/login"),
         ("GET", "/_matrix/client/v3/account/whoami"),

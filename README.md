@@ -55,6 +55,14 @@ matrix-mcp auth sso https://matrix.example.com \
   --header "X-Access-Client-Secret: ..."
 ```
 
+If the gateway header is short-lived, store a command that prints the current header value instead.
+The command is re-run when Matrix MCP creates a client for tool calls:
+
+```bash
+matrix-mcp auth sso https://matrix.example.com \
+  --header-command "X-Access-Token: access-gateway-cli token --app https://matrix.example.com"
+```
+
 Existing Matrix access token:
 
 ```bash

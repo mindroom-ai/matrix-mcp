@@ -20,6 +20,7 @@ from nio.api import RelationshipType
 from pydantic import BaseModel, ConfigDict
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.http_headers import resolve_http_headers
 
 
 class MatrixRoom(BaseModel):
@@ -79,7 +80,13 @@ class NioMatrixDriver:
         self._client = AsyncClient(
             config.normalized_homeserver,
             config.user_id,
-            config=AsyncClientConfig(custom_headers=config.http_headers or None),
+            config=AsyncClientConfig(
+                custom_headers=resolve_http_headers(
+                    config.http_headers,
+                    config.http_header_commands,
+                )
+                or None
+            ),
         )
         self._client.restore_login(
             user_id=config.user_id,

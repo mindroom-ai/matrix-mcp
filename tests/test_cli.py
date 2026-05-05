@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from matrix_mcp.cli import app
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.http_headers import HTTPHeaderConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,6 +53,8 @@ def test_auth_token_stores_extra_http_headers(tmp_path: Path) -> None:
             "TESTDEVICE",
             "--header",
             "X-Access: secret",
+            "--header-command",
+            "X-Dynamic: print-token",
             "--config",
             str(config),
         ],
@@ -60,16 +63,20 @@ def test_auth_token_stores_extra_http_headers(tmp_path: Path) -> None:
     assert result.exit_code == 0
     saved = MatrixMCPConfig.load(config)
     assert saved.http_headers == {"X-Access": "secret"}
+    assert saved.http_header_commands == {"X-Dynamic": "print-token"}
 
 
 def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_fetch_sso_providers(
         homeserver: str,
         *,
-        http_headers: dict[str, str] | None = None,
+        header_config: HTTPHeaderConfig | None = None,
     ) -> list[SimpleNamespace]:
         assert homeserver == "https://matrix.example.com"
-        assert http_headers == {"X-Access": "secret"}
+        assert header_config == HTTPHeaderConfig(
+            headers={"X-Access": "secret"},
+            commands={"X-Dynamic": "print-token"},
+        )
         return [
             SimpleNamespace(id="google", name="Google", brand="google"),
             SimpleNamespace(id="github", name="GitHub", brand="github"),
@@ -86,6 +93,8 @@ def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) 
             "https://matrix.example.com",
             "--header",
             "X-Access: secret",
+            "--header-command",
+            "X-Dynamic: print-token",
         ],
     )
 
