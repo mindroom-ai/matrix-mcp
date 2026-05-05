@@ -17,7 +17,7 @@ It is intended to make MindRoom conversations available to local coding agents w
 ## Install
 
 ```bash
-uv tool install git+https://github.com/mindroom-ai/matrix-mcp
+uv tool install matrix-mcp
 ```
 
 For local development:
