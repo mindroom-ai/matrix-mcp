@@ -13,14 +13,7 @@ icon: lucide/message-square-code
 Matrix MCP lets Claude Code and other MCP clients inspect and participate in Matrix conversations from a local machine.
 It is designed for workflows where a local coding agent should be able to read Matrix context, reply in threads, and attach local files without giving hosted agents access to the local filesystem.
 
-<div style="text-align: center; margin: 2rem 0;">
-  <a href="https://pypi.org/project/matrix-mcp/" class="md-button md-button--primary">
-    Install from PyPI
-  </a>
-  <a href="https://github.com/mindroom-ai/matrix-mcp" class="md-button">
-    View on GitHub
-  </a>
-</div>
+[PyPI package](https://pypi.org/project/matrix-mcp/) · [GitHub repository](https://github.com/mindroom-ai/matrix-mcp)
 
 ## Quick Start
 
@@ -30,8 +23,7 @@ matrix-mcp auth sso https://matrix.example.com
 claude mcp add matrix -- matrix-mcp serve
 ```
 
-[Get Started ->](getting-started.md){ .md-button .md-button--primary }
-[View Usage ->](usage.md){ .md-button }
+Continue with [Getting Started](getting-started.md), or see the [usage guide](usage.md) for the full tool surface.
 
 ## Features
 
