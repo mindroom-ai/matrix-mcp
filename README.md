@@ -95,6 +95,14 @@ Add the local MCP server:
 claude mcp add matrix -- matrix-mcp serve
 ```
 
+## Codex
+
+Add the local MCP server:
+
+```bash
+codex mcp add matrix -- matrix-mcp serve
+```
+
 The server runs over stdio. It does not expose a local HTTP port during normal MCP operation.
 
 ## Tools
