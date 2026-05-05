@@ -6,8 +6,8 @@ icon: lucide/message-square-code
 
 **Local-first Matrix access for MCP clients**
 
-<div style="text-align: center; margin: 2rem 0;">
-  <img src="assets/logo.svg" alt="Matrix MCP logo" width="200" />
+<div style="text-align: center; margin: 1.5rem 0;">
+  <img src="assets/logo.svg" alt="Matrix MCP logo" width="140" />
 </div>
 
 Matrix MCP lets Claude Code and other MCP clients inspect and participate in Matrix conversations from a local machine.
