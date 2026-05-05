@@ -11,7 +11,19 @@ APP_NAME = "matrix-mcp"
 
 
 def default_config_path() -> Path:
-    return Path(user_config_dir(APP_NAME, appauthor=False)) / "config.json"
+    candidates = _default_config_path_candidates()
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _default_config_path_candidates() -> tuple[Path, ...]:
+    platform_path = Path(user_config_dir(APP_NAME, appauthor=False)) / "config.json"
+    home_dot_config_path = Path.home() / ".config" / APP_NAME / "config.json"
+    if home_dot_config_path == platform_path:
+        return (platform_path,)
+    return (platform_path, home_dot_config_path)
 
 
 class AuthConfig(BaseModel):
