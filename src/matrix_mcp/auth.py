@@ -135,18 +135,88 @@ async def login_with_token(
     homeserver: str,
     login_token: str,
     device_name: str = "matrix-mcp",
+    http_client: httpx.AsyncClient | None = None,
 ) -> LoginResult:
-    client = AsyncClient(homeserver.rstrip("/"))
-    try:
-        response = await client.login(token=login_token, device_name=device_name)
-    finally:
-        await client.close()
-    if isinstance(response, LoginResponse):
-        return LoginResult(
-            homeserver=homeserver.rstrip("/"),
-            user_id=response.user_id,
-            device_id=response.device_id,
-            access_token=response.access_token,
+    normalized_homeserver = homeserver.rstrip("/")
+    if http_client is not None:
+        return await _login_with_token_http(
+            http_client=http_client,
+            homeserver=normalized_homeserver,
+            login_token=login_token,
+            device_name=device_name,
         )
-    msg = f"Matrix token login failed: {response}"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        return await _login_with_token_http(
+            http_client=client,
+            homeserver=normalized_homeserver,
+            login_token=login_token,
+            device_name=device_name,
+        )
+
+
+async def _login_with_token_http(
+    *,
+    http_client: httpx.AsyncClient,
+    homeserver: str,
+    login_token: str,
+    device_name: str,
+) -> LoginResult:
+    response = await http_client.post(
+        f"{homeserver}/_matrix/client/v3/login",
+        json={
+            "type": "m.login.token",
+            "token": login_token,
+            "initial_device_display_name": device_name,
+        },
+    )
+    response.raise_for_status()
+    data = _response_json_object(response, context="Matrix token login response")
+
+    access_token = _required_string(data, "access_token", context="Matrix token login response")
+    device_id = data.get("device_id")
+    user_id = data.get("user_id")
+    if not isinstance(user_id, str):
+        user_id = await _fetch_user_id(
+            http_client=http_client,
+            homeserver=homeserver,
+            access_token=access_token,
+        )
+
+    return LoginResult(
+        homeserver=homeserver,
+        user_id=user_id,
+        device_id=device_id if isinstance(device_id, str) else None,
+        access_token=access_token,
+    )
+
+
+async def _fetch_user_id(
+    *,
+    http_client: httpx.AsyncClient,
+    homeserver: str,
+    access_token: str,
+) -> str:
+    response = await http_client.get(
+        f"{homeserver}/_matrix/client/v3/account/whoami",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    response.raise_for_status()
+    data = _response_json_object(response, context="Matrix whoami response")
+    return _required_string(data, "user_id", context="Matrix whoami response")
+
+
+def _response_json_object(response: httpx.Response, *, context: str) -> dict[str, Any]:
+    data = response.json()
+    if isinstance(data, dict):
+        return data
+    msg = f"{context} was not a JSON object"
+    raise RuntimeError(msg)
+
+
+def _required_string(data: dict[str, Any], key: str, *, context: str) -> str:
+    value = data.get(key)
+    if isinstance(value, str) and value:
+        return value
+    msg = f"{context} did not include required string field {key!r}"
     raise RuntimeError(msg)

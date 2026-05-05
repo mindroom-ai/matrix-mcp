@@ -66,6 +66,7 @@ ignore = [
   "B008",    # Typer uses Option/Argument defaults intentionally
   "FBT001",  # Typer boolean options are command-line flags
   "FBT003",  # Typer boolean option defaults are command-line flag defaults
+  "PLC0415", # command handlers intentionally lazy-import runtime dependencies
   "PLR0913", # CLI commands naturally expose several command-line options
   "TC003",   # Typer resolves annotations at runtime
 ]
