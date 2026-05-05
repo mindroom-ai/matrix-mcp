@@ -52,6 +52,12 @@ Credentials are stored in the user config directory reported by:
 matrix-mcp config-path
 ```
 
+Remove stored credentials:
+
+```bash
+matrix-mcp auth logout
+```
+
 ## Claude Code
 
 Add the local MCP server:

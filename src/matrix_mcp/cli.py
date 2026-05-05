@@ -134,5 +134,17 @@ def auth_login_token(
     console.print(f"Saved Matrix MCP credentials for {result.user_id} to {config}")
 
 
+@auth_app.command("logout")
+def auth_logout(
+    config: Path = typer.Option(default_config_path(), "--config", help="Config file to remove"),
+) -> None:
+    """Remove stored Matrix MCP credentials."""
+    if config.exists():
+        config.unlink()
+        console.print(f"Removed Matrix MCP credentials from {config}")
+        return
+    console.print(f"No Matrix MCP credentials found at {config}")
+
+
 if __name__ == "__main__":
     app()
