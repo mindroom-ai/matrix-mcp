@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
+import httpx
 from nio import AsyncClient, LoginResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from matrix_mcp.config import MatrixMCPConfig
+
+
+class SSOProvider(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str | None = None
+    brand: str | None = None
 
 
 class LoginResult(BaseModel):
@@ -29,6 +39,26 @@ def build_sso_redirect_url(*, homeserver: str, redirect_url: str, idp_id: str | 
     provider = f"/{quote(idp_id, safe='')}" if idp_id else ""
     query = urlencode({"redirectUrl": redirect_url})
     return f"{base}/_matrix/client/v3/login/sso/redirect{provider}?{query}"
+
+
+def parse_sso_providers(login_response: dict[str, Any]) -> list[SSOProvider]:
+    providers: list[SSOProvider] = []
+    for flow in login_response.get("flows", []):
+        if not isinstance(flow, dict) or flow.get("type") != "m.login.sso":
+            continue
+        providers.extend(
+            SSOProvider.model_validate(provider)
+            for provider in flow.get("identity_providers", [])
+            if isinstance(provider, dict) and isinstance(provider.get("id"), str)
+        )
+    return providers
+
+
+def fetch_sso_providers(homeserver: str) -> list[SSOProvider]:
+    url = f"{homeserver.rstrip('/')}/_matrix/client/v3/login"
+    response = httpx.get(url, timeout=10)
+    response.raise_for_status()
+    return parse_sso_providers(response.json())
 
 
 def extract_login_token(query: str) -> str:

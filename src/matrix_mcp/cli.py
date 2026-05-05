@@ -9,7 +9,9 @@ from rich.console import Console
 
 from matrix_mcp.auth import (
     SSOCallbackServer,
+    SSOProvider,
     build_sso_redirect_url,
+    fetch_sso_providers,
     login_with_password,
     login_with_token,
 )
@@ -87,6 +89,20 @@ def auth_sso_url(
         webbrowser.open(url)
 
 
+@auth_app.command("providers")
+def auth_providers(
+    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
+) -> None:
+    """List Matrix SSO provider IDs for a homeserver."""
+    providers = fetch_sso_providers(homeserver)
+    if not providers:
+        console.print("No Matrix SSO providers advertised by this homeserver.")
+        return
+    for provider in providers:
+        label = _provider_label(provider)
+        console.print(f"{provider.id}\t{label}")
+
+
 @auth_app.command("sso")
 def auth_sso(
     homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
@@ -144,6 +160,10 @@ def auth_logout(
         console.print(f"Removed Matrix MCP credentials from {config}")
         return
     console.print(f"No Matrix MCP credentials found at {config}")
+
+
+def _provider_label(provider: SSOProvider) -> str:
+    return provider.name or provider.brand or provider.id
 
 
 if __name__ == "__main__":

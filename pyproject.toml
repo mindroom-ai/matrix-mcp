@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "MindRoom" }]
 dependencies = [
   "fastmcp>=2.12",
+  "httpx>=0.28",
   "mindroom-nio>=0.25",
   "platformdirs>=4.3",
   "pydantic>=2.11",

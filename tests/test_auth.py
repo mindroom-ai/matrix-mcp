@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from matrix_mcp.auth import build_sso_redirect_url, extract_login_token
+from matrix_mcp.auth import (
+    SSOProvider,
+    build_sso_redirect_url,
+    extract_login_token,
+    parse_sso_providers,
+)
 
 
 def test_build_sso_redirect_url_includes_redirect_url() -> None:
@@ -24,3 +29,25 @@ def test_extract_login_token_from_callback_query() -> None:
 def test_extract_login_token_requires_token() -> None:
     with pytest.raises(ValueError, match="loginToken"):
         extract_login_token("state=ignored")
+
+
+def test_parse_sso_providers_reads_matrix_login_flows() -> None:
+    providers = parse_sso_providers(
+        {
+            "flows": [
+                {"type": "m.login.password"},
+                {
+                    "type": "m.login.sso",
+                    "identity_providers": [
+                        {"id": "google", "name": "Google", "brand": "google"},
+                        {"id": "github", "name": "GitHub", "brand": "github"},
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert providers == [
+        SSOProvider(id="google", name="Google", brand="google"),
+        SSOProvider(id="github", name="GitHub", brand="github"),
+    ]

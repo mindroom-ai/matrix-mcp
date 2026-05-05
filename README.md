@@ -34,6 +34,18 @@ Matrix SSO:
 matrix-mcp auth sso https://matrix.example.com
 ```
 
+If the homeserver advertises multiple SSO providers, list their provider IDs:
+
+```bash
+matrix-mcp auth providers https://matrix.example.com
+```
+
+Then pass the provider ID explicitly:
+
+```bash
+matrix-mcp auth sso https://matrix.example.com --idp-id github
+```
+
 Existing Matrix access token:
 
 ```bash
