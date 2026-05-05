@@ -1,13 +1,27 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, cast
 
 import pytest
+from nio import (
+    AsyncClientConfig,
+    JoinedRoomsResponse,
+    MessageDirection,
+    RoomGetEventResponse,
+    RoomGetStateEventResponse,
+    RoomMessagesResponse,
+    RoomMessageText,
+    RoomSendResponse,
+    UploadResponse,
+)
+from nio.api import RelationshipType
 
+from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.id_state import MatrixIdStore
-from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom
+from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom, NioMatrixDriver
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 
@@ -74,6 +88,293 @@ class FakeDriver:
     ) -> str:
         self.files.append((room_id, file_path, thread_id, filename, content_type))
         return "$file"
+
+
+def text_event(
+    event_id: str,
+    *,
+    sender: str = "@alice:example.com",
+    timestamp_ms: int = 123,
+    body: str = "hello",
+    thread_id: str | None = None,
+) -> RoomMessageText:
+    event = RoomMessageText(
+        {
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": timestamp_ms,
+            "content": {"body": body, "msgtype": "m.text"},
+        },
+        body,
+        None,
+        None,
+    )
+    if thread_id is not None:
+        cast("Any", event).relates_to = {"rel_type": "m.thread", "event_id": thread_id}
+    return event
+
+
+class FakeNioClient:
+    instances: ClassVar[list[FakeNioClient]] = []
+
+    def __init__(
+        self,
+        homeserver: str,
+        user_id: str,
+        *,
+        config: AsyncClientConfig,
+    ) -> None:
+        self.homeserver = homeserver
+        self.user_id = user_id
+        self.config = config
+        self.restore_login_call: dict[str, str] | None = None
+        self.room_messages_call: dict[str, object] | None = None
+        self.relations_call: dict[str, object] | None = None
+        self.room_send_calls: list[tuple[str, str, dict[str, object]]] = []
+        self.upload_call: dict[str, object] | None = None
+        self.closed = False
+        FakeNioClient.instances.append(self)
+
+    def restore_login(self, *, user_id: str, device_id: str, access_token: str) -> None:
+        self.restore_login_call = {
+            "user_id": user_id,
+            "device_id": device_id,
+            "access_token": access_token,
+        }
+
+    async def joined_rooms(self) -> JoinedRoomsResponse:
+        return JoinedRoomsResponse(["!room:example.com"])
+
+    async def room_get_state_event(
+        self, room_id: str, event_type: str
+    ) -> RoomGetStateEventResponse:
+        assert room_id == "!room:example.com"
+        assert event_type == "m.room.name"
+        return RoomGetStateEventResponse(
+            {"name": "General"},
+            "m.room.name",
+            "",
+            room_id,
+        )
+
+    async def room_messages(
+        self,
+        room_id: str,
+        *,
+        direction: MessageDirection,
+        limit: int,
+    ) -> RoomMessagesResponse:
+        self.room_messages_call = {
+            "room_id": room_id,
+            "direction": direction,
+            "limit": limit,
+        }
+        return RoomMessagesResponse(
+            room_id,
+            [text_event("$event", body="recent"), cast("Any", object())],
+            "start",
+            "end",
+        )
+
+    async def room_get_event(self, room_id: str, event_id: str) -> RoomGetEventResponse:
+        assert room_id == "!room:example.com"
+        assert event_id == "$root"
+        response = RoomGetEventResponse()
+        response.event = text_event("$root", timestamp_ms=100, body="root")
+        return response
+
+    async def room_get_event_relations(
+        self,
+        room_id: str,
+        event_id: str,
+        **kwargs: object,
+    ) -> AsyncIterator[RoomMessageText]:
+        self.relations_call = {
+            "room_id": room_id,
+            "event_id": event_id,
+            **kwargs,
+        }
+        yield text_event(
+            "$reply",
+            sender="@bob:example.com",
+            timestamp_ms=200,
+            body="reply",
+            thread_id="$root",
+        )
+
+    async def room_send(
+        self, room_id: str, event_type: str, content: dict[str, object]
+    ) -> RoomSendResponse:
+        self.room_send_calls.append((room_id, event_type, content))
+        return RoomSendResponse(f"$sent{len(self.room_send_calls)}", room_id)
+
+    async def upload(
+        self,
+        file: BinaryIO,
+        *,
+        content_type: str,
+        filename: str,
+        filesize: int,
+    ) -> tuple[UploadResponse, None]:
+        self.upload_call = {
+            "content": file.read(),
+            "content_type": content_type,
+            "filename": filename,
+            "filesize": filesize,
+        }
+        return UploadResponse("mxc://example.com/report"), None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    path = tmp_path / "report.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com/",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+            http_headers={"X-Access": "secret"},
+        )
+    )
+    nio_client = FakeNioClient.instances[0]
+
+    assert nio_client.homeserver == "https://matrix.example.com"
+    assert nio_client.user_id == "@alice:example.com"
+    assert nio_client.config.custom_headers == {"X-Access": "secret"}
+    assert nio_client.restore_login_call == {
+        "user_id": "@alice:example.com",
+        "device_id": "TESTDEVICE",
+        "access_token": "test-token",
+    }
+    assert await driver.whoami() == {
+        "user_id": "@alice:example.com",
+        "device_id": "TESTDEVICE",
+    }
+    assert await driver.list_rooms() == [MatrixRoom(room_id="!room:example.com", name="General")]
+
+    recent = await driver.read_room_recent("!room:example.com", limit=500)
+    assert recent == [
+        MatrixEvent(
+            event_id="$event",
+            sender="@alice:example.com",
+            timestamp_ms=123,
+            body="recent",
+            thread_id=None,
+        )
+    ]
+    assert nio_client.room_messages_call == {
+        "room_id": "!room:example.com",
+        "direction": MessageDirection.back,
+        "limit": 100,
+    }
+
+    thread = await driver.read_thread("!room:example.com", "$root", limit=500)
+    assert thread == [
+        MatrixEvent(
+            event_id="$root",
+            sender="@alice:example.com",
+            timestamp_ms=100,
+            body="root",
+            thread_id=None,
+        ),
+        MatrixEvent(
+            event_id="$reply",
+            sender="@bob:example.com",
+            timestamp_ms=200,
+            body="reply",
+            thread_id="$root",
+        ),
+    ]
+    assert nio_client.relations_call == {
+        "room_id": "!room:example.com",
+        "event_id": "$root",
+        "rel_type": RelationshipType.thread,
+        "event_type": "m.room.message",
+        "direction": MessageDirection.front,
+        "limit": 100,
+    }
+
+    sent_id = await driver.send_message("!room:example.com", "hi", thread_id="$root")
+    assert sent_id == "$sent1"
+    assert nio_client.room_send_calls[-1] == (
+        "!room:example.com",
+        "m.room.message",
+        {
+            "body": "hi",
+            "msgtype": "m.text",
+            "m.relates_to": {
+                "event_id": "$root",
+                "is_falling_back": False,
+                "rel_type": "m.thread",
+            },
+        },
+    )
+
+    file_event_id = await driver.send_file("!room:example.com", str(path), thread_id="$root")
+    assert file_event_id == "$sent2"
+    assert nio_client.upload_call == {
+        "content": b"hello",
+        "content_type": "text/plain",
+        "filename": "report.txt",
+        "filesize": 5,
+    }
+    assert nio_client.room_send_calls[-1] == (
+        "!room:example.com",
+        "m.room.message",
+        {
+            "body": "report.txt",
+            "filename": "report.txt",
+            "info": {"mimetype": "text/plain", "size": 5},
+            "msgtype": "m.file",
+            "url": "mxc://example.com/report",
+            "m.relates_to": {
+                "event_id": "$root",
+                "is_falling_back": False,
+                "rel_type": "m.thread",
+            },
+        },
+    )
+
+    await driver.aclose()
+    assert nio_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_builds_default_driver_from_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_configs: list[MatrixMCPConfig] = []
+
+    def fake_driver(config: MatrixMCPConfig) -> FakeDriver:
+        created_configs.append(config)
+        return FakeDriver()
+
+    config = MatrixMCPConfig(
+        homeserver="https://matrix.example.com",
+        user_id="@alice:example.com",
+        device_id="TESTDEVICE",
+        access_token="test-token",
+    )
+    monkeypatch.setattr("matrix_mcp.matrix_client.NioMatrixDriver", fake_driver)
+    client = MatrixAPIClient(config=config, id_store=MatrixIdStore(tmp_path / "ids.json"))
+
+    assert await client.whoami() == {
+        "user_id": "@alice:example.com",
+        "device_id": "CLAUDECODE",
+    }
+    assert created_configs == [config]
 
 
 @pytest.mark.asyncio

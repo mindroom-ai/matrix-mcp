@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
 
+from matrix_mcp.auth import LoginResult
 from matrix_mcp.cli import app
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import HTTPHeaderConfig
@@ -66,6 +67,227 @@ def test_auth_token_stores_extra_http_headers(tmp_path: Path) -> None:
     assert saved.http_header_commands == {"X-Dynamic": "print-token"}
 
 
+def test_config_path_prints_default_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "matrix_mcp.config.default_config_path",
+        lambda: tmp_path / "config.json",
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["config-path"])
+
+    assert result.exit_code == 0
+    assert result.output.strip() == str(tmp_path / "config.json")
+
+
+def test_auth_password_saves_login_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.json"
+
+    async def fake_login_with_password(
+        *,
+        homeserver: str,
+        user: str,
+        password: str,
+        device_name: str,
+        header_config: HTTPHeaderConfig,
+    ) -> LoginResult:
+        assert homeserver == "https://matrix.example.com"
+        assert user == "@alice:example.com"
+        assert password == "secret"
+        assert device_name == "TESTDEVICE"
+        assert header_config == HTTPHeaderConfig(headers={"X-Access": "secret"})
+        return LoginResult(
+            homeserver=homeserver,
+            user_id=user,
+            device_id=device_name,
+            access_token="test-token",
+            http_headers=header_config.headers,
+        )
+
+    monkeypatch.setattr("matrix_mcp.auth.login_with_password", fake_login_with_password)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "password",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "--password",
+            "secret",
+            "--device-name",
+            "TESTDEVICE",
+            "--header",
+            "X-Access: secret",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = MatrixMCPConfig.load(config)
+    assert saved.user_id == "@alice:example.com"
+    assert saved.device_id == "TESTDEVICE"
+    assert saved.access_token == "test-token"
+    assert saved.http_headers == {"X-Access": "secret"}
+
+
+def test_auth_login_token_saves_login_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.json"
+
+    async def fake_login_with_token(
+        *,
+        homeserver: str,
+        login_token: str,
+        device_name: str,
+        header_config: HTTPHeaderConfig,
+    ) -> LoginResult:
+        assert homeserver == "https://matrix.example.com"
+        assert login_token == "login-token"
+        assert device_name == "TESTDEVICE"
+        assert header_config == HTTPHeaderConfig(commands={"X-Dynamic": "print-token"})
+        return LoginResult(
+            homeserver=homeserver,
+            user_id="@alice:example.com",
+            device_id=device_name,
+            access_token="test-token",
+            http_header_commands=header_config.commands,
+        )
+
+    monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "login-token",
+            "https://matrix.example.com",
+            "login-token",
+            "--device-name",
+            "TESTDEVICE",
+            "--header-command",
+            "X-Dynamic: print-token",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = MatrixMCPConfig.load(config)
+    assert saved.user_id == "@alice:example.com"
+    assert saved.device_id == "TESTDEVICE"
+    assert saved.access_token == "test-token"
+    assert saved.http_header_commands == {"X-Dynamic": "print-token"}
+
+
+def test_auth_sso_saves_login_result_after_browser_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.json"
+    opened_urls: list[str] = []
+
+    class FakeCallback:
+        def __init__(self, *, host: str, port: int) -> None:
+            assert host == "127.0.0.1"
+            assert port == 8767
+            self.redirect_url = "http://127.0.0.1:8767/callback"
+            self.close_calls = 0
+            callbacks.append(self)
+
+        def wait_for_token(self) -> str:
+            self.close()
+            return "login-token"
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    callbacks: list[FakeCallback] = []
+
+    async def fake_login_with_token(
+        *,
+        homeserver: str,
+        login_token: str,
+        device_name: str,
+        header_config: HTTPHeaderConfig,
+    ) -> LoginResult:
+        assert homeserver == "https://matrix.example.com"
+        assert login_token == "login-token"
+        assert device_name == "TESTDEVICE"
+        assert header_config == HTTPHeaderConfig(headers={"X-Access": "secret"})
+        return LoginResult(
+            homeserver=homeserver,
+            user_id="@alice:example.com",
+            device_id=device_name,
+            access_token="test-token",
+            http_headers=header_config.headers,
+        )
+
+    monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
+    monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
+    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", opened_urls.append)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso",
+            "https://matrix.example.com",
+            "--idp-id",
+            "github",
+            "--callback-port",
+            "8767",
+            "--device-name",
+            "TESTDEVICE",
+            "--header",
+            "X-Access: secret",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert opened_urls == [
+        "https://matrix.example.com/_matrix/client/v3/login/sso/redirect/github?"
+        "redirectUrl=http%3A%2F%2F127.0.0.1%3A8767%2Fcallback"
+    ]
+    assert callbacks[0].close_calls == 2
+    saved = MatrixMCPConfig.load(config)
+    assert saved.user_id == "@alice:example.com"
+    assert saved.access_token == "test-token"
+
+
+def test_auth_sso_url_prints_and_opens_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened_urls: list[str] = []
+    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", opened_urls.append)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso-url",
+            "https://matrix.example.com",
+            "http://127.0.0.1:8767/callback",
+            "--idp-id",
+            "github",
+            "--open",
+        ],
+    )
+
+    expected_url = (
+        "https://matrix.example.com/_matrix/client/v3/login/sso/redirect/github?"
+        "redirectUrl=http%3A%2F%2F127.0.0.1%3A8767%2Fcallback"
+    )
+    assert result.exit_code == 0
+    assert result.output.strip() == expected_url
+    assert opened_urls == [expected_url]
+
+
 def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_fetch_sso_providers(
         homeserver: str,
@@ -82,7 +304,7 @@ def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) 
             SimpleNamespace(id="github", name="GitHub", brand="github"),
         ]
 
-    monkeypatch.setattr("matrix_mcp.cli._fetch_sso_providers", fake_fetch_sso_providers)
+    monkeypatch.setattr("matrix_mcp.auth.fetch_sso_providers", fake_fetch_sso_providers)
     runner = CliRunner()
 
     result = runner.invoke(
@@ -101,3 +323,13 @@ def test_auth_providers_lists_sso_provider_ids(monkeypatch: pytest.MonkeyPatch) 
     assert result.exit_code == 0
     assert "google\tGoogle" in result.output
     assert "github\tGitHub" in result.output
+
+
+def test_auth_providers_reports_empty_provider_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("matrix_mcp.auth.fetch_sso_providers", lambda *_args, **_kwargs: [])
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["auth", "providers", "https://matrix.example.com"])
+
+    assert result.exit_code == 0
+    assert "No Matrix SSO providers advertised" in result.output
