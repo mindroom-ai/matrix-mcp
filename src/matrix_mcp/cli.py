@@ -135,7 +135,7 @@ def auth_sso(
     homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
     idp_id: str | None = typer.Option(None, help="Optional Matrix SSO provider ID"),
     callback_host: str = typer.Option("127.0.0.1", help="Local callback bind host"),
-    callback_port: int = typer.Option(8767, help="Local callback bind port"),
+    callback_port: int = typer.Option(0, help="Local callback bind port; 0 chooses a free port"),
     device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
     header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
     header_command: list[str] | None = typer.Option(
@@ -151,20 +151,23 @@ def auth_sso(
     config_path = _resolve_config_path(config)
     header_config = _http_header_config(header, header_command)
     callback = SSOCallbackServer(host=callback_host, port=callback_port)
-    url = build_sso_redirect_url(
-        homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
-    )
-    typer.echo(f"Opening Matrix SSO URL: {url}")
-    webbrowser.open(url)
-    login_token = callback.wait_for_token()
-    result = asyncio.run(
-        login_with_token(
-            homeserver=homeserver,
-            login_token=login_token,
-            device_name=device_name,
-            header_config=header_config,
-        ),
-    )
+    try:
+        url = build_sso_redirect_url(
+            homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
+        )
+        typer.echo(f"Opening Matrix SSO URL: {url}")
+        webbrowser.open(url)
+        login_token = callback.wait_for_token()
+        result = asyncio.run(
+            login_with_token(
+                homeserver=homeserver,
+                login_token=login_token,
+                device_name=device_name,
+                header_config=header_config,
+            ),
+        )
+    finally:
+        callback.close()
     result.to_config().save(config_path)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
 

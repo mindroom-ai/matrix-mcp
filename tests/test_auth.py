@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import socket
 import sys
 
 import httpx
 import pytest
 
 from matrix_mcp.auth import (
+    SSOCallbackServer,
     SSOProvider,
     build_sso_redirect_url,
     extract_login_token,
@@ -30,6 +32,19 @@ def test_build_sso_redirect_url_includes_redirect_url() -> None:
         "https://matrix.example.com/_matrix/client/v3/login/sso/redirect?"
         "redirectUrl=http%3A%2F%2F127.0.0.1%3A8767%2Fcallback"
     )
+
+
+def test_sso_callback_server_default_uses_free_port() -> None:
+    with socket.socket() as busy_socket:
+        busy_socket.bind(("127.0.0.1", 8767))
+        busy_socket.listen()
+
+        callback = SSOCallbackServer()
+        try:
+            assert callback.redirect_url.startswith("http://127.0.0.1:")
+            assert callback.redirect_url != "http://127.0.0.1:8767/callback"
+        finally:
+            callback.close()
 
 
 def test_extract_login_token_from_callback_query() -> None:

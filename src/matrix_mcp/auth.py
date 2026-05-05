@@ -84,7 +84,7 @@ def extract_login_token(query: str) -> str:
 
 
 class SSOCallbackServer:
-    def __init__(self, *, host: str = "127.0.0.1", port: int = 8767) -> None:
+    def __init__(self, *, host: str = "127.0.0.1", port: int = 0) -> None:
         self.token: str | None = None
         self.error: Exception | None = None
 
@@ -110,14 +110,19 @@ class SSOCallbackServer:
         self.redirect_url = f"http://{host}:{self._server.server_port}/callback"
 
     def wait_for_token(self) -> str:
-        self._server.handle_request()
-        self._server.server_close()
+        try:
+            self._server.handle_request()
+        finally:
+            self.close()
         if self.error is not None:
             raise self.error
         if self.token is None:
             msg = "Matrix SSO callback did not complete"
             raise RuntimeError(msg)
         return self.token
+
+    def close(self) -> None:
+        self._server.server_close()
 
 
 async def login_with_password(
