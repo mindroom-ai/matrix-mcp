@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Matrix MCP logo">
+  <rect width="128" height="128" rx="24" fill="#4f46e5"/>
+  <path d="M31 35h66v12H31zM31 58h66v12H31zM31 81h66v12H31z" fill="#fff"/>
+  <circle cx="38" cy="41" r="5" fill="#22d3ee"/>
+  <circle cx="64" cy="64" r="5" fill="#22d3ee"/>
+  <circle cx="90" cy="87" r="5" fill="#22d3ee"/>
+</svg>
