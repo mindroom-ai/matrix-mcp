@@ -6,11 +6,13 @@ from nio import (
     AsyncClient,
     JoinedRoomsResponse,
     MessageDirection,
+    RoomGetEventResponse,
     RoomGetStateEventResponse,
     RoomMessagesResponse,
     RoomMessageText,
     RoomSendResponse,
 )
+from nio.api import RelationshipType
 from pydantic import BaseModel, ConfigDict
 
 from matrix_mcp.config import MatrixMCPConfig
@@ -39,6 +41,10 @@ class MatrixDriver(Protocol):
     async def list_rooms(self) -> list[MatrixRoom]: ...
 
     async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]: ...
+
+    async def read_thread(
+        self, room_id: str, thread_id: str, *, limit: int = 50
+    ) -> list[MatrixEvent]: ...
 
     async def send_message(
         self,
@@ -94,6 +100,32 @@ class NioMatrixDriver:
         msg = f"Matrix room_messages failed: {response}"
         raise RuntimeError(msg)
 
+    async def read_thread(
+        self, room_id: str, thread_id: str, *, limit: int = 50
+    ) -> list[MatrixEvent]:
+        max_replies = max(1, min(limit, 100))
+        events: list[MatrixEvent] = []
+
+        root_response = await self._client.room_get_event(room_id, thread_id)
+        if isinstance(root_response, RoomGetEventResponse):
+            root = _event_from_nio(root_response.event)
+            if root is not None:
+                events.append(root)
+
+        async for raw in self._client.room_get_event_relations(
+            room_id,
+            thread_id,
+            rel_type=RelationshipType.thread,
+            event_type="m.room.message",
+            direction=MessageDirection.front,
+            limit=max_replies,
+        ):
+            event = _event_from_nio(raw)
+            if event is not None:
+                events.append(event)
+
+        return sorted(events, key=_event_sort_key)
+
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         content: dict[str, object] = {
             "body": body,
@@ -136,6 +168,11 @@ class MatrixAPIClient:
     async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]:
         return await self._driver.read_room_recent(room_id, limit=limit)
 
+    async def read_thread(
+        self, room_id: str, thread_id: str, *, limit: int = 50
+    ) -> list[MatrixEvent]:
+        return await self._driver.read_thread(room_id, thread_id, limit=limit)
+
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         return await self._driver.send_message(room_id, body, thread_id=thread_id)
 
@@ -155,3 +192,7 @@ def _event_from_nio(raw: object) -> MatrixEvent | None:
         body=raw.body,
         thread_id=thread_id,
     )
+
+
+def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:
+    return (event.timestamp_ms if event.timestamp_ms is not None else -1, event.event_id)

@@ -29,6 +29,29 @@ class FakeMatrixClient:
             ),
         ]
 
+    async def read_thread(
+        self, room_id: str, thread_id: str, *, limit: int = 50
+    ) -> list[MatrixEvent]:
+        assert room_id == "!mind:example.com"
+        assert thread_id == "$root"
+        assert limit == 25
+        return [
+            MatrixEvent(
+                event_id="$root",
+                sender="@alice:example.com",
+                timestamp_ms=100,
+                body="root",
+                thread_id=None,
+            ),
+            MatrixEvent(
+                event_id="$reply",
+                sender="@bob:example.com",
+                timestamp_ms=200,
+                body="reply",
+                thread_id="$root",
+            ),
+        ]
+
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         self.sent.append((room_id, body, thread_id))
         return "$sent"
@@ -53,7 +76,29 @@ async def test_tools_return_pydantic_models() -> None:
             thread_id=None,
         ),
     ]
+    assert await tools.matrix_read_thread("!mind:example.com", "$root", limit=25) == [
+        MatrixEvent(
+            event_id="$root",
+            sender="@alice:example.com",
+            timestamp_ms=100,
+            body="root",
+            thread_id=None,
+        ),
+        MatrixEvent(
+            event_id="$reply",
+            sender="@bob:example.com",
+            timestamp_ms=200,
+            body="reply",
+            thread_id="$root",
+        ),
+    ]
     assert await tools.matrix_send_message("!mind:example.com", "hi", thread_id="$root") == {
         "event_id": "$sent"
     }
-    assert matrix.sent == [("!mind:example.com", "hi", "$root")]
+    assert await tools.matrix_reply_thread("!mind:example.com", "$root", "thread reply") == {
+        "event_id": "$sent"
+    }
+    assert matrix.sent == [
+        ("!mind:example.com", "hi", "$root"),
+        ("!mind:example.com", "thread reply", "$root"),
+    ]

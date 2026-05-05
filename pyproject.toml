@@ -89,7 +89,7 @@ warn_unused_configs = true
 packages = ["matrix_mcp"]
 
 [[tool.mypy.overrides]]
-module = ["nio"]
+module = ["nio", "nio.api"]
 ignore_missing_imports = true
 
 [tool.ty.rules]

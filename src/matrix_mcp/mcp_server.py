@@ -26,6 +26,15 @@ class MatrixMCPTools:
         """Read recent text messages from one Matrix room."""
         return await self._client_factory().read_room_recent(room_id, limit=limit)
 
+    async def matrix_read_thread(
+        self,
+        room_id: str,
+        thread_id: str,
+        limit: int = 50,
+    ) -> list[MatrixEvent]:
+        """Read a Matrix thread root and its recent text replies."""
+        return await self._client_factory().read_thread(room_id, thread_id, limit=limit)
+
     async def matrix_send_message(
         self,
         room_id: str,
@@ -33,6 +42,11 @@ class MatrixMCPTools:
         thread_id: str | None = None,
     ) -> dict[str, str]:
         """Send a Matrix text message, optionally as a thread reply."""
+        event_id = await self._client_factory().send_message(room_id, body, thread_id=thread_id)
+        return {"event_id": event_id}
+
+    async def matrix_reply_thread(self, room_id: str, thread_id: str, body: str) -> dict[str, str]:
+        """Send a Matrix text reply to an existing thread."""
         event_id = await self._client_factory().send_message(room_id, body, thread_id=thread_id)
         return {"event_id": event_id}
 
@@ -49,7 +63,9 @@ def create_mcp_server(client_factory: Callable[[], MatrixDriver] = MatrixAPIClie
     mcp.tool(tools.matrix_whoami)
     mcp.tool(tools.matrix_list_rooms)
     mcp.tool(tools.matrix_read_room_recent)
+    mcp.tool(tools.matrix_read_thread)
     mcp.tool(tools.matrix_send_message)
+    mcp.tool(tools.matrix_reply_thread)
     return mcp
 
 

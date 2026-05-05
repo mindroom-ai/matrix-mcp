@@ -29,6 +29,29 @@ class FakeDriver:
             ),
         ]
 
+    async def read_thread(
+        self, room_id: str, thread_id: str, *, limit: int = 50
+    ) -> list[MatrixEvent]:
+        assert room_id == "!room:example.com"
+        assert thread_id == "$root"
+        assert limit == 25
+        return [
+            MatrixEvent(
+                event_id="$root",
+                sender="@alice:example.com",
+                timestamp_ms=100,
+                body="root",
+                thread_id=None,
+            ),
+            MatrixEvent(
+                event_id="$reply",
+                sender="@bob:example.com",
+                timestamp_ms=200,
+                body="reply",
+                thread_id="$root",
+            ),
+        ]
+
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         self.sent.append((room_id, body, thread_id))
         return "$sent"
@@ -58,6 +81,31 @@ async def test_read_room_recent_normalizes_text_events() -> None:
             timestamp_ms=123,
             body="hello",
             thread_id=None,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_thread_returns_root_and_replies() -> None:
+    driver = FakeDriver()
+    client = MatrixAPIClient(driver=driver)
+
+    events = await client.read_thread("!room:example.com", "$root", limit=25)
+
+    assert events == [
+        MatrixEvent(
+            event_id="$root",
+            sender="@alice:example.com",
+            timestamp_ms=100,
+            body="root",
+            thread_id=None,
+        ),
+        MatrixEvent(
+            event_id="$reply",
+            sender="@bob:example.com",
+            timestamp_ms=200,
+            body="reply",
+            thread_id="$root",
         ),
     ]
 
