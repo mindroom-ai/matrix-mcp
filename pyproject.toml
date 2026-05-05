@@ -9,6 +9,7 @@ description = "A Matrix MCP server for connecting coding agents to Matrix and Mi
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "MindRoom" }]
 dependencies = [
   "fastmcp>=2.12",
