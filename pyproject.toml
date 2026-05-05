@@ -73,6 +73,9 @@ ignore = [
 "src/matrix_mcp/config.py" = [
   "S105", # redaction placeholder is intentionally not a real token
 ]
+"src/matrix_mcp/mcp_server.py" = [
+  "PLR0913", # MCP tool signatures expose structured tool parameters directly
+]
 "tests/*" = [
   "S101",    # assert usage is fine in tests
   "PLR2004", # magic values are fine in tests

@@ -9,6 +9,7 @@ from matrix_mcp.mcp_server import MatrixMCPTools
 class FakeMatrixClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str | None]] = []
+        self.files: list[tuple[str, str, str | None, str | None, str | None]] = []
 
     async def whoami(self) -> dict[str, str | None]:
         return {"user_id": "@alice:example.com", "device_id": "CLAUDECODE"}
@@ -56,6 +57,18 @@ class FakeMatrixClient:
         self.sent.append((room_id, body, thread_id))
         return "$sent"
 
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        *,
+        thread_id: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        self.files.append((room_id, file_path, thread_id, filename, content_type))
+        return "$file"
+
 
 @pytest.mark.asyncio
 async def test_tools_return_pydantic_models() -> None:
@@ -95,10 +108,40 @@ async def test_tools_return_pydantic_models() -> None:
     assert await tools.matrix_send_message("!mind:example.com", "hi", thread_id="$root") == {
         "event_id": "$sent"
     }
-    assert await tools.matrix_reply_thread("!mind:example.com", "$root", "thread reply") == {
-        "event_id": "$sent"
-    }
-    assert matrix.sent == [
-        ("!mind:example.com", "hi", "$root"),
-        ("!mind:example.com", "thread reply", "$root"),
+    assert matrix.sent == [("!mind:example.com", "hi", "$root")]
+
+
+@pytest.mark.asyncio
+async def test_file_tools_send_room_and_thread_attachments() -> None:
+    matrix = FakeMatrixClient()
+    tools = MatrixMCPTools(client_factory=lambda: matrix)
+
+    report_path = "workspace/report.txt"
+    thread_report_path = "workspace/thread-report.txt"
+
+    assert await tools.matrix_send_message(
+        "!mind:example.com",
+        file_path=report_path,
+        filename="report.txt",
+        content_type="text/plain",
+    ) == {"event_id": "$file"}
+    assert await tools.matrix_send_message(
+        "!mind:example.com",
+        thread_id="$root",
+        file_path=thread_report_path,
+        filename="thread-report.txt",
+        content_type="text/plain",
+    ) == {"event_id": "$file"}
+    assert matrix.files == [
+        ("!mind:example.com", report_path, None, "report.txt", "text/plain"),
+        ("!mind:example.com", thread_report_path, "$root", "thread-report.txt", "text/plain"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_message_requires_text_or_attachment() -> None:
+    matrix = FakeMatrixClient()
+    tools = MatrixMCPTools(client_factory=lambda: matrix)
+
+    with pytest.raises(ValueError, match="body or file_path"):
+        await tools.matrix_send_message("!mind:example.com")

@@ -86,8 +86,7 @@ The server runs over stdio. It does not expose a local HTTP port during normal M
 - `matrix_list_rooms`: list rooms joined by the authenticated user.
 - `matrix_read_room_recent`: read recent text events from a room.
 - `matrix_read_thread`: read a Matrix thread root and its recent text replies.
-- `matrix_send_message`: send a text message, optionally as a Matrix thread reply.
-- `matrix_reply_thread`: reply to an existing Matrix thread.
+- `matrix_send_message`: send a text message or local file, optionally as a Matrix thread reply.
 
 The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
 

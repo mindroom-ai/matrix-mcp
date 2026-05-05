@@ -38,15 +38,25 @@ class MatrixMCPTools:
     async def matrix_send_message(
         self,
         room_id: str,
-        body: str,
+        body: str | None = None,
         thread_id: str | None = None,
+        file_path: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
     ) -> dict[str, str]:
-        """Send a Matrix text message, optionally as a thread reply."""
-        event_id = await self._client_factory().send_message(room_id, body, thread_id=thread_id)
-        return {"event_id": event_id}
-
-    async def matrix_reply_thread(self, room_id: str, thread_id: str, body: str) -> dict[str, str]:
-        """Send a Matrix text reply to an existing thread."""
+        """Send a Matrix text message or local file, optionally as a thread reply."""
+        if file_path:
+            event_id = await self._client_factory().send_file(
+                room_id,
+                file_path,
+                thread_id=thread_id,
+                filename=filename,
+                content_type=content_type,
+            )
+            return {"event_id": event_id}
+        if body is None:
+            msg = "matrix_send_message requires either body or file_path"
+            raise ValueError(msg)
         event_id = await self._client_factory().send_message(room_id, body, thread_id=thread_id)
         return {"event_id": event_id}
 
@@ -65,7 +75,6 @@ def create_mcp_server(client_factory: Callable[[], MatrixDriver] = MatrixAPIClie
     mcp.tool(tools.matrix_read_room_recent)
     mcp.tool(tools.matrix_read_thread)
     mcp.tool(tools.matrix_send_message)
-    mcp.tool(tools.matrix_reply_thread)
     return mcp
 
 

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class FakeDriver:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, str | None]] = []
+        self.files: list[tuple[str, str, str | None, str | None, str | None]] = []
         self.room_member_calls = 0
 
     async def whoami(self) -> dict[str, str | None]:
@@ -55,6 +61,18 @@ class FakeDriver:
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         self.sent.append((room_id, body, thread_id))
         return "$sent"
+
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        *,
+        thread_id: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        self.files.append((room_id, file_path, thread_id, filename, content_type))
+        return "$file"
 
 
 @pytest.mark.asyncio
@@ -119,3 +137,24 @@ async def test_send_message_uses_transaction_id_and_optional_thread() -> None:
 
     assert event_id == "$sent"
     assert driver.sent == [("!room:example.com", "hi", "$root")]
+
+
+@pytest.mark.asyncio
+async def test_send_file_accepts_optional_thread_and_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "report.txt"
+    path.write_text("hello", encoding="utf-8")
+    driver = FakeDriver()
+    client = MatrixAPIClient(driver=driver)
+
+    event_id = await client.send_file(
+        "!room:example.com",
+        str(path),
+        thread_id="$root",
+        filename="summary.txt",
+        content_type="text/plain",
+    )
+
+    assert event_id == "$file"
+    assert driver.files == [
+        ("!room:example.com", str(path), "$root", "summary.txt", "text/plain"),
+    ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import Protocol, cast
 
 from nio import (
@@ -11,6 +13,7 @@ from nio import (
     RoomMessagesResponse,
     RoomMessageText,
     RoomSendResponse,
+    UploadResponse,
 )
 from nio.api import RelationshipType
 from pydantic import BaseModel, ConfigDict
@@ -52,6 +55,16 @@ class MatrixDriver(Protocol):
         body: str,
         *,
         thread_id: str | None = None,
+    ) -> str: ...
+
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        *,
+        thread_id: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
     ) -> str: ...
 
 
@@ -143,6 +156,44 @@ class NioMatrixDriver:
         msg = f"Matrix room_send failed: {response}"
         raise RuntimeError(msg)
 
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        *,
+        thread_id: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        path = Path(file_path).expanduser()
+        display_name = filename or path.name
+        resolved_content_type = content_type or mimetypes.guess_type(display_name)[0]
+        resolved_content_type = resolved_content_type or "application/octet-stream"
+        size = path.stat().st_size
+
+        with path.open("rb") as file:
+            upload_response, _decryption_info = await self._client.upload(
+                file,
+                content_type=resolved_content_type,
+                filename=display_name,
+                filesize=size,
+            )
+        if isinstance(upload_response, UploadResponse):
+            content = _file_message_content(
+                content_uri=upload_response.content_uri,
+                filename=display_name,
+                content_type=resolved_content_type,
+                size=size,
+                thread_id=thread_id,
+            )
+            response = await self._client.room_send(room_id, "m.room.message", content)
+            if isinstance(response, RoomSendResponse):
+                return cast("str", response.event_id)
+            msg = f"Matrix room_send failed: {response}"
+            raise RuntimeError(msg)
+        msg = f"Matrix media upload failed: {upload_response}"
+        raise RuntimeError(msg)
+
     async def aclose(self) -> None:
         await self._client.close()
 
@@ -176,6 +227,23 @@ class MatrixAPIClient:
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         return await self._driver.send_message(room_id, body, thread_id=thread_id)
 
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        *,
+        thread_id: str | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        return await self._driver.send_file(
+            room_id,
+            file_path,
+            thread_id=thread_id,
+            filename=filename,
+            content_type=content_type,
+        )
+
 
 def _event_from_nio(raw: object) -> MatrixEvent | None:
     if not isinstance(raw, RoomMessageText):
@@ -196,3 +264,30 @@ def _event_from_nio(raw: object) -> MatrixEvent | None:
 
 def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:
     return (event.timestamp_ms if event.timestamp_ms is not None else -1, event.event_id)
+
+
+def _file_message_content(
+    *,
+    content_uri: str,
+    filename: str,
+    content_type: str,
+    size: int,
+    thread_id: str | None,
+) -> dict[str, object]:
+    content: dict[str, object] = {
+        "body": filename,
+        "filename": filename,
+        "info": {
+            "mimetype": content_type,
+            "size": size,
+        },
+        "msgtype": "m.file",
+        "url": content_uri,
+    }
+    if thread_id:
+        content["m.relates_to"] = {
+            "event_id": thread_id,
+            "is_falling_back": False,
+            "rel_type": "m.thread",
+        }
+    return content
