@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from matrix_mcp.id_state import MatrixIdStore
 from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom
 
 if TYPE_CHECKING:
@@ -83,6 +84,39 @@ async def test_list_rooms_reads_joined_room_names() -> None:
     rooms = await client.list_rooms()
 
     assert rooms == [MatrixRoom(room_id="!room:example.com", name="Mind")]
+
+
+@pytest.mark.asyncio
+async def test_client_adds_and_accepts_numeric_refs(tmp_path: Path) -> None:
+    driver = FakeDriver()
+    id_store = MatrixIdStore(tmp_path / "ids.json")
+    client = MatrixAPIClient(driver=driver, id_store=id_store)
+
+    rooms = await client.list_rooms()
+    assert rooms == [MatrixRoom(id=1, room_id="!room:example.com", name="Mind")]
+
+    events = await client.read_room_recent(1, limit=10)
+    assert events == [
+        MatrixEvent(
+            id=1,
+            event_id="$event1",
+            sender="@alice:example.com",
+            timestamp_ms=123,
+            body="hello",
+            thread_id=None,
+            thread_ref=None,
+        ),
+    ]
+
+    id_store.event_ref("$root")
+    thread_events = await client.read_thread(1, 2, limit=25)
+    assert thread_events[0].id == 2
+    assert thread_events[0].thread_ref == 2
+    assert thread_events[1].id == 3
+    assert thread_events[1].thread_ref == 2
+
+    await client.send_message(1, "hi", thread_id=2)
+    assert driver.sent == [("!room:example.com", "hi", "$root")]
 
 
 @pytest.mark.asyncio

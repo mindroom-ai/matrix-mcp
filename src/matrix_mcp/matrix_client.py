@@ -21,11 +21,13 @@ from pydantic import BaseModel, ConfigDict
 
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import resolve_http_headers
+from matrix_mcp.id_state import MatrixIdStore
 
 
 class MatrixRoom(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    id: int | None = None
     room_id: str
     name: str | None = None
 
@@ -33,11 +35,13 @@ class MatrixRoom(BaseModel):
 class MatrixEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    id: int | None = None
     event_id: str
     sender: str
     timestamp_ms: int | None = None
     body: str
     thread_id: str | None = None
+    thread_ref: int | None = None
 
 
 class MatrixDriver(Protocol):
@@ -216,45 +220,98 @@ class MatrixAPIClient:
         config: MatrixMCPConfig | None = None,
         *,
         driver: MatrixDriver | None = None,
+        id_store: MatrixIdStore | None = None,
     ) -> None:
         if driver is not None:
             self._driver = driver
+            self._id_store = id_store
             return
-        self._driver = NioMatrixDriver(config or MatrixMCPConfig.load())
+        config = config or MatrixMCPConfig.load()
+        self._driver = NioMatrixDriver(config)
+        self._id_store = id_store or MatrixIdStore.for_config(config)
 
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()
 
     async def list_rooms(self) -> list[MatrixRoom]:
-        return await self._driver.list_rooms()
+        rooms = await self._driver.list_rooms()
+        return [self._with_room_ref(room) for room in rooms]
 
-    async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]:
-        return await self._driver.read_room_recent(room_id, limit=limit)
+    async def read_room_recent(self, room_id: str | int, *, limit: int = 20) -> list[MatrixEvent]:
+        resolved_room_id = self._resolve_room(room_id)
+        events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
+        return [self._with_event_refs(event) for event in events]
 
     async def read_thread(
-        self, room_id: str, thread_id: str, *, limit: int = 50
+        self, room_id: str | int, thread_id: str | int, *, limit: int = 50
     ) -> list[MatrixEvent]:
-        return await self._driver.read_thread(room_id, thread_id, limit=limit)
+        resolved_room_id = self._resolve_room(room_id)
+        resolved_thread_id = self._resolve_event(thread_id)
+        events = await self._driver.read_thread(resolved_room_id, resolved_thread_id, limit=limit)
+        return [self._with_event_refs(event, thread_root_id=resolved_thread_id) for event in events]
 
-    async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
-        return await self._driver.send_message(room_id, body, thread_id=thread_id)
+    async def send_message(
+        self,
+        room_id: str | int,
+        body: str,
+        *,
+        thread_id: str | int | None = None,
+    ) -> str:
+        return await self._driver.send_message(
+            self._resolve_room(room_id),
+            body,
+            thread_id=self._resolve_optional_event(thread_id),
+        )
 
     async def send_file(
         self,
-        room_id: str,
+        room_id: str | int,
         file_path: str,
         *,
-        thread_id: str | None = None,
+        thread_id: str | int | None = None,
         filename: str | None = None,
         content_type: str | None = None,
     ) -> str:
         return await self._driver.send_file(
-            room_id,
+            self._resolve_room(room_id),
             file_path,
-            thread_id=thread_id,
+            thread_id=self._resolve_optional_event(thread_id),
             filename=filename,
             content_type=content_type,
         )
+
+    def _with_room_ref(self, room: MatrixRoom) -> MatrixRoom:
+        if self._id_store is None:
+            return room
+        return room.model_copy(update={"id": self._id_store.room_ref(room.room_id)})
+
+    def _with_event_refs(
+        self,
+        event: MatrixEvent,
+        *,
+        thread_root_id: str | None = None,
+    ) -> MatrixEvent:
+        if self._id_store is None:
+            return event
+        event_ref = self._id_store.event_ref(event.event_id)
+        raw_thread_id = event.thread_id or thread_root_id
+        thread_ref = self._id_store.event_ref(raw_thread_id) if raw_thread_id else None
+        return event.model_copy(update={"id": event_ref, "thread_ref": thread_ref})
+
+    def _resolve_room(self, room_id_or_ref: str | int) -> str:
+        if self._id_store is None:
+            return str(room_id_or_ref)
+        return self._id_store.resolve_room(room_id_or_ref)
+
+    def _resolve_event(self, event_id_or_ref: str | int) -> str:
+        if self._id_store is None:
+            return str(event_id_or_ref)
+        return self._id_store.resolve_event(event_id_or_ref)
+
+    def _resolve_optional_event(self, event_id_or_ref: str | int | None) -> str | None:
+        if event_id_or_ref is None:
+            return None
+        return self._resolve_event(event_id_or_ref)
 
 
 def _event_from_nio(raw: object) -> MatrixEvent | None:

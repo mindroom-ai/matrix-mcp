@@ -105,6 +105,16 @@ The server runs over stdio. It does not expose a local HTTP port during normal M
 - `matrix_read_thread`: read a Matrix thread root and its recent text replies.
 - `matrix_send_message`: send a text message or local file, optionally as a Matrix thread reply.
 
+Rooms and events returned by read/list tools include stable numeric `id` fields.
+Thread replies also include `thread_ref`, which is the numeric event ref of the thread root.
+Use these integers in later tool calls instead of copying raw Matrix IDs:
+
+```text
+matrix_read_room_recent(room_id=1)
+matrix_read_thread(room_id=1, thread_id=42)
+matrix_send_message(room_id=1, body="reply", thread_id=42)
+```
+
 The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
 
 ## Development

@@ -8,8 +8,8 @@ from matrix_mcp.mcp_server import MatrixMCPTools
 
 class FakeMatrixClient:
     def __init__(self) -> None:
-        self.sent: list[tuple[str, str, str | None]] = []
-        self.files: list[tuple[str, str, str | None, str | None, str | None]] = []
+        self.sent: list[tuple[str | int, str, str | int | None]] = []
+        self.files: list[tuple[str | int, str, str | int | None, str | None, str | None]] = []
 
     async def whoami(self) -> dict[str, str | None]:
         return {"user_id": "@alice:example.com", "device_id": "CLAUDECODE"}
@@ -17,7 +17,7 @@ class FakeMatrixClient:
     async def list_rooms(self) -> list[MatrixRoom]:
         return [MatrixRoom(room_id="!mind:example.com", name="Mind")]
 
-    async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]:
+    async def read_room_recent(self, room_id: str | int, *, limit: int = 20) -> list[MatrixEvent]:
         assert room_id == "!mind:example.com"
         assert limit == 5
         return [
@@ -31,7 +31,7 @@ class FakeMatrixClient:
         ]
 
     async def read_thread(
-        self, room_id: str, thread_id: str, *, limit: int = 50
+        self, room_id: str | int, thread_id: str | int, *, limit: int = 50
     ) -> list[MatrixEvent]:
         assert room_id == "!mind:example.com"
         assert thread_id == "$root"
@@ -53,16 +53,22 @@ class FakeMatrixClient:
             ),
         ]
 
-    async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
+    async def send_message(
+        self,
+        room_id: str | int,
+        body: str,
+        *,
+        thread_id: str | int | None = None,
+    ) -> str:
         self.sent.append((room_id, body, thread_id))
         return "$sent"
 
     async def send_file(
         self,
-        room_id: str,
+        room_id: str | int,
         file_path: str,
         *,
-        thread_id: str | None = None,
+        thread_id: str | int | None = None,
         filename: str | None = None,
         content_type: str | None = None,
     ) -> str:
