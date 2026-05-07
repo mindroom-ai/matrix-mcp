@@ -261,6 +261,125 @@ def test_auth_sso_saves_login_result_after_browser_callback(
     assert saved.access_token == "test-token"
 
 
+def test_auth_sso_cloudflare_access_adds_access_token_header_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.json"
+
+    class FakeCallback:
+        redirect_url = "http://127.0.0.1:8767/callback"
+
+        def __init__(self, *, host: str, port: int) -> None:
+            assert host == "127.0.0.1"
+            assert port == 0
+
+        def wait_for_token(self) -> str:
+            return "login-token"
+
+        def close(self) -> None:
+            pass
+
+    async def fake_login_with_token(
+        *,
+        homeserver: str,
+        login_token: str,
+        device_name: str,
+        header_config: HTTPHeaderConfig,
+    ) -> LoginResult:
+        assert homeserver == "https://matrix.example.com"
+        assert login_token == "login-token"
+        assert device_name == "matrix-mcp"
+        assert header_config == HTTPHeaderConfig(
+            commands={
+                "cf-access-token": (
+                    'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
+                    '{ cloudflared access login "$1" >/dev/null && '
+                    'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
+                )
+            }
+        )
+        return LoginResult(
+            homeserver=homeserver,
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+            http_header_commands=header_config.commands,
+        )
+
+    monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
+    monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
+    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", lambda _url: None)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso",
+            "https://matrix.example.com",
+            "--cloudflare-access",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = MatrixMCPConfig.load(config)
+    assert saved.http_header_commands == {
+        "cf-access-token": (
+            'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
+            '{ cloudflared access login "$1" >/dev/null && '
+            'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
+        )
+    }
+
+
+def test_auth_sso_cloudflare_access_rejects_duplicate_access_token_command(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso",
+            "https://matrix.example.com",
+            "--cloudflare-access",
+            "--header-command",
+            "cf-access-token: print-token",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cf-access-token" in result.output
+
+
+def test_auth_sso_cloudflare_access_rejects_duplicate_access_token_header(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso",
+            "https://matrix.example.com",
+            "--cloudflare-access",
+            "--header",
+            "cf-access-token: static-token",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cf-access-token" in result.output
+
+
 def test_auth_sso_url_prints_and_opens_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     opened_urls: list[str] = []
     monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", opened_urls.append)

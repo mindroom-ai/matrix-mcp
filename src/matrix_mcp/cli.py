@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -143,13 +144,26 @@ def auth_sso(
         "--header-command",
         help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
     ),
+    cloudflare_access: bool = typer.Option(
+        False,
+        "--cloudflare-access",
+        help="Use cloudflared to provide a Cloudflare Access token header",
+    ),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
     """Login through Matrix SSO in a browser and save the resulting access token."""
     from matrix_mcp.auth import SSOCallbackServer, build_sso_redirect_url, login_with_token
 
     config_path = _resolve_config_path(config)
-    header_config = _http_header_config(header, header_command)
+    header_config = _http_header_config(
+        header,
+        _with_cloudflare_access_header_command(
+            homeserver=homeserver,
+            header_values=header,
+            header_command_values=header_command,
+            enabled=cloudflare_access,
+        ),
+    )
     callback = SSOCallbackServer(host=callback_host, port=callback_port)
     try:
         url = build_sso_redirect_url(
@@ -237,6 +251,35 @@ def _http_header_config(
         headers=parse_http_headers(header_values),
         commands=parse_http_header_commands(header_command_values),
     )
+
+
+def _with_cloudflare_access_header_command(
+    *,
+    homeserver: str,
+    header_values: list[str] | None,
+    header_command_values: list[str] | None,
+    enabled: bool,
+) -> list[str] | None:
+    if not enabled:
+        return header_command_values
+
+    commands = list(header_command_values or [])
+    header_name = "cf-access-token"
+    configured_header_names = [
+        raw.partition(":")[0].strip().lower() for raw in [*(header_values or []), *commands]
+    ]
+    if header_name in configured_header_names:
+        msg = "--cloudflare-access cannot be combined with a cf-access-token header"
+        raise typer.BadParameter(msg)
+
+    command = (
+        'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
+        '{ cloudflared access login "$1" >/dev/null && '
+        'cloudflared access token -app="$1"; }\' -- '
+        f"{shlex.quote(homeserver.rstrip('/'))}"
+    )
+    commands.append(f"{header_name}: {command}")
+    return commands
 
 
 class ProviderLike(Protocol):
