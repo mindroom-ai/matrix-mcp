@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 
@@ -44,6 +45,9 @@ def _parse_header_mapping(header_values: list[str] | None, *, value_label: str) 
 
 
 def _run_header_command(*, name: str, command: str) -> str:
+    if _is_cloudflare_access_header_command(name=name, command=command):
+        _require_cloudflared("The stored cf-access-token header command")
+
     try:
         args = shlex.split(command)
     except ValueError as exc:
@@ -80,3 +84,23 @@ def _run_header_command(*, name: str, command: str) -> str:
         msg = f"HTTP header command for {name!r} produced no output"
         raise RuntimeError(msg)
     return value
+
+
+def cloudflared_missing_message(context: str) -> str:
+    return (
+        f"{context} requires the cloudflared CLI, but it was not found on PATH.\n\n"
+        "Install cloudflared, then rerun this command.\n\n"
+        "macOS with Homebrew:\n"
+        "  brew install cloudflared\n\n"
+        "Other platforms:\n"
+        "  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+    )
+
+
+def _require_cloudflared(context: str) -> None:
+    if shutil.which("cloudflared") is None:
+        raise RuntimeError(cloudflared_missing_message(context))
+
+
+def _is_cloudflare_access_header_command(*, name: str, command: str) -> bool:
+    return name.lower() == "cf-access-token" and "cloudflared access" in command

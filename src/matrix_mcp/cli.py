@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import shutil
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -147,7 +148,7 @@ def auth_sso(
     cloudflare_access: bool = typer.Option(
         False,
         "--cloudflare-access",
-        help="Use cloudflared to provide a Cloudflare Access token header",
+        help="Use cloudflared on PATH to provide a Cloudflare Access token header",
     ),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
@@ -271,6 +272,10 @@ def _with_cloudflare_access_header_command(
     if header_name in configured_header_names:
         msg = "--cloudflare-access cannot be combined with a cf-access-token header"
         raise typer.BadParameter(msg)
+    if shutil.which("cloudflared") is None:
+        from matrix_mcp.http_headers import cloudflared_missing_message
+
+        raise typer.BadParameter(cloudflared_missing_message("--cloudflare-access"))
 
     command = (
         'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '

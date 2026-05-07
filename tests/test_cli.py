@@ -309,6 +309,7 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
     monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
     monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
     monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", lambda _url: None)
+    monkeypatch.setattr("matrix_mcp.cli.shutil.which", lambda name: f"/usr/bin/{name}")
     runner = CliRunner()
 
     result = runner.invoke(
@@ -332,6 +333,49 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
             'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
         )
     }
+
+
+def test_auth_sso_cloudflare_access_requires_cloudflared_before_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_urls: list[str] = []
+    callback_starts: list[dict[str, object]] = []
+
+    class FakeCallback:
+        redirect_url = "http://127.0.0.1:8767/callback"
+
+        def __init__(self, **kwargs: object) -> None:
+            callback_starts.append(kwargs)
+
+        def wait_for_token(self) -> str:
+            return "login-token"
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
+    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", opened_urls.append)
+    monkeypatch.setattr("matrix_mcp.cli.shutil.which", lambda _name: None)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "sso",
+            "https://matrix.example.com",
+            "--cloudflare-access",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--cloudflare-access requires the cloudflared CLI" in result.output
+    assert "brew install cloudflared" in result.output
+    assert callback_starts == []
+    assert opened_urls == []
 
 
 def test_auth_sso_cloudflare_access_rejects_duplicate_access_token_command(
