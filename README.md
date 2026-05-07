@@ -68,8 +68,11 @@ For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic
 an existing token or start a Cloudflare Access login when needed:
 
 ```bash
+brew install cloudflared
 matrix-mcp auth sso https://matrix.example.com --cloudflare-access
 ```
+
+For other platforms, install `cloudflared` from Cloudflare's downloads page.
 
 Existing Matrix access token:
 

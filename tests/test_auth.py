@@ -193,6 +193,24 @@ def test_resolve_http_headers_reports_header_command_failures(
         resolve_http_headers(http_header_commands={"X-Dynamic": command})
 
 
+def test_resolve_http_headers_reports_missing_cloudflared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = (
+        'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
+        '{ cloudflared access login "$1" >/dev/null && '
+        'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
+    )
+    monkeypatch.setattr("matrix_mcp.http_headers.shutil.which", lambda _name: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        resolve_http_headers(http_header_commands={"cf-access-token": command})
+
+    message = str(exc_info.value)
+    assert "cloudflared CLI" in message
+    assert "brew install cloudflared" in message
+
+
 @pytest.mark.asyncio
 async def test_login_with_password_uses_matrix_client(
     monkeypatch: pytest.MonkeyPatch,

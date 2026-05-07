@@ -38,11 +38,15 @@ matrix-mcp auth sso https://matrix.example.com \
 ```
 
 For Cloudflare Access, use the built-in preset instead. It stores a dynamic
-`cf-access-token` header command backed by the local `cloudflared` CLI:
+`cf-access-token` header command backed by the local `cloudflared` CLI. On macOS
+with Homebrew, install it first:
 
 ```bash
+brew install cloudflared
 matrix-mcp auth sso https://matrix.example.com --cloudflare-access
 ```
+
+For other platforms, install `cloudflared` from Cloudflare's downloads page.
 
 ### Logout
 
