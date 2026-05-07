@@ -37,6 +37,13 @@ matrix-mcp auth sso https://matrix.example.com \
   --header-command "X-Access-Token: access-gateway-cli token --app https://matrix.example.com"
 ```
 
+For Cloudflare Access, use the built-in preset instead. It stores a dynamic
+`cf-access-token` header command backed by the local `cloudflared` CLI:
+
+```bash
+matrix-mcp auth sso https://matrix.example.com --cloudflare-access
+```
+
 ### Logout
 
 ```bash
