@@ -3,17 +3,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from matrix_mcp.auth import LoginResult
-from matrix_mcp.cli import app
+from matrix_mcp.cli import _with_cloudflare_access_header_command, app
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import HTTPHeaderConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def test_auth_logout_removes_stored_credentials(tmp_path: Path) -> None:
@@ -372,10 +372,28 @@ def test_auth_sso_cloudflare_access_requires_cloudflared_before_browser(
     )
 
     assert result.exit_code == 2
-    assert "--cloudflare-access requires the cloudflared CLI" in result.output
+    assert "cloudflared CLI" in result.output
     assert "brew install cloudflared" in result.output
     assert callback_starts == []
     assert opened_urls == []
+
+
+def test_cloudflare_access_header_command_reports_missing_cloudflared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("matrix_mcp.cli.shutil.which", lambda _name: None)
+
+    with pytest.raises(typer.BadParameter) as exc_info:
+        _with_cloudflare_access_header_command(
+            homeserver="https://matrix.example.com",
+            header_values=None,
+            header_command_values=None,
+            enabled=True,
+        )
+
+    message = str(exc_info.value)
+    assert "--cloudflare-access requires the cloudflared CLI" in message
+    assert "brew install cloudflared" in message
 
 
 def test_auth_sso_cloudflare_access_rejects_duplicate_access_token_command(
