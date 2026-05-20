@@ -23,6 +23,12 @@ matrix-mcp auth sso https://matrix.example.com
 claude mcp add matrix -- matrix-mcp serve
 ```
 
+For Codex, use:
+
+```bash
+codex mcp add matrix -- matrix-mcp serve
+```
+
 Continue with [Getting Started](getting-started.md), or see the [usage guide](usage.md) for the full tool surface.
 
 ## Features

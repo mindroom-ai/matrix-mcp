@@ -10,7 +10,7 @@ You need:
 
 - Python 3.12+
 - [`uv`](https://docs.astral.sh/uv/)
-- an MCP client such as Claude Code
+- an MCP client such as Claude Code or Codex
 - a Matrix homeserver account
 
 ## Installation
@@ -73,11 +73,20 @@ matrix-mcp auth token https://matrix.example.com @alice:example.com "$MATRIX_ACC
 matrix-mcp auth password https://matrix.example.com @alice:example.com
 ```
 
-## Configure Claude Code
+## Configure an MCP Client
 
-```bash
-claude mcp add matrix -- matrix-mcp serve
-```
+=== "Claude Code"
+
+    ```bash
+    claude mcp add matrix -- matrix-mcp serve
+    ```
+
+=== "Codex"
+
+    ```bash
+    codex mcp add matrix -- matrix-mcp serve
+    ```
+
 
 The server runs over stdio and does not expose a local HTTP port during normal MCP operation.
 
