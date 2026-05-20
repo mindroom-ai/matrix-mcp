@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import shutil
+import subprocess
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -156,14 +157,17 @@ def auth_sso(
     from matrix_mcp.auth import SSOCallbackServer, build_sso_redirect_url, login_with_token
 
     config_path = _resolve_config_path(config)
+    header_command = _with_cloudflare_access_header_command(
+        homeserver=homeserver,
+        header_values=header,
+        header_command_values=header_command,
+        enabled=cloudflare_access,
+    )
+    if cloudflare_access:
+        _ensure_cloudflare_access_login(homeserver=homeserver)
     header_config = _http_header_config(
         header,
-        _with_cloudflare_access_header_command(
-            homeserver=homeserver,
-            header_values=header,
-            header_command_values=header_command,
-            enabled=cloudflare_access,
-        ),
+        header_command,
     )
     callback = SSOCallbackServer(host=callback_host, port=callback_port)
     try:
@@ -277,14 +281,79 @@ def _with_cloudflare_access_header_command(
 
         raise typer.BadParameter(cloudflared_missing_message("--cloudflare-access"))
 
-    command = (
-        'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
-        '{ cloudflared access login "$1" >/dev/null && '
-        'cloudflared access token -app="$1"; }\' -- '
-        f"{shlex.quote(homeserver.rstrip('/'))}"
-    )
+    command = shlex.join(_cloudflare_access_token_args(homeserver.rstrip("/")))
     commands.append(f"{header_name}: {command}")
     return commands
+
+
+def _ensure_cloudflare_access_login(*, homeserver: str) -> None:
+    cloudflared = _cloudflared_executable()
+    app_url = homeserver.rstrip("/")
+    token_args = _cloudflare_access_token_args(app_url, executable=cloudflared)
+    if _cloudflare_access_token_available(token_args):
+        return
+
+    typer.echo("Opening Cloudflare Access login with cloudflared...", err=True)
+    try:
+        login_completed = subprocess.run(  # noqa: S603
+            [cloudflared, "access", "login", app_url],
+            check=False,
+        )
+    except OSError as exc:
+        msg = f"Failed to run cloudflared access login: {exc}"
+        raise typer.BadParameter(msg) from exc
+    if login_completed.returncode != 0:
+        msg = f"cloudflared access login failed with exit {login_completed.returncode}"
+        raise typer.BadParameter(msg)
+
+    try:
+        token_completed = subprocess.run(  # noqa: S603
+            token_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+    except OSError as exc:
+        msg = f"Failed to run cloudflared access token: {exc}"
+        raise typer.BadParameter(msg) from exc
+    except subprocess.TimeoutExpired as exc:
+        msg = "cloudflared access token timed out after Cloudflare Access login"
+        raise typer.BadParameter(msg) from exc
+
+    if token_completed.returncode != 0:
+        detail = token_completed.stderr.strip() or f"exit {token_completed.returncode}"
+        msg = f"cloudflared access token failed after Cloudflare Access login: {detail}"
+        raise typer.BadParameter(msg)
+
+
+def _cloudflare_access_token_available(token_args: list[str]) -> bool:
+    try:
+        completed = subprocess.run(  # noqa: S603
+            token_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _cloudflare_access_token_args(app_url: str, *, executable: str = "cloudflared") -> list[str]:
+    return [executable, "access", "token", f"-app={app_url}"]
+
+
+def _cloudflared_executable() -> str:
+    executable = shutil.which("cloudflared")
+    if executable is not None:
+        return executable
+
+    from matrix_mcp.http_headers import cloudflared_missing_message
+
+    raise typer.BadParameter(cloudflared_missing_message("--cloudflare-access"))
 
 
 class ProviderLike(Protocol):
