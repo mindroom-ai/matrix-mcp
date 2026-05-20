@@ -64,8 +64,8 @@ matrix-mcp auth sso https://matrix.example.com \
 ```
 
 For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic
-`cf-access-token` header for you. This uses the local `cloudflared` CLI to read
-an existing token or start a Cloudflare Access login when needed:
+`cf-access-token` header for you. This uses the local `cloudflared` CLI to log in
+when needed during setup, then stores a command that reads the current token:
 
 ```bash
 brew install cloudflared

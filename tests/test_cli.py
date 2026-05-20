@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -7,6 +8,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from matrix_mcp import cli
 from matrix_mcp.auth import LoginResult
 from matrix_mcp.cli import _with_cloudflare_access_header_command, app
 from matrix_mcp.config import MatrixMCPConfig
@@ -265,6 +267,7 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = tmp_path / "config.json"
+    calls: list[str] = []
 
     class FakeCallback:
         redirect_url = "http://127.0.0.1:8767/callback"
@@ -274,6 +277,7 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
             assert port == 0
 
         def wait_for_token(self) -> str:
+            assert calls == ["cloudflare-login", "matrix-sso-browser"]
             return "login-token"
 
         def close(self) -> None:
@@ -290,13 +294,7 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
         assert login_token == "login-token"
         assert device_name == "matrix-mcp"
         assert header_config == HTTPHeaderConfig(
-            commands={
-                "cf-access-token": (
-                    'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
-                    '{ cloudflared access login "$1" >/dev/null && '
-                    'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
-                )
-            }
+            commands={"cf-access-token": "cloudflared access token -app=https://matrix.example.com"}
         )
         return LoginResult(
             homeserver=homeserver,
@@ -308,8 +306,21 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
 
     monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
     monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
-    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", lambda _url: None)
+    monkeypatch.setattr(
+        "matrix_mcp.cli.webbrowser.open",
+        lambda _url: calls.append("matrix-sso-browser"),
+    )
     monkeypatch.setattr("matrix_mcp.cli.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def fake_ensure_cloudflare_access_login(*, homeserver: str) -> None:
+        assert homeserver == "https://matrix.example.com"
+        calls.append("cloudflare-login")
+
+    monkeypatch.setattr(
+        "matrix_mcp.cli._ensure_cloudflare_access_login",
+        fake_ensure_cloudflare_access_login,
+        raising=False,
+    )
     runner = CliRunner()
 
     result = runner.invoke(
@@ -327,11 +338,7 @@ def test_auth_sso_cloudflare_access_adds_access_token_header_command(
     assert result.exit_code == 0
     saved = MatrixMCPConfig.load(config)
     assert saved.http_header_commands == {
-        "cf-access-token": (
-            'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
-            '{ cloudflared access login "$1" >/dev/null && '
-            'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
-        )
+        "cf-access-token": "cloudflared access token -app=https://matrix.example.com"
     }
 
 
@@ -394,6 +401,42 @@ def test_cloudflare_access_header_command_reports_missing_cloudflared(
     message = str(exc_info.value)
     assert "--cloudflare-access requires the cloudflared CLI" in message
     assert "brew install cloudflared" in message
+
+
+def test_cloudflare_access_login_preflight_logs_in_when_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], object, object]] = []
+    results = iter(
+        [
+            SimpleNamespace(returncode=1, stderr=""),
+            SimpleNamespace(returncode=0, stderr=""),
+            SimpleNamespace(returncode=0, stderr=""),
+        ]
+    )
+
+    def fake_run(args: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((args, kwargs.get("stdout"), kwargs.get("stderr")))
+        return next(results)
+
+    monkeypatch.setattr("matrix_mcp.cli.shutil.which", lambda _name: "/usr/bin/cloudflared")
+    monkeypatch.setattr("matrix_mcp.cli.subprocess.run", fake_run)
+
+    cli._ensure_cloudflare_access_login(homeserver="https://matrix.example.com")  # noqa: SLF001
+
+    assert calls == [
+        (
+            ["/usr/bin/cloudflared", "access", "token", "-app=https://matrix.example.com"],
+            subprocess.DEVNULL,
+            subprocess.DEVNULL,
+        ),
+        (["/usr/bin/cloudflared", "access", "login", "https://matrix.example.com"], None, None),
+        (
+            ["/usr/bin/cloudflared", "access", "token", "-app=https://matrix.example.com"],
+            subprocess.DEVNULL,
+            subprocess.PIPE,
+        ),
+    ]
 
 
 def test_auth_sso_cloudflare_access_rejects_duplicate_access_token_command(

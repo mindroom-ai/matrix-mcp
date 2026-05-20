@@ -196,11 +196,7 @@ def test_resolve_http_headers_reports_header_command_failures(
 def test_resolve_http_headers_reports_missing_cloudflared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    command = (
-        'sh -c \'cloudflared access token -app="$1" 2>/dev/null || '
-        '{ cloudflared access login "$1" >/dev/null && '
-        'cloudflared access token -app="$1"; }\' -- https://matrix.example.com'
-    )
+    command = "cloudflared access token -app=https://matrix.example.com"
     monkeypatch.setattr("matrix_mcp.http_headers.shutil.which", lambda _name: None)
 
     with pytest.raises(RuntimeError) as exc_info:
