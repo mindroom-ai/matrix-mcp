@@ -19,7 +19,7 @@ It is designed for workflows where a local coding agent should be able to read M
 
 ```bash
 uv tool install matrix-mcp
-matrix-mcp auth sso https://matrix.example.com
+matrix-mcp auth sso https://mindroom.chat
 claude mcp add matrix -- matrix-mcp serve
 ```
 

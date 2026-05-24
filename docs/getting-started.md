@@ -46,31 +46,31 @@ You need:
 ### Matrix SSO
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com
+matrix-mcp auth sso https://mindroom.chat
 ```
 
 If the homeserver advertises multiple SSO providers, list them:
 
 ```bash
-matrix-mcp auth providers https://matrix.example.com
+matrix-mcp auth providers https://mindroom.chat
 ```
 
 Then pass the provider ID explicitly:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com --idp-id github
+matrix-mcp auth sso https://mindroom.chat --idp-id github
 ```
 
 ### Existing Matrix Access Token
 
 ```bash
-matrix-mcp auth token https://matrix.example.com @alice:example.com "$MATRIX_ACCESS_TOKEN" --device-id DEVICEID
+matrix-mcp auth token https://mindroom.chat @alice:mindroom.chat "$MATRIX_ACCESS_TOKEN" --device-id DEVICEID
 ```
 
 ### Password Auth
 
 ```bash
-matrix-mcp auth password https://matrix.example.com @alice:example.com
+matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
 ```
 
 ## Configure an MCP Client

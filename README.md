@@ -31,26 +31,26 @@ uv sync --extra dev
 Matrix SSO:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com
+matrix-mcp auth sso https://mindroom.chat
 ```
 
 If the homeserver advertises multiple SSO providers, list their provider IDs:
 
 ```bash
-matrix-mcp auth providers https://matrix.example.com
+matrix-mcp auth providers https://mindroom.chat
 ```
 
 Then pass the provider ID explicitly:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com --idp-id github
+matrix-mcp auth sso https://mindroom.chat --idp-id github
 ```
 
 If your homeserver is behind an access gateway that requires extra request headers, pass them during login.
 They are stored with the Matrix credentials and reused by MCP tools:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com \
+matrix-mcp auth sso https://mindroom.chat \
   --header "X-Access-Client-Id: ..." \
   --header "X-Access-Client-Secret: ..."
 ```
@@ -59,8 +59,8 @@ If the gateway header is short-lived, store a command that prints the current he
 The command is re-run when Matrix MCP creates a client for tool calls:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com \
-  --header-command "X-Access-Token: access-gateway-cli token --app https://matrix.example.com"
+matrix-mcp auth sso https://mindroom.chat \
+  --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
 ```
 
 For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic
@@ -69,7 +69,7 @@ when needed during setup, then stores a command that reads the current token:
 
 ```bash
 brew install cloudflared
-matrix-mcp auth sso https://matrix.example.com --cloudflare-access
+matrix-mcp auth sso https://mindroom.chat --cloudflare-access
 ```
 
 For other platforms, install `cloudflared` from Cloudflare's downloads page.
@@ -77,13 +77,13 @@ For other platforms, install `cloudflared` from Cloudflare's downloads page.
 Existing Matrix access token:
 
 ```bash
-matrix-mcp auth token https://matrix.example.com @alice:example.com "$MATRIX_ACCESS_TOKEN" --device-id DEVICEID
+matrix-mcp auth token https://mindroom.chat @alice:mindroom.chat "$MATRIX_ACCESS_TOKEN" --device-id DEVICEID
 ```
 
 Password auth, when enabled by the homeserver:
 
 ```bash
-matrix-mcp auth password https://matrix.example.com @alice:example.com
+matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
 ```
 
 Credentials are stored in the user config directory reported by:
