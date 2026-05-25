@@ -34,8 +34,8 @@ def config_path() -> None:
 
 @auth_app.command("token")
 def auth_token(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL, e.g. https://matrix.org"),
-    user_id: str = typer.Argument(..., help="Matrix user ID, e.g. @alice:example.com"),
+    homeserver: str = typer.Argument(..., help="Matrix homeserver URL, e.g. https://mindroom.chat"),
+    user_id: str = typer.Argument(..., help="Matrix user ID, e.g. @alice:mindroom.chat"),
     access_token: str = typer.Argument(..., help="Matrix access token"),
     device_id: str | None = typer.Option(None, help="Optional Matrix device ID"),
     header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),

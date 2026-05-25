@@ -9,13 +9,13 @@ icon: lucide/terminal
 ### SSO Login
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com
+matrix-mcp auth sso https://mindroom.chat
 ```
 
 ### SSO Provider Discovery
 
 ```bash
-matrix-mcp auth providers https://matrix.example.com
+matrix-mcp auth providers https://mindroom.chat
 ```
 
 ### Access Gateways
@@ -24,7 +24,7 @@ Some homeservers sit behind an access gateway that requires extra HTTP headers.
 Static headers can be stored during login:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com \
+matrix-mcp auth sso https://mindroom.chat \
   --header "X-Access-Client-Id: ..." \
   --header "X-Access-Client-Secret: ..."
 ```
@@ -33,8 +33,8 @@ For short-lived headers, store a command that prints the current value.
 Matrix MCP reruns this command when creating a Matrix client for later MCP tool calls:
 
 ```bash
-matrix-mcp auth sso https://matrix.example.com \
-  --header-command "X-Access-Token: access-gateway-cli token --app https://matrix.example.com"
+matrix-mcp auth sso https://mindroom.chat \
+  --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
 ```
 
 For Cloudflare Access, use the built-in preset instead. It stores a dynamic
@@ -44,7 +44,7 @@ macOS with Homebrew, install it first:
 
 ```bash
 brew install cloudflared
-matrix-mcp auth sso https://matrix.example.com --cloudflare-access
+matrix-mcp auth sso https://mindroom.chat --cloudflare-access
 ```
 
 For other platforms, install `cloudflared` from Cloudflare's downloads page.
