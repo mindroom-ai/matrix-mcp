@@ -12,6 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "MindRoom" }]
 dependencies = [
+  "anyio>=4",
   "fastmcp>=2.12",
   "httpx>=0.28",
   "mindroom-nio>=0.25",

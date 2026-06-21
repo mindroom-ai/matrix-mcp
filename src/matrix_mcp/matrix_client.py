@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import mimetypes
-from pathlib import Path
 from typing import Protocol, cast
 
+from anyio import Path as AsyncPath
 from nio import (
     AsyncClient,
     AsyncClientConfig,
@@ -153,7 +153,40 @@ class NioMatrixDriver:
             if event is not None:
                 events.append(event)
 
+        events = [
+            await self._event_with_latest_edit(room_id, event, page_size=max_replies)
+            for event in events
+        ]
         return sorted(events, key=_event_sort_key)
+
+    async def _event_with_latest_edit(
+        self, room_id: str, event: MatrixEvent, *, page_size: int
+    ) -> MatrixEvent:
+        latest_body: str | None = None
+        latest_key: tuple[int, str] | None = None
+
+        async for raw in self._client.room_get_event_relations(
+            room_id,
+            event.event_id,
+            rel_type=RelationshipType.replacement,
+            event_type="m.room.message",
+            direction=MessageDirection.front,
+            limit=page_size,
+        ):
+            body = _replacement_body_for(raw, event)
+            if body is None:
+                continue
+            key = (
+                raw.server_timestamp if raw.server_timestamp is not None else -1,
+                raw.event_id,
+            )
+            if latest_key is None or key > latest_key:
+                latest_key = key
+                latest_body = body
+
+        if latest_body is None:
+            return event
+        return event.model_copy(update={"body": latest_body})
 
     async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
         content: dict[str, object] = {
@@ -181,19 +214,21 @@ class NioMatrixDriver:
         filename: str | None = None,
         content_type: str | None = None,
     ) -> str:
-        path = Path(file_path).expanduser()
+        path = await AsyncPath(file_path).expanduser()
         display_name = filename or path.name
         resolved_content_type = content_type or mimetypes.guess_type(display_name)[0]
         resolved_content_type = resolved_content_type or "application/octet-stream"
-        size = path.stat().st_size
+        size = (await path.stat()).st_size
 
-        with path.open("rb") as file:
-            upload_response, _decryption_info = await self._client.upload(
-                file,
-                content_type=resolved_content_type,
-                filename=display_name,
-                filesize=size,
-            )
+        def upload_path(_got_429: int, _got_timeouts: int) -> str:
+            return str(path)
+
+        upload_response, _decryption_info = await self._client.upload(
+            upload_path,
+            content_type=resolved_content_type,
+            filename=display_name,
+            filesize=size,
+        )
         if isinstance(upload_response, UploadResponse):
             content = _file_message_content(
                 content_uri=upload_response.content_uri,
@@ -318,8 +353,8 @@ def _event_from_nio(raw: object) -> MatrixEvent | None:
     if not isinstance(raw, RoomMessageText):
         return None
     thread_id = None
-    relates_to = getattr(raw, "relates_to", None)
-    if isinstance(relates_to, dict) and relates_to.get("rel_type") == "m.thread":
+    relates_to = _relates_to_from_nio(raw)
+    if relates_to is not None and _relationship_type(relates_to) == RelationshipType.thread.value:
         raw_thread_id = relates_to.get("event_id")
         thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
     return MatrixEvent(
@@ -329,6 +364,53 @@ def _event_from_nio(raw: object) -> MatrixEvent | None:
         body=raw.body,
         thread_id=thread_id,
     )
+
+
+def _replacement_body_for(raw: object, event: MatrixEvent) -> str | None:
+    if not isinstance(raw, RoomMessageText):
+        return None
+    if raw.sender != event.sender:
+        return None
+
+    relates_to = _relates_to_from_nio(raw)
+    if relates_to is None or _relationship_type(relates_to) != RelationshipType.replacement.value:
+        return None
+    if relates_to.get("event_id") != event.event_id:
+        return None
+
+    content = _content_from_nio(raw)
+    new_content = content.get("m.new_content") if content is not None else None
+    if not isinstance(new_content, dict):
+        return None
+    body = cast("dict[str, object]", new_content).get("body")
+    return body if isinstance(body, str) else None
+
+
+def _relates_to_from_nio(raw: RoomMessageText) -> dict[str, object] | None:
+    relates_to = getattr(raw, "relates_to", None)
+    if isinstance(relates_to, dict):
+        return cast("dict[str, object]", relates_to)
+
+    content = _content_from_nio(raw)
+    if content is None:
+        return None
+    relates_to = content.get("m.relates_to")
+    return cast("dict[str, object]", relates_to) if isinstance(relates_to, dict) else None
+
+
+def _content_from_nio(raw: RoomMessageText) -> dict[str, object] | None:
+    source = getattr(raw, "source", None)
+    if not isinstance(source, dict):
+        return None
+    content = source.get("content")
+    return cast("dict[str, object]", content) if isinstance(content, dict) else None
+
+
+def _relationship_type(relates_to: dict[str, object]) -> str | None:
+    rel_type = relates_to.get("rel_type")
+    if isinstance(rel_type, RelationshipType):
+        return cast("str", rel_type.value)
+    return rel_type if isinstance(rel_type, str) else None
 
 
 def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:
