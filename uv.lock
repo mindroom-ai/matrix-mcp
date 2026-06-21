@@ -1031,6 +1031,7 @@ wheels = [
 name = "matrix-mcp"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "mindroom-nio" },
@@ -1060,6 +1061,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4" },
     { name = "fastmcp", specifier = ">=2.12" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "mindroom-nio", specifier = ">=0.25" },
