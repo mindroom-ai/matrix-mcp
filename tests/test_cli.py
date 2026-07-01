@@ -263,6 +263,56 @@ def test_auth_sso_saves_login_result_after_browser_callback(
     assert saved.access_token == "test-token"
 
 
+@pytest.mark.parametrize("browser_opened", [True, False])
+def test_auth_sso_prints_ssh_hint_when_no_browser_opens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    browser_opened: bool,
+) -> None:
+    config = tmp_path / "config.json"
+
+    class FakeCallback:
+        def __init__(self, *, host: str, port: int) -> None:
+            del host, port
+            self.redirect_url = "http://127.0.0.1:8767/callback"
+
+        def wait_for_token(self) -> str:
+            return "login-token"
+
+        def close(self) -> None:
+            pass
+
+    async def fake_login_with_token(
+        *,
+        homeserver: str,
+        login_token: str,
+        device_name: str,
+        header_config: HTTPHeaderConfig,
+    ) -> LoginResult:
+        del login_token, device_name, header_config
+        return LoginResult(
+            homeserver=homeserver,
+            user_id="@alice:example.com",
+            device_id="DEVICE",
+            access_token="test-token",
+        )
+
+    monkeypatch.setattr("matrix_mcp.auth.SSOCallbackServer", FakeCallback)
+    monkeypatch.setattr("matrix_mcp.auth.login_with_token", fake_login_with_token)
+    monkeypatch.setattr("matrix_mcp.cli.webbrowser.open", lambda _url: browser_opened)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["auth", "sso", "https://matrix.example.com", "--config", str(config)],
+    )
+
+    assert result.exit_code == 0
+    hint = "ssh -N -L 8767:127.0.0.1:8767"
+    assert (hint in result.output) is not browser_opened
+
+
 def test_auth_sso_cloudflare_access_adds_access_token_header_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

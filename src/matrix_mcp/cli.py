@@ -7,6 +7,7 @@ import subprocess
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
+from urllib.parse import urlsplit
 
 import typer
 
@@ -175,7 +176,14 @@ def auth_sso(
             homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
         )
         typer.echo(f"Opening Matrix SSO URL: {url}")
-        webbrowser.open(url)
+        if not webbrowser.open(url):
+            port = urlsplit(callback.redirect_url).port
+            typer.echo(
+                "No browser opened on this machine. If you are connected over SSH, "
+                "forward the callback port from the machine with your browser "
+                f"(ssh -N -L {port}:127.0.0.1:{port} remote-host) and open the URL "
+                "above there. See https://matrix-mcp.mindroom.chat/getting-started/."
+            )
         login_token = callback.wait_for_token()
         result = asyncio.run(
             login_with_token(

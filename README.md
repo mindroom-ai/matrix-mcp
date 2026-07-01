@@ -46,6 +46,26 @@ Then pass the provider ID explicitly:
 matrix-mcp auth sso https://mindroom.chat --idp-id github
 ```
 
+The SSO flow starts a temporary callback server on the machine running `matrix-mcp` and waits for the browser to be redirected to it.
+If that machine is remote (for example over SSH), a browser on your local machine cannot reach the callback.
+Pin the callback port and forward it from the machine with your browser:
+
+```bash
+# on the remote machine
+matrix-mcp auth sso https://mindroom.chat --callback-port 8765
+```
+
+```bash
+# on your local machine, in a second terminal
+ssh -N -L 8765:127.0.0.1:8765 remote-host
+```
+
+Then open the printed SSO URL in your local browser.
+After login, the homeserver redirects to `http://127.0.0.1:8765/callback`, which SSH forwards to the waiting command on the remote machine.
+If port forwarding is not an option, use the manual flow described in the
+[getting started guide](https://matrix-mcp.mindroom.chat/getting-started/) with
+`matrix-mcp auth sso-url` and `matrix-mcp auth login-token`.
+
 If your homeserver is behind an access gateway that requires extra request headers, pass them during login.
 They are stored with the Matrix credentials and reused by MCP tools:
 
