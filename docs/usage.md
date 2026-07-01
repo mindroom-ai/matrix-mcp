@@ -24,7 +24,7 @@ matrix-mcp auth providers https://mindroom.chat
 When that machine has no browser (for example over SSH), either pin the callback port and forward it with `ssh -L`, or exchange the login token manually:
 
 ```bash
-matrix-mcp auth sso https://mindroom.chat --callback-port 8765   # with ssh -L 8765:127.0.0.1:8765
+matrix-mcp auth sso https://mindroom.chat --callback-port 8765   # with ssh -N -L 8765:127.0.0.1:8765
 matrix-mcp auth sso-url https://mindroom.chat http://127.0.0.1:8765/callback
 matrix-mcp auth login-token https://mindroom.chat syt_...
 ```

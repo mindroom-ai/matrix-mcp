@@ -57,7 +57,7 @@ matrix-mcp auth sso https://mindroom.chat --callback-port 8765
 
 ```bash
 # on your local machine, in a second terminal
-ssh -L 8765:127.0.0.1:8765 remote-host
+ssh -N -L 8765:127.0.0.1:8765 remote-host
 ```
 
 Then open the printed SSO URL in your local browser.

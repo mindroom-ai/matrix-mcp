@@ -309,7 +309,8 @@ def test_auth_sso_prints_ssh_hint_when_no_browser_opens(
     )
 
     assert result.exit_code == 0
-    assert ("--callback-port" in result.output) is not browser_opened
+    hint = "ssh -N -L 8767:127.0.0.1:8767"
+    assert (hint in result.output) is not browser_opened
 
 
 def test_auth_sso_cloudflare_access_adds_access_token_header_command(

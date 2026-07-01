@@ -77,7 +77,7 @@ If that machine is remote — an SSH session, a VM, a container — a browser on
     While that command waits, forward the port from your local machine in a second terminal:
 
     ```bash
-    ssh -L 8765:127.0.0.1:8765 remote-host
+    ssh -N -L 8765:127.0.0.1:8765 remote-host
     ```
 
     Open the printed SSO URL in your local browser.
