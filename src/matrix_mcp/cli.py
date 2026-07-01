@@ -175,7 +175,13 @@ def auth_sso(
             homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
         )
         typer.echo(f"Opening Matrix SSO URL: {url}")
-        webbrowser.open(url)
+        if not webbrowser.open(url):
+            typer.echo(
+                "No browser opened on this machine. If you are connected over SSH, "
+                "re-run with --callback-port PORT, forward the port from the machine "
+                "with your browser (ssh -L PORT:127.0.0.1:PORT remote-host), and open "
+                "the URL above there. See https://matrix-mcp.mindroom.chat/getting-started/."
+            )
         login_token = callback.wait_for_token()
         result = asyncio.run(
             login_with_token(

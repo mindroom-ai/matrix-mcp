@@ -18,6 +18,19 @@ matrix-mcp auth sso https://mindroom.chat
 matrix-mcp auth providers https://mindroom.chat
 ```
 
+### SSO on a Remote or Headless Machine
+
+`auth sso` waits for the browser to hit a callback server on the machine running the command.
+When that machine has no browser (for example over SSH), either pin the callback port and forward it with `ssh -L`, or exchange the login token manually:
+
+```bash
+matrix-mcp auth sso https://mindroom.chat --callback-port 8765   # with ssh -L 8765:127.0.0.1:8765
+matrix-mcp auth sso-url https://mindroom.chat http://127.0.0.1:8765/callback
+matrix-mcp auth login-token https://mindroom.chat syt_...
+```
+
+See the [getting started guide](getting-started.md#sso-over-ssh-or-on-a-headless-machine) for the full walkthrough.
+
 ### Access Gateways
 
 Some homeservers sit behind an access gateway that requires extra HTTP headers.
