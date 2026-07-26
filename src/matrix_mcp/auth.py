@@ -9,6 +9,7 @@ from nio import AsyncClient, AsyncClientConfig, LoginResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
     from matrix_mcp.http_headers import HTTPHeaderConfig
@@ -86,7 +87,6 @@ def extract_login_token(query: str) -> str:
 class SSOCallbackServer:
     def __init__(self, *, host: str = "127.0.0.1", port: int = 0) -> None:
         self.token: str | None = None
-        self.error: Exception | None = None
 
         owner = self
 
@@ -94,14 +94,16 @@ class SSOCallbackServer:
             def do_GET(self) -> None:
                 try:
                     owner.token = extract_login_token(urlsplit(self.path).query)
-                    self.send_response(200)
+                except ValueError:
+                    # Stray request (favicon, prefetch, or a redirect that
+                    # lost the token) — keep waiting for the real callback.
+                    self.send_response(404)
                     self.end_headers()
-                    self.wfile.write(b"Matrix MCP login complete. You can close this tab.")
-                except Exception as exc:  # noqa: BLE001
-                    owner.error = exc
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"Matrix MCP login failed. Return to the terminal.")
+                    self.wfile.write(b"Waiting for the Matrix SSO login token.")
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"Matrix MCP login complete. You can close this tab.")
 
             def log_message(self, format: str, *_args: object) -> None:  # noqa: A002
                 del format, _args
@@ -111,14 +113,10 @@ class SSOCallbackServer:
 
     def wait_for_token(self) -> str:
         try:
-            self._server.handle_request()
+            while self.token is None:
+                self._server.handle_request()
         finally:
             self.close()
-        if self.error is not None:
-            raise self.error
-        if self.token is None:
-            msg = "Matrix SSO callback did not complete"
-            raise RuntimeError(msg)
         return self.token
 
     def close(self) -> None:
@@ -138,6 +136,9 @@ async def login_with_password(
         homeserver.rstrip("/"),
         user,
         config=AsyncClientConfig(custom_headers=resolved_headers or None),
+        # nio annotates ssl as bool but forwards it to aiohttp, which
+        # accepts an SSLContext.
+        ssl=default_ssl_context(),  # ty: ignore[invalid-argument-type]
     )
     try:
         response = await client.login(password=password, device_name=device_name)
