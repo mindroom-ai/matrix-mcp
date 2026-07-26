@@ -63,16 +63,19 @@ def test_sso_callback_server_accepts_browser_callback() -> None:
     assert token_future.result(timeout=1) == "abc123"
 
 
-def test_sso_callback_server_reports_browser_callback_errors() -> None:
+def test_sso_callback_server_ignores_requests_without_token() -> None:
     callback = SSOCallbackServer()
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         token_future = executor.submit(callback.wait_for_token)
-        response = httpx.get(callback.redirect_url)
+        stray_response = httpx.get(callback.redirect_url)
+        favicon_response = httpx.get(f"{callback.redirect_url.rsplit('/', 1)[0]}/favicon.ico")
+        response = httpx.get(f"{callback.redirect_url}?loginToken=abc123")
 
-    assert response.status_code == 400
-    with pytest.raises(ValueError, match="loginToken"):
-        token_future.result(timeout=1)
+    assert stray_response.status_code == 404
+    assert favicon_response.status_code == 404
+    assert response.status_code == 200
+    assert token_future.result(timeout=1) == "abc123"
 
 
 def test_extract_login_token_from_callback_query() -> None:
@@ -220,7 +223,9 @@ async def test_login_with_password_uses_matrix_client(
             user: str,
             *,
             config: AsyncClientConfig,
+            ssl: object | None = None,
         ) -> None:
+            del ssl
             self.homeserver = homeserver
             self.user = user
             self.config = config

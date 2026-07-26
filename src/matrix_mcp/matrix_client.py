@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from typing import Protocol, cast
 
@@ -22,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.id_state import MatrixIdStore
+from matrix_mcp.tls import default_ssl_context
 
 
 class MatrixRoom(BaseModel):
@@ -91,6 +93,9 @@ class NioMatrixDriver:
                 )
                 or None
             ),
+            # nio annotates ssl as bool but forwards it to aiohttp, which
+            # accepts an SSLContext.
+            ssl=default_ssl_context(),  # ty: ignore[invalid-argument-type]
         )
         self._client.restore_login(
             user_id=config.user_id,
@@ -104,9 +109,10 @@ class NioMatrixDriver:
     async def list_rooms(self) -> list[MatrixRoom]:
         response = await self._client.joined_rooms()
         if isinstance(response, JoinedRoomsResponse):
+            names = await asyncio.gather(*(self._room_name(room_id) for room_id in response.rooms))
             return [
-                MatrixRoom(room_id=room_id, name=await self._room_name(room_id))
-                for room_id in response.rooms
+                MatrixRoom(room_id=room_id, name=name)
+                for room_id, name in zip(response.rooms, names, strict=True)
             ]
         msg = f"Matrix joined_rooms failed: {response}"
         raise RuntimeError(msg)

@@ -150,7 +150,9 @@ class FakeNioClient:
         user_id: str,
         *,
         config: AsyncClientConfig,
+        ssl: object | None = None,
     ) -> None:
+        del ssl
         self.homeserver = homeserver
         self.user_id = user_id
         self.config = config
