@@ -25,9 +25,36 @@ def test_default_ssl_context_falls_back_to_certifi(monkeypatch: pytest.MonkeyPat
             return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         return real_create(cafile=cafile)
 
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     monkeypatch.setattr(ssl, "create_default_context", fake_create)
 
     context = default_ssl_context()
 
     assert calls == [None, certifi.where()]
     assert context.cert_store_stats()["x509_ca"] > 0
+
+
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_default_ssl_context_preserves_explicit_ca_sources(
+    variable: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | None] = []
+    initial_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    fallback_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setenv(variable, "/configured/ca/source")
+
+    def fake_create(*, cafile: str | None = None) -> ssl.SSLContext:
+        calls.append(cafile)
+        return initial_context if cafile is None else fallback_context
+
+    monkeypatch.setattr(ssl, "create_default_context", fake_create)
+
+    context = default_ssl_context()
+
+    assert context is initial_context
+    assert calls == [None]
