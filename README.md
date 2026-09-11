@@ -14,6 +14,10 @@ Local-first Matrix access for MCP clients.
 Matrix MCP lets Claude Code and other MCP clients read and write Matrix rooms.
 It is intended to make MindRoom conversations available to local coding agents without giving hosted agents access to the local filesystem.
 
+For remote clients, opt into [authenticated HTTP](docs/hosted.md). Each caller
+connects its own Matrix account through browser SSO. Hosted tools use raw Matrix
+IDs and support reads and text sends, with no local-file access.
+
 ## Install
 
 ```bash

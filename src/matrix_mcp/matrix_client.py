@@ -103,6 +103,9 @@ class NioMatrixDriver:
             access_token=token,
         )
 
+    async def close(self) -> None:
+        await self._client.close()
+
     async def whoami(self) -> dict[str, str | None]:
         return {"user_id": self._config.user_id, "device_id": self._config.device_id}
 

@@ -1,0 +1,108 @@
+# Authenticated HTTP
+
+`matrix-mcp serve` uses local stdio by default. HTTP mode lets each MCP client
+connect its own Matrix account through the configured homeserver's browser SSO.
+It uses FastMCP's OAuth proxy, client registration, consent, PKCE, and encrypted
+persistent storage. No shared Matrix access token or local auth config is used.
+
+## Setup
+
+The homeserver must support `m.login.sso` and `m.login.token`. Configure one
+homeserver and one public MCP origin. Put HTTPS in front of the HTTP listener.
+Public URLs require HTTPS; loopback HTTP is allowed for local development.
+
+Generate a stable secret once and store it in your deployment's secret manager:
+
+```sh
+openssl rand -hex 32
+```
+
+Provide that value through `MATRIX_MCP_HOSTED_SECRET_KEY`. Use at least 32
+random characters. Do not regenerate it at each startup or pass it on the
+command line. Losing the key loses access to stored registrations and sessions.
+The server refuses to open existing state with a different key or homeserver.
+
+```sh
+matrix-mcp serve --transport http \
+  --host 127.0.0.1 --port 8000 \
+  --public-base-url https://mcp.example.com \
+  --homeserver https://matrix.example.com \
+  --state-directory ./matrix-mcp-state \
+  --allowed-client-redirect-uri https://client.example.com/oauth/callback
+```
+
+Register the exact callback URI used by each MCP client. Repeat the callback
+option for multiple clients. Wildcards are rejected. A loopback client callback
+such as `http://127.0.0.1:8765/callback` is allowed when explicitly configured.
+Dynamic registration accepts public clients using PKCE (`token_endpoint_auth_method`
+set to `none`), with the `authorization_code` and `refresh_token` grants and the
+single `matrix` scope. Client metadata document discovery is disabled.
+
+Every setting also supports a `MATRIX_MCP_HOSTED_` environment variable:
+
+| Variable suffix | Meaning |
+| --- | --- |
+| `PUBLIC_BASE_URL` | Public MCP origin, such as `https://mcp.example.com` |
+| `HOMESERVER` | Public Matrix homeserver used for browser SSO |
+| `API_BASE_URL` | Optional trusted server-side Matrix API base; HTTP allowed |
+| `STATE_DIRECTORY` | Persistent directory for encrypted OAuth state |
+| `SECRET_KEY` | Required stable signing and encryption secret |
+| `ALLOWED_CLIENT_REDIRECT_URIS` | JSON array of exact allowed callback URIs |
+
+For example, `MATRIX_MCP_HOSTED_ALLOWED_CLIENT_REDIRECT_URIS` may contain
+`["https://client.example.com/oauth/callback"]`. CLI values override environment
+values. Request input cannot choose the homeserver or API base.
+
+Keep the state directory on a persistent local volume, accessible only to the
+service account. Run **one process per state directory**. Startup holds a file
+lock for the application lifetime; a second server fails to start. Multiple
+workers, replicas, and network filesystems are unsupported. Back up encrypted
+state and the secret securely together. Stop the server before restoring state.
+
+## Connect a client
+
+Use `https://mcp.example.com/mcp` as the remote MCP URL. Authorization and
+protected-resource discovery advertise the OAuth endpoints and `matrix` scope.
+The client registers its callback, opens the consent screen, then redirects to
+Matrix SSO. The browser returns to `https://mcp.example.com/auth/callback` with a
+single-use Matrix `loginToken`; that token is exchanged only by the server.
+
+The CLI disables HTTP access logs because callback queries contain login tokens.
+Configure reverse proxies and observability systems to omit callback query
+strings and authorization headers. Keep auth debug logging disabled. Deploy
+public registration and login endpoints behind appropriate request limits.
+
+## Sessions and revocation
+
+MCP clients receive server-issued tokens, never Matrix access or refresh tokens.
+MCP access tokens last at most one hour, bounded by Matrix's advertised lifetime.
+MCP refresh tokens rotate on every use and expire after 30 days without renewal.
+Real Matrix refresh tokens are renewed upstream. For legacy Matrix sessions
+without refresh tokens, an encrypted private credential retains that session and
+validates it with Matrix `whoami` before issuing fresh MCP tokens.
+
+Every authenticated MCP request checks the current Matrix access token through
+`whoami`. The returned user and device identify the tool caller. Matrix room
+permissions apply normally. Remote token invalidation causes requests to fail;
+access checks never silently refresh an invalidated Matrix session.
+
+MCP token revocation invalidates the entire local token lineage, including
+access tokens from earlier refreshes, before attempting Matrix device logout.
+If Matrix logout fails, local access stays revoked. Another MCP client's token
+cannot revoke your connection. Use a current refresh token to revoke a connection
+whose access token has expired or whose Matrix session is already invalid.
+Signing out of the upstream identity provider does **not** itself revoke an
+existing Matrix session. Revoke the Matrix device/session or the MCP connection.
+
+## Tools and limits
+
+Hosted mode exposes `matrix_whoami`, `matrix_list_rooms`,
+`matrix_read_room_recent`, `matrix_read_thread`, and text-only
+`matrix_send_message`. Use raw Matrix room and event IDs. Numeric references and
+local-file upload remain stdio features. Each hosted tool opens its own Matrix
+client with the request's verified credential and closes it after the call.
+
+End-to-end encrypted rooms are unsupported. Text sends check `m.room.encryption`
+and refuse encrypted rooms or any lookup result other than a definitive missing
+encryption state event. No administration, account provisioning, administrator
+credentials, or appservice credentials are provided.
