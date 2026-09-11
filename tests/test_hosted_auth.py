@@ -478,6 +478,7 @@ async def test_two_users_tools_use_request_identity_without_local_files(
                     "room_id": "!room:example.com",
                     "body": name,
                     "thread_id": "$root",
+                    "mentions": ["@helper:example.com", "@reader:example.com"],
                 },
             )
             for name, tokens in [("alice", alice), ("bob", bob)]
@@ -490,6 +491,9 @@ async def test_two_users_tools_use_request_identity_without_local_files(
     }
     for message in browser.matrix.messages:
         assert message["sender"] == f"@{message['content']['body']}:example.com"
+        assert message["content"]["m.mentions"] == {
+            "user_ids": ["@helper:example.com", "@reader:example.com"]
+        }
         assert message["content"]["m.relates_to"]["event_id"] == "$root"
     for name, args in [
         ("matrix_list_rooms", {}),

@@ -158,6 +158,21 @@ matrix_read_thread(room_id=1, thread_id=42)
 matrix_send_message(room_id=1, body="reply", thread_id=42)
 ```
 
+To address a specific agent or user, send their full Matrix user ID in
+`mentions`, then read replies from the same thread:
+
+```text
+matrix_send_message(
+    room_id=1,
+    body="Could you check this?",
+    thread_id=42,
+    mentions=["@helper:example.com"],
+)
+matrix_read_thread(room_id=1, thread_id=42)
+```
+
+Mentions apply to text messages. File sends do not accept `mentions`.
+
 The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
 
 ## Development

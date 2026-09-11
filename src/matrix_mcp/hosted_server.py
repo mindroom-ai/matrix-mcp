@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 RoomID = Annotated[str, Field(pattern=r"^![^\s:]+:[^\s]+$")]
 EventID = Annotated[str, Field(pattern=r"^\$[^\s]+$")]
+UserID = Annotated[str, Field(pattern=r"^@[^\s:]+:[^\s]+$")]
 
 
 class HostedMatrixTools:
@@ -69,12 +70,23 @@ class HostedMatrixTools:
             return await client.read_thread(room_id, thread_id, limit=limit)
 
     async def matrix_send_message(
-        self, room_id: RoomID, body: str, thread_id: EventID | None = None
+        self,
+        room_id: RoomID,
+        body: str,
+        thread_id: EventID | None = None,
+        mentions: list[UserID] | None = None,
     ) -> dict[str, str]:
-        """Send text as the connected Matrix user, optionally replying to a thread."""
+        """Send text as the connected user, with optional thread and explicit user mentions."""
         await self._require_unencrypted_room(room_id)
         async with self.client() as client:
-            return {"event_id": await client.send_message(room_id, body, thread_id=thread_id)}
+            return {
+                "event_id": await client.send_message(
+                    room_id,
+                    body,
+                    thread_id=thread_id,
+                    mentions=mentions,
+                )
+            }
 
     async def _require_unencrypted_room(self, room_id: str) -> None:
         token = get_access_token()

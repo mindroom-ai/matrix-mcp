@@ -105,6 +105,19 @@ Hosted mode exposes `matrix_whoami`, `matrix_list_rooms`,
 local-file upload remain stdio features. Each hosted tool opens its own Matrix
 client with the request's verified credential and closes it after the call.
 
+Address a specific agent or user by passing full Matrix user IDs in `mentions`.
+For a threaded request, reuse the root event ID when reading the reply:
+
+```text
+matrix_send_message(
+    room_id="!room:example.com",
+    body="Could you check this?",
+    thread_id="$root",
+    mentions=["@helper:example.com"],
+)
+matrix_read_thread(room_id="!room:example.com", thread_id="$root")
+```
+
 End-to-end encrypted rooms are unsupported. Text sends check `m.room.encryption`
 and refuse encrypted rooms or any lookup result other than a definitive missing
 encryption state event. No administration, account provisioning, administrator
