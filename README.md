@@ -14,9 +14,9 @@ Local-first Matrix access for MCP clients.
 Matrix MCP lets Claude Code and other MCP clients read and write Matrix rooms.
 It is intended to make MindRoom conversations available to local coding agents without giving hosted agents access to the local filesystem.
 
-For remote clients, opt into [authenticated HTTP](docs/hosted.md). Each caller
-connects its own Matrix account through browser SSO. Hosted tools use raw Matrix
-IDs and support reads and text sends, with no local-file access.
+For remote clients, opt into [authenticated HTTP](docs/hosted.md).
+Each caller connects its own Matrix account through browser SSO.
+Hosted tools use raw Matrix IDs and support reads and text sends, with no local-file access.
 
 ## Install
 
@@ -66,9 +66,7 @@ ssh -N -L 8765:127.0.0.1:8765 remote-host
 
 Then open the printed SSO URL in your local browser.
 After login, the homeserver redirects to `http://127.0.0.1:8765/callback`, which SSH forwards to the waiting command on the remote machine.
-If port forwarding is not an option, use the manual flow described in the
-[getting started guide](https://matrix-mcp.mindroom.chat/getting-started/) with
-`matrix-mcp auth sso-url` and `matrix-mcp auth login-token`.
+If port forwarding is not an option, use the manual flow described in the [getting started guide](https://matrix-mcp.mindroom.chat/getting-started/) with `matrix-mcp auth sso-url` and `matrix-mcp auth login-token`.
 
 If your homeserver is behind an access gateway that requires extra request headers, pass them during login.
 They are stored with the Matrix credentials and reused by MCP tools:
@@ -87,9 +85,8 @@ matrix-mcp auth sso https://mindroom.chat \
   --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
 ```
 
-For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic
-`cf-access-token` header for you. This uses the local `cloudflared` CLI to log in
-when needed during setup, then stores a command that reads the current token:
+For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic `cf-access-token` header for you.
+This uses the local `cloudflared` CLI to log in when needed during setup, then stores a command that reads the current token:
 
 ```bash
 brew install cloudflared
@@ -138,7 +135,8 @@ Add the local MCP server:
 codex mcp add matrix -- matrix-mcp serve
 ```
 
-The server runs over stdio. It does not expose a local HTTP port during normal MCP operation.
+The server runs over stdio.
+It does not expose a local HTTP port during normal MCP operation.
 
 ## Tools
 
@@ -158,8 +156,7 @@ matrix_read_thread(room_id=1, thread_id=42)
 matrix_send_message(room_id=1, body="reply", thread_id=42)
 ```
 
-To address a specific agent or user, send their full Matrix user ID in
-`mentions`, then read replies from the same thread:
+To address a specific agent or user, send their full Matrix user ID in `mentions`, then read replies from the same thread:
 
 ```text
 matrix_send_message(
@@ -171,7 +168,8 @@ matrix_send_message(
 matrix_read_thread(room_id=1, thread_id=42)
 ```
 
-Mentions apply to text messages. File sends do not accept `mentions`.
+Mentions apply to text messages.
+File sends do not accept `mentions`.
 
 The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
 
