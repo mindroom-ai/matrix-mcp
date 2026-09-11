@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from pathlib import Path  # noqa: TC003 - Pydantic resolves settings annotations at runtime.
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -21,10 +22,11 @@ from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import AccessToken as SDKAccessToken
 from mcp.server.auth.provider import RefreshToken, RegistrationError
 from mcp.server.auth.routes import build_metadata, cors_middleware
+from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyHttpUrl, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.requests import ClientDisconnect, Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 if TYPE_CHECKING:
@@ -33,12 +35,13 @@ if TYPE_CHECKING:
     from authlib.integrations.httpx_client import AsyncOAuth2Client
     from fastmcp import FastMCP
     from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
-    from mcp.shared.auth import OAuthClientInformationFull
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _ACCESS_TTL = 3600
 _REFRESH_TTL = 30 * 24 * 3600
 _MIN_KEY_LENGTH = 32
+_MAX_AUTH_BODY_BYTES = 64 * 1024
+_AUTH_BODY_TIMEOUT_SECONDS = 10
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -207,6 +210,8 @@ class MatrixTokenClient:
             session = json.loads(self.fernet.decrypt(refresh_token.encode()))
             if session["refresh_token"]:
                 data = await self._post("refresh", {"refresh_token": session["refresh_token"]})
+                # Omission means the existing Matrix refresh credential remains valid.
+                data.setdefault("refresh_token", session["refresh_token"])
             else:
                 data = {"access_token": session["access_token"]}
             return await self._tokens(data, expected=session["identity"])
@@ -216,14 +221,59 @@ class MatrixTokenClient:
 
 
 class _SerializedAuthRoute:
-    """Serialize complete handlers, including framework load/consume sequences."""
+    """Serialize state handlers with bounded, buffered client I/O outside the lock."""
 
     def __init__(self, app: ASGIApp, lock: asyncio.Lock) -> None:
         self.app, self.lock = app, lock
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async with self.lock:
+        if scope["method"] == "OPTIONS":
             await self.app(scope, receive, send)
+            return
+        try:
+            body = await self._receive_body(scope, receive)
+        except ClientDisconnect:
+            return
+        if isinstance(body, Response):
+            await body(scope, receive, send)
+            return
+
+        consumed = False
+        messages: list[Message] = []
+
+        async def replay() -> Message:
+            nonlocal consumed
+            if consumed:
+                return {"type": "http.disconnect"}
+            consumed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def capture(message: Message) -> None:
+            messages.append(message)
+
+        # Parsing and grant load/validate/consume still run together. The finite
+        # OAuth responses are captured locally; no client receive/send awaits
+        # can suspend this critical section.
+        async with self.lock:
+            await self.app(scope, replay, capture)
+        for message in messages:
+            await send(message)
+
+    @staticmethod
+    async def _receive_body(scope: Scope, receive: Receive) -> bytes | Response:
+        body = bytearray()
+        try:
+            async with asyncio.timeout(_AUTH_BODY_TIMEOUT_SECONDS):
+                async for chunk in Request(scope, receive).stream():
+                    if len(body) + len(chunk) > _MAX_AUTH_BODY_BYTES:
+                        return Response(
+                            "OAuth request body is too large",
+                            status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        )
+                    body.extend(chunk)
+        except TimeoutError:
+            return Response("OAuth request body timed out", status_code=HTTPStatus.REQUEST_TIMEOUT)
+        return bytes(body)
 
 
 class _PublicClientRevocationRoute:
@@ -350,6 +400,8 @@ class MatrixOAuthProvider(OAuthProxy):
                     endpoint=cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"]),
                     methods=["GET", "OPTIONS"],
                 ).app
+            if route.path.startswith("/.well-known/"):
+                continue
             if route.path == "/revoke":
                 route.app = _PublicClientRevocationRoute(route.app)
             route.app = _SerializedAuthRoute(route.app, self._auth_lock)
@@ -366,6 +418,21 @@ class MatrixOAuthProvider(OAuthProxy):
             msg = "Use public-client PKCE authentication"
             raise RegistrationError(error="invalid_client_metadata", error_description=msg)
         await super().register_client(client_info)
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        client = await super().get_client(client_id)
+        if client is None:
+            return None
+        # The proxy's pattern matcher admits any globally allowed callback.
+        # Use the SDK's exact registered-URI validation for every loaded client,
+        # including registrations persisted by earlier versions of this adapter.
+        registered = OAuthClientInformationFull.model_validate(client.model_dump())
+        registered.redirect_uris = [
+            uri
+            for uri in registered.redirect_uris or []
+            if str(uri) in self.settings.allowed_client_redirect_uris
+        ]
+        return registered
 
     def _create_upstream_oauth_client(self) -> AsyncOAuth2Client:
         # FastMCP annotates a concrete Authlib client but consumes only these hooks.

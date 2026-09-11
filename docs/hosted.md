@@ -71,6 +71,9 @@ The CLI disables HTTP access logs because callback queries contain login tokens.
 Configure reverse proxies and observability systems to omit callback query
 strings and authorization headers. Keep auth debug logging disabled. Deploy
 public registration and login endpoints behind appropriate request limits.
+OAuth request bodies are limited to 64 KiB and must arrive within ten seconds.
+Client body reception and response delivery occur outside the state mutation lock;
+discovery remains available while authorization state changes are in progress.
 
 ## Sessions and revocation
 

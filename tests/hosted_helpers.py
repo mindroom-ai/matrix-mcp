@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from aiohttp import web
 
 if TYPE_CHECKING:
     import httpx
+    from starlette.types import ASGIApp, Message, Scope
 
 CALLBACK = "https://client.example.com/callback"
 VERIFIER = "test-pkce-verifier-with-at-least-forty-three-characters"
@@ -27,6 +30,10 @@ class FakeMatrix:
     legacy: bool = False
     expires_in_ms: int = 3_600_000
     encryption_status: int = 404
+    omit_replacement_refresh: bool = False
+    expired_access: set[str] = field(default_factory=set)
+    refresh_started: asyncio.Event | None = None
+    refresh_release: asyncio.Event | None = None
 
     def login_token(self, user: str) -> str:
         token = secrets.token_urlsafe(24)
@@ -66,16 +73,22 @@ class FakeMatrix:
             return web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
         if path.endswith("/refresh"):
             data = await request.json()
+            if self.refresh_started is not None and self.refresh_release is not None:
+                self.refresh_started.set()
+                await self.refresh_release.wait()
             access = self.refreshes.pop(data["refresh_token"], None)
             identity = self.sessions.get(access or "")
             if identity:
                 result = self.session(identity[0].split(":")[0][1:], identity[1])
                 self.sessions.pop(access or "")
+                if self.omit_replacement_refresh:
+                    self.refreshes.pop(result.pop("refresh_token"))
+                    self.refreshes[data["refresh_token"]] = result["access_token"]
                 return web.json_response(result)
             return web.json_response({"errcode": "M_UNKNOWN_TOKEN"}, status=401)
         access = request.headers.get("Authorization", "").removeprefix("Bearer ")
         identity = self.sessions.get(access)
-        if not identity:
+        if not identity or access in self.expired_access:
             return web.json_response({"errcode": "M_UNKNOWN_TOKEN"}, status=401)
         if path.endswith("/account/whoami"):
             return web.json_response({"user_id": identity[0], "device_id": identity[1]})
@@ -124,6 +137,7 @@ class FakeMatrix:
 class OAuthBrowser:
     client: httpx.AsyncClient
     matrix: FakeMatrix
+    asgi_app: ASGIApp | None = None
 
     async def register(self, redirect: str = CALLBACK) -> str:
         response = await self.client.post(
@@ -140,13 +154,13 @@ class OAuthBrowser:
         assert response.status_code == 201, response.text
         return str(response.json()["client_id"])
 
-    async def consent(self, client_id: str) -> str:
+    async def authorize(self, client_id: str, redirect: str = CALLBACK) -> httpx.Response:
         challenge = base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode()).digest())
-        response = await self.client.get(
+        return await self.client.get(
             "/authorize",
             params={
                 "client_id": client_id,
-                "redirect_uri": CALLBACK,
+                "redirect_uri": redirect,
                 "response_type": "code",
                 "scope": "matrix",
                 "state": "client-state",
@@ -154,6 +168,9 @@ class OAuthBrowser:
                 "code_challenge": challenge.decode().rstrip("="),
             },
         )
+
+    async def consent(self, client_id: str) -> str:
+        response = await self.authorize(client_id)
         assert response.status_code == 302, response.text
         response = await self.client.get(response.headers["location"])
         if response.status_code == 200:
@@ -248,3 +265,50 @@ class OAuthBrowser:
         result: dict[str, Any] = response.json()["result"]
         assert not result.get("isError"), result
         return result
+
+
+@dataclass
+class PausedOAuthRequest:
+    """A single local ASGI exchange with one explicitly controlled I/O boundary."""
+
+    phase: Literal["receive", "send"]
+    blocked: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+    messages: list[Message] = field(default_factory=list)
+
+    async def run(self, app: ASGIApp) -> None:
+        scope: Scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/register",
+            "raw_path": b"/register",
+            "root_path": "",
+            "query_string": b"",
+            "server": ("127.0.0.1", 8000),
+            "client": ("127.0.0.1", 8765),
+            "headers": [(b"content-type", b"application/json")],
+        }
+        body = json.dumps(
+            {
+                "redirect_uris": [CALLBACK],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code", "refresh_token"],
+            }
+        ).encode()
+
+        async def receive() -> Message:
+            if self.phase == "receive":
+                self.blocked.set()
+                await self.release.wait()
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message: Message) -> None:
+            if self.phase == "send" and message["type"] == "http.response.start":
+                self.blocked.set()
+                await self.release.wait()
+            self.messages.append(message)
+
+        await app(scope, receive, send)

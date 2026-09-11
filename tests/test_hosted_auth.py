@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -11,10 +12,10 @@ import pytest
 from aiohttp import web
 from nio import AsyncClient
 
-from matrix_mcp import matrix_client
+from matrix_mcp import hosted_auth, matrix_client
 from matrix_mcp.hosted_auth import HostedSettings
 from matrix_mcp.hosted_server import create_hosted_server
-from tests.hosted_helpers import CALLBACK, FakeMatrix, OAuthBrowser
+from tests.hosted_helpers import CALLBACK, FakeMatrix, OAuthBrowser, PausedOAuthRequest
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -62,7 +63,7 @@ async def browser_session(
             base_url=settings.public_base_url,
         ) as client,
     ):
-        yield OAuthBrowser(client, fake)
+        yield OAuthBrowser(client, fake, app)
 
 
 @pytest.fixture
@@ -143,6 +144,160 @@ async def test_registration_preserves_trailing_slash_in_callback(
     configured = HostedSettings(**values)
     async with browser_session(configured, matrix[0]) as browser:
         await browser.register(f"{CALLBACK}/")
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize(
+    ("registered", "unregistered"),
+    [
+        (CALLBACK, "https://other.example.com/callback"),
+        ("http://127.0.0.1:8765/callback", "http://127.0.0.1:8766/callback"),
+    ],
+)
+async def test_authorization_uses_only_registered_client_callbacks(
+    settings: HostedSettings,
+    matrix: tuple[FakeMatrix, str],
+    registered: str,
+    unregistered: str,
+    *,
+    restart: bool,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "allowed_client_redirect_uris": [registered, unregistered],
+        }
+    )
+    async with browser_session(configured, matrix[0]) as browser:
+        client_id = await browser.register(registered)
+        if not restart:
+            accepted = await browser.authorize(client_id, registered)
+            rejected = await browser.authorize(client_id, unregistered)
+    if restart:
+        async with browser_session(configured, matrix[0]) as browser:
+            accepted = await browser.authorize(client_id, registered)
+            rejected = await browser.authorize(client_id, unregistered)
+    assert accepted.status_code == 302
+    assert rejected.status_code == 400
+    assert "location" not in rejected.headers
+
+
+async def test_removed_operator_callback_is_rejected_after_restart(
+    settings: HostedSettings,
+    matrix: tuple[FakeMatrix, str],
+) -> None:
+    async with browser_session(settings, matrix[0]) as browser:
+        client_id = await browser.register()
+    changed = settings.model_copy(
+        update={
+            "allowed_client_redirect_uris": ["https://other.example.com/callback"],
+        }
+    )
+    async with browser_session(changed, matrix[0]) as browser:
+        rejected = await browser.authorize(client_id)
+    assert rejected.status_code == 400
+    assert "location" not in rejected.headers
+
+
+@pytest.mark.parametrize("phase", ["receive", "send"])
+async def test_oauth_client_io_does_not_hold_mutation_lock(
+    browser: OAuthBrowser,
+    phase: Literal["receive", "send"],
+) -> None:
+    assert browser.asgi_app is not None
+    request = PausedOAuthRequest(phase)
+    task = asyncio.create_task(request.run(browser.asgi_app))
+    try:
+        await asyncio.wait_for(request.blocked.wait(), timeout=1)
+        metadata, client_id = await asyncio.wait_for(
+            asyncio.gather(
+                browser.client.get("/.well-known/oauth-authorization-server"),
+                browser.register(),
+            ),
+            timeout=1,
+        )
+        assert metadata.status_code == 200
+        assert client_id
+    finally:
+        request.release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+
+async def test_discovery_remains_available_during_mutation(browser: OAuthBrowser) -> None:
+    client_id = await browser.register()
+    tokens = await browser.login(client_id)
+    browser.matrix.refresh_started = asyncio.Event()
+    browser.matrix.refresh_release = asyncio.Event()
+    task = asyncio.create_task(browser.refresh(client_id, tokens["refresh_token"]))
+    try:
+        await asyncio.wait_for(browser.matrix.refresh_started.wait(), timeout=1)
+        metadata = await asyncio.wait_for(
+            browser.client.get("/.well-known/oauth-authorization-server"),
+            timeout=1,
+        )
+        assert metadata.status_code == 200
+    finally:
+        browser.matrix.refresh_release.set()
+        response = await asyncio.wait_for(task, timeout=1)
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_oauth_request_body_size_is_bounded(browser: OAuthBrowser, *, chunked: bool) -> None:
+    payload = json.dumps(
+        {
+            "redirect_uris": [CALLBACK],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "client_name": "x" * 65536,
+        }
+    ).encode()
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield payload[:32768]
+        yield payload[32768:]
+
+    response = await browser.client.post(
+        "/register",
+        content=chunks() if chunked else payload,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    await browser.register()
+
+
+async def test_oauth_request_body_deadline_is_bounded(
+    browser: OAuthBrowser,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hosted_auth, "_AUTH_BODY_TIMEOUT_SECONDS", 0.02, raising=False)
+    assert browser.asgi_app is not None
+    request = PausedOAuthRequest("receive")
+    task = asyncio.create_task(request.run(browser.asgi_app))
+    try:
+        await asyncio.wait_for(request.blocked.wait(), timeout=1)
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "OAuth body reception did not meet its deadline"
+        assert request.messages[0]["status"] == 408
+        await browser.register()
+    finally:
+        request.release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+
+async def test_successive_refreshes_preserve_omitted_matrix_refresh_token(
+    browser: OAuthBrowser,
+) -> None:
+    browser.matrix.omit_replacement_refresh = True
+    client_id = await browser.register()
+    tokens = await browser.login(client_id)
+    for _ in range(3):
+        browser.matrix.expired_access.update(browser.matrix.sessions)
+        expired = await browser.rpc(tokens["access_token"], "tools/list", {})
+        assert expired.status_code == 401
+        renewed = await browser.refresh(client_id, tokens["refresh_token"])
+        assert renewed.status_code == 200, renewed.text
+        tokens = renewed.json()
+        await browser.call(tokens["access_token"], "matrix_whoami", {})
 
 
 async def test_callback_requires_state_login_token_and_bound_browser(browser: OAuthBrowser) -> None:
