@@ -53,6 +53,9 @@ For example, `MATRIX_MCP_HOSTED_ALLOWED_CLIENT_REDIRECT_URIS` may contain
 `["https://client.example.com/oauth/callback"]`. CLI values override environment
 values. Request input cannot choose the homeserver or API base.
 
+An HTTP `API_BASE_URL` carries Matrix bearer tokens without transport encryption.
+Use it only on a protected internal network; use HTTPS otherwise.
+
 Keep the state directory on a persistent local volume, accessible only to the
 service account. Run **one process per state directory**. Startup holds a file
 lock for the application lifetime; a second server fails to start. Multiple
@@ -74,11 +77,16 @@ public registration and login endpoints behind appropriate request limits.
 OAuth request bodies are limited to 64 KiB and must arrive within ten seconds.
 Client body reception and response delivery occur outside the state mutation lock;
 discovery remains available while authorization state changes are in progress.
+Upstream Matrix calls remain inside serialized OAuth mutations, so a slow upstream
+queues other OAuth mutations. Discovery and MCP request authentication stay outside
+this lock.
 
 ## Sessions and revocation
 
 MCP clients receive server-issued tokens, never Matrix access or refresh tokens.
 MCP access tokens last at most one hour, bounded by Matrix's advertised lifetime.
+Missing Matrix expiry uses the one-hour legacy default; malformed advertised
+expiry is rejected.
 MCP refresh tokens rotate on every use and expire after 30 days without renewal.
 Real Matrix refresh tokens are renewed upstream. For legacy Matrix sessions
 without refresh tokens, an encrypted private credential retains that session and
@@ -118,7 +126,13 @@ matrix_send_message(
 matrix_read_thread(room_id="!room:example.com", thread_id="$root")
 ```
 
-End-to-end encrypted rooms are unsupported. Text sends check `m.room.encryption`
-and refuse encrypted rooms or any lookup result other than a definitive missing
-encryption state event. No administration, account provisioning, administrator
-credentials, or appservice credentials are provided.
+End-to-end encryption is unsupported; hosted sends transmit plaintext. Before
+each send, a best effort preflight checks `m.room.encryption` and refuses known
+encrypted rooms or any lookup result other than a definitive missing encryption
+state event. The check and send are separate, non-atomic operations: a room can
+enable encryption between them and still receive the plaintext message. Hosted
+sends provide no E2EE guarantee. Do not use them where end-to-end encryption is
+required.
+
+No administration, account provisioning, administrator credentials, or appservice
+credentials are provided.

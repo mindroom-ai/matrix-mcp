@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import ValidationError
+from rich.text import Text
 from typer.testing import CliRunner
 
 from matrix_mcp.cli import app
@@ -50,10 +51,11 @@ def test_http_cli_validates_missing_settings_before_starting() -> None:
 
 def test_serve_help_exposes_http_without_changing_default() -> None:
     result = CliRunner().invoke(app, ["serve", "--help"], color=False)
+    output = Text.from_ansi(result.output).plain
     assert result.exit_code == 0
-    assert "--transport" in result.output
-    assert "stdio" in result.output
-    assert "http" in result.output
+    assert "--transport" in output
+    assert "stdio" in output
+    assert "http" in output
 
 
 def test_missing_signing_key_has_no_default(tmp_path: Path) -> None:

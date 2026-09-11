@@ -28,12 +28,14 @@ class FakeMatrix:
     messages: list[dict[str, Any]] = field(default_factory=list)
     logout_fails: bool = False
     legacy: bool = False
-    expires_in_ms: int = 3_600_000
+    expires_in_ms: float | str | None = 3_600_000
     encryption_status: int = 404
     omit_replacement_refresh: bool = False
     expired_access: set[str] = field(default_factory=set)
     refresh_started: asyncio.Event | None = None
     refresh_release: asyncio.Event | None = None
+    whoami_started: asyncio.Event | None = None
+    whoami_release: asyncio.Event | None = None
 
     def login_token(self, user: str) -> str:
         token = secrets.token_urlsafe(24)
@@ -91,6 +93,9 @@ class FakeMatrix:
         if not identity or access in self.expired_access:
             return web.json_response({"errcode": "M_UNKNOWN_TOKEN"}, status=401)
         if path.endswith("/account/whoami"):
+            if self.whoami_started is not None and self.whoami_release is not None:
+                self.whoami_started.set()
+                await self.whoami_release.wait()
             return web.json_response({"user_id": identity[0], "device_id": identity[1]})
         if path.endswith("/logout"):
             if self.logout_fails:

@@ -180,7 +180,11 @@ class MatrixTokenClient:
             "refresh_token": data.get("refresh_token"),
             "identity": validated.claims,
         }
-        expires_in = min(_ACCESS_TTL, int(data.get("expires_in_ms", _ACCESS_TTL * 1000)) // 1000)
+        expires_in_ms = data.get("expires_in_ms", _ACCESS_TTL * 1000)
+        if type(expires_in_ms) is not int or expires_in_ms <= 0:
+            msg = "Matrix access token expiry is invalid"
+            raise ValueError(msg)
+        expires_in = min(_ACCESS_TTL, expires_in_ms // 1000)
         if expires_in <= 0:
             msg = "Matrix access token expires too soon"
             raise ValueError(msg)
@@ -469,6 +473,14 @@ class MatrixOAuthProvider(OAuthProxy):
                 return None
             validated = await self._token_validator.verify_token(upstream.access_token)
             if validated is None:
+                return None
+            # Revocation or rotation may complete while the remote whoami is pending.
+            current = await self._upstream_token_store.get(key=upstream.upstream_token_id)
+            if (
+                current is None
+                or current.client_id != upstream.client_id
+                or current.access_token != upstream.access_token
+            ):
                 return None
             # Keep Matrix token for tools; keep MCP client and lineage for revoke.
             return validated.model_copy(

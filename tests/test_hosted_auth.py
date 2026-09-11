@@ -5,7 +5,7 @@ import json
 import socket
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -417,6 +417,20 @@ async def test_second_process_and_wrong_key_fail_closed(
             pytest.fail("wrong key accepted")
 
 
+@pytest.mark.parametrize("expiry", [None, "malformed-expiry", True, 3_600_000.5, 0, -1000])
+async def test_invalid_matrix_expiry_rejects_callback_without_echoing_value(
+    browser: OAuthBrowser, expiry: float | str | None
+) -> None:
+    browser.matrix.expires_in_ms = expiry
+    callback = await browser.consent(await browser.register())
+    response = await browser.client.get(
+        callback + "&" + urlencode({"loginToken": browser.matrix.login_token("alice")})
+    )
+    assert response.status_code == 500
+    assert "Matrix access token expiry is invalid" in response.text
+    assert "malformed-expiry" not in response.text
+
+
 async def test_expired_mcp_access_is_rejected(browser: OAuthBrowser) -> None:
     browser.matrix.expires_in_ms = 1000
     client_id = await browser.register()
@@ -459,6 +473,23 @@ async def test_revocation_racing_refresh_cannot_revive_session(browser: OAuthBro
         response = await browser.refresh(client_id, refreshed.json()["refresh_token"])
         assert response.status_code in (400, 401)
     response = await browser.rpc(tokens["access_token"], "tools/list", {})
+    assert response.status_code == 401
+
+
+async def test_revocation_during_whoami_rejects_pending_mcp_request(browser: OAuthBrowser) -> None:
+    client_id = await browser.register()
+    tokens = await browser.login(client_id)
+    browser.matrix.logout_fails = True
+    browser.matrix.whoami_started = asyncio.Event()
+    browser.matrix.whoami_release = asyncio.Event()
+    pending = asyncio.create_task(browser.rpc(tokens["access_token"], "tools/list", {}))
+    try:
+        await asyncio.wait_for(browser.matrix.whoami_started.wait(), timeout=1)
+        await asyncio.wait_for(browser.revoke(client_id, tokens["refresh_token"]), timeout=1)
+        assert browser.matrix.sessions  # Failed logout leaves the remote token valid.
+    finally:
+        browser.matrix.whoami_release.set()
+        response = await asyncio.wait_for(pending, timeout=1)
     assert response.status_code == 401
 
 

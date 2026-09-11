@@ -76,7 +76,11 @@ class HostedMatrixTools:
         thread_id: EventID | None = None,
         mentions: list[UserID] | None = None,
     ) -> dict[str, str]:
-        """Send text as the connected user, with optional thread and explicit user mentions."""
+        """Send plaintext as the connected user, with optional thread and explicit mentions.
+
+        The encryption preflight is best effort. A room enabling encryption between
+        the check and send can receive plaintext. Do not use where E2EE is required.
+        """
         await self._require_unencrypted_room(room_id)
         async with self.client() as client:
             return {
