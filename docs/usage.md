@@ -50,10 +50,10 @@ matrix-mcp auth sso https://mindroom.chat \
   --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
 ```
 
-For Cloudflare Access, use the built-in preset instead. It stores a dynamic
-`cf-access-token` header command backed by the local `cloudflared` CLI. During
-setup, it runs `cloudflared access login` first if no token is available. On
-macOS with Homebrew, install it first:
+For Cloudflare Access, use the built-in preset instead.
+It stores a dynamic `cf-access-token` header command backed by the local `cloudflared` CLI.
+During setup, it runs `cloudflared access login` first if no token is available.
+On macOS with Homebrew, install it first:
 
 ```bash
 brew install cloudflared
