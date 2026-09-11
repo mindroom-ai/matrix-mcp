@@ -93,7 +93,7 @@ To build from a checkout:
 
 ```sh
 uv build --wheel
-uv export --frozen --no-dev --no-emit-project --no-hashes --output-file dist/requirements.txt
+uv export --locked --no-dev --no-emit-project --no-hashes --output-file dist/requirements.txt
 docker build -t matrix-mcp:local .
 ```
 

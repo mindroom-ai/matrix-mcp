@@ -22,7 +22,7 @@ jobs:
       - name: Build
         run: |
           uv build
-          uv export --frozen --no-dev --no-emit-project --no-hashes --output-file dist/requirements.txt
+          uv export --locked --no-dev --no-emit-project --no-hashes --output-file dist/requirements.txt
       - uses: actions/upload-artifact@v7
         with:
           name: python-dist
