@@ -62,6 +62,46 @@ lock for the application lifetime; a second server fails to start. Multiple
 workers, replicas, and network filesystems are unsupported. Back up encrypted
 state and the secret securely together. Stop the server before restoring state.
 
+## Container
+
+Release CI publishes Linux AMD64 and ARM64 images to
+`ghcr.io/mindroom-ai/matrix-mcp`, tagged with the release tag (such as `v0.6.1`).
+`latest` follows stable releases. The image contains the same wheel published to
+PyPI, with dependencies pinned by `uv.lock`. Pin a version or image digest when
+you need predictable upgrades.
+
+With the stable secret exported as described above:
+
+```sh
+docker run --rm --read-only --tmpfs /tmp \
+  --publish 127.0.0.1:8000:8000 \
+  --mount type=volume,src=matrix-mcp-state,dst=/data \
+  --env MATRIX_MCP_HOSTED_SECRET_KEY \
+  ghcr.io/mindroom-ai/matrix-mcp:latest serve --transport http \
+  --host 0.0.0.0 --public-base-url https://mcp.example.com \
+  --homeserver https://matrix.example.com --state-directory /data/oauth \
+  --allowed-client-redirect-uri https://client.example.com/oauth/callback
+```
+
+Put your HTTPS proxy in front of port 8000. The image runs as UID/GID `10001`;
+bind-mounted state directories must be writable by that identity. Keep `/data`
+and the signing key across replacements. One container serves multiple users;
+each request uses its caller's Matrix credentials. The single-process storage
+limits above still apply.
+
+To build from a checkout:
+
+```sh
+uv build --wheel
+uv export --frozen --no-dev --no-emit-project --no-hashes --output-file dist/requirements.txt
+docker build -t matrix-mcp:local .
+```
+
+PR CI builds and smoke-tests both
+architectures without publishing. Release publishing uses the repository's
+`GITHUB_TOKEN`; no separate registry credential is needed. On first publication,
+a package administrator must make the GHCR package public for anonymous pulls.
+
 ## Connect a client
 
 Use `https://mcp.example.com/mcp` as the remote MCP URL. Authorization and
