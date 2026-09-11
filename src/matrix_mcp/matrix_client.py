@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import re
 from typing import Protocol, cast
 
 from anyio import Path as AsyncPath
@@ -63,6 +64,7 @@ class MatrixDriver(Protocol):
         body: str,
         *,
         thread_id: str | None = None,
+        mentions: list[str] | None = None,
     ) -> str: ...
 
     async def send_file(
@@ -102,6 +104,9 @@ class NioMatrixDriver:
             device_id=config.device_id,
             access_token=token,
         )
+
+    async def close(self) -> None:
+        await self._client.close()
 
     async def whoami(self) -> dict[str, str | None]:
         return {"user_id": self._config.user_id, "device_id": self._config.device_id}
@@ -194,11 +199,25 @@ class NioMatrixDriver:
             return event
         return event.model_copy(update={"body": latest_body})
 
-    async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
+    async def send_message(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        thread_id: str | None = None,
+        mentions: list[str] | None = None,
+    ) -> str:
+        if mentions is not None:
+            for user_id in mentions:
+                if re.fullmatch(r"@[^\s:]+:[^\s]+", user_id) is None:
+                    msg = f"Invalid Matrix user ID: {user_id}"
+                    raise ValueError(msg)
         content: dict[str, object] = {
             "body": body,
             "msgtype": "m.text",
         }
+        if mentions is not None:
+            content["m.mentions"] = {"user_ids": mentions}
         if thread_id:
             content["m.relates_to"] = {
                 "event_id": thread_id,
@@ -297,11 +316,13 @@ class MatrixAPIClient:
         body: str,
         *,
         thread_id: str | int | None = None,
+        mentions: list[str] | None = None,
     ) -> str:
         return await self._driver.send_message(
             self._resolve_room(room_id),
             body,
             thread_id=self._resolve_optional_event(thread_id),
+            mentions=mentions,
         )
 
     async def send_file(

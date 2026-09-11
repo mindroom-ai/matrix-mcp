@@ -14,6 +14,10 @@ Local-first Matrix access for MCP clients.
 Matrix MCP lets Claude Code and other MCP clients read and write Matrix rooms.
 It is intended to make MindRoom conversations available to local coding agents without giving hosted agents access to the local filesystem.
 
+For remote clients, opt into [authenticated HTTP](docs/hosted.md). Each caller
+connects its own Matrix account through browser SSO. Hosted tools use raw Matrix
+IDs and support reads and text sends, with no local-file access.
+
 ## Install
 
 ```bash
@@ -153,6 +157,21 @@ matrix_read_room_recent(room_id=1)
 matrix_read_thread(room_id=1, thread_id=42)
 matrix_send_message(room_id=1, body="reply", thread_id=42)
 ```
+
+To address a specific agent or user, send their full Matrix user ID in
+`mentions`, then read replies from the same thread:
+
+```text
+matrix_send_message(
+    room_id=1,
+    body="Could you check this?",
+    thread_id=42,
+    mentions=["@helper:example.com"],
+)
+matrix_read_thread(room_id=1, thread_id=42)
+```
+
+Mentions apply to text messages. File sends do not accept `mentions`.
 
 The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
 

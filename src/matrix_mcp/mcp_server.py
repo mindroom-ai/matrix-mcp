@@ -29,6 +29,7 @@ class MatrixMCPClient(Protocol):
         body: str,
         *,
         thread_id: str | int | None = None,
+        mentions: list[str] | None = None,
     ) -> str: ...
 
     async def send_file(
@@ -77,9 +78,13 @@ class MatrixMCPTools:
         file_path: str | None = None,
         filename: str | None = None,
         content_type: str | None = None,
+        mentions: list[str] | None = None,
     ) -> dict[str, str]:
-        """Send text or a local file by Matrix ID or numeric ref, optionally as a thread reply."""
+        """Send text or a local file, with optional thread and explicit text mentions."""
         if file_path:
+            if mentions is not None:
+                msg = "mentions are supported only for text messages"
+                raise ValueError(msg)
             event_id = await self._client_factory().send_file(
                 room_id,
                 file_path,
@@ -91,7 +96,12 @@ class MatrixMCPTools:
         if body is None:
             msg = "matrix_send_message requires either body or file_path"
             raise ValueError(msg)
-        event_id = await self._client_factory().send_message(room_id, body, thread_id=thread_id)
+        event_id = await self._client_factory().send_message(
+            room_id,
+            body,
+            thread_id=thread_id,
+            mentions=mentions,
+        )
         return {"event_id": event_id}
 
 

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 class FakeDriver:
     def __init__(self) -> None:
-        self.sent: list[tuple[str, str, str | None]] = []
+        self.sent: list[tuple[str, str, str | None, list[str] | None]] = []
         self.files: list[tuple[str, str, str | None, str | None, str | None]] = []
         self.room_member_calls = 0
 
@@ -74,8 +74,15 @@ class FakeDriver:
             ),
         ]
 
-    async def send_message(self, room_id: str, body: str, *, thread_id: str | None = None) -> str:
-        self.sent.append((room_id, body, thread_id))
+    async def send_message(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        thread_id: str | None = None,
+        mentions: list[str] | None = None,
+    ) -> str:
+        self.sent.append((room_id, body, thread_id, mentions))
         return "$sent"
 
     async def send_file(
@@ -360,8 +367,20 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         },
     )
 
+    mentioned_id = await driver.send_message(
+        "!room:example.com",
+        "hello",
+        thread_id="$root",
+        mentions=["@alice:example.com", "@helper:example.com"],
+    )
+    assert mentioned_id == "$sent2"
+    content = cast("dict[str, Any]", nio_client.room_send_calls[-1][2])
+    assert content["m.mentions"] == {"user_ids": ["@alice:example.com", "@helper:example.com"]}
+    assert content["m.relates_to"]["rel_type"] == "m.thread"
+    assert content["m.relates_to"]["event_id"] == "$root"
+
     file_event_id = await driver.send_file("!room:example.com", str(path), thread_id="$root")
-    assert file_event_id == "$sent2"
+    assert file_event_id == "$sent3"
     assert nio_client.upload_call == {
         "content": b"hello",
         "content_type": "text/plain",
@@ -525,8 +544,20 @@ async def test_client_adds_and_accepts_numeric_refs(tmp_path: Path) -> None:
     assert thread_events[1].id == 3
     assert thread_events[1].thread_ref == 2
 
-    await client.send_message(1, "hi", thread_id=2)
-    assert driver.sent == [("!room:example.com", "hi", "$root")]
+    await client.send_message(
+        1,
+        "hi",
+        thread_id=2,
+        mentions=["@alice:example.com", "@helper:example.com"],
+    )
+    assert driver.sent == [
+        (
+            "!room:example.com",
+            "hi",
+            "$root",
+            ["@alice:example.com", "@helper:example.com"],
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -580,7 +611,33 @@ async def test_send_message_uses_transaction_id_and_optional_thread() -> None:
     event_id = await client.send_message("!room:example.com", "hi", thread_id="$root")
 
     assert event_id == "$sent"
-    assert driver.sent == [("!room:example.com", "hi", "$root")]
+    assert driver.sent == [("!room:example.com", "hi", "$root", None)]
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_malformed_mentions_before_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    nio_client = FakeNioClient.instances[0]
+
+    with pytest.raises(ValueError, match="Invalid Matrix user ID"):
+        await driver.send_message(
+            "!room:example.com",
+            "hello",
+            mentions=["alice"],
+        )
+
+    assert nio_client.room_send_calls == []
 
 
 @pytest.mark.asyncio

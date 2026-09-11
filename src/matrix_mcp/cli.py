@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 import typer
@@ -20,11 +20,53 @@ app.add_typer(auth_app, name="auth")
 
 
 @app.command()
-def serve() -> None:
-    """Run the Matrix MCP server over stdio."""
-    from matrix_mcp.mcp_server import create_mcp_server
+def serve(
+    transport: Literal["stdio", "http"] = typer.Option("stdio", help="MCP transport"),
+    host: str = typer.Option("127.0.0.1", help="HTTP listen address"),
+    port: int = typer.Option(8000, min=1, max=65535, help="HTTP listen port"),
+    public_base_url: str | None = typer.Option(None, help="Public HTTPS MCP origin"),
+    homeserver: str | None = typer.Option(None, help="Public Matrix homeserver URL"),
+    api_base_url: str | None = typer.Option(None, help="Optional trusted Matrix API URL"),
+    state_directory: Path | None = typer.Option(None, help="Persistent encrypted OAuth state"),
+    allowed_client_redirect_uri: list[str] | None = typer.Option(
+        None,
+        "--allowed-client-redirect-uri",
+        help="Allowed OAuth callback URI; repeat as needed",
+    ),
+) -> None:
+    """Run stdio, or opt into authenticated HTTP using explicit hosted settings."""
+    if transport == "stdio":
+        from matrix_mcp.mcp_server import create_mcp_server
 
-    create_mcp_server().run()
+        create_mcp_server().run()
+        return
+
+    from pydantic import ValidationError
+
+    from matrix_mcp.hosted_auth import HostedSettings
+    from matrix_mcp.hosted_server import create_hosted_server
+
+    overrides: dict[str, Any] = {
+        "public_base_url": public_base_url,
+        "homeserver": homeserver,
+        "api_base_url": api_base_url,
+        "state_directory": state_directory,
+        "allowed_client_redirect_uris": allowed_client_redirect_uri,
+    }
+    try:
+        settings = HostedSettings(
+            **{key: value for key, value in overrides.items() if value is not None}
+        )
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    create_hosted_server(settings).run(
+        transport="http",
+        host=host,
+        port=port,
+        path="/mcp",
+        stateless_http=True,
+        uvicorn_config={"access_log": False},
+    )
 
 
 @app.command()

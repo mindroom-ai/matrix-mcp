@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import pytest
+from fastmcp import Client
 
 from matrix_mcp.matrix_client import MatrixEvent, MatrixRoom
-from matrix_mcp.mcp_server import MatrixMCPTools
+from matrix_mcp.mcp_server import MatrixMCPTools, create_mcp_server
 
 
 class FakeMatrixClient:
     def __init__(self) -> None:
-        self.sent: list[tuple[str | int, str, str | int | None]] = []
+        self.sent: list[tuple[str | int, str, str | int | None, list[str] | None]] = []
         self.files: list[tuple[str | int, str, str | int | None, str | None, str | None]] = []
 
     async def whoami(self) -> dict[str, str | None]:
@@ -59,8 +60,9 @@ class FakeMatrixClient:
         body: str,
         *,
         thread_id: str | int | None = None,
+        mentions: list[str] | None = None,
     ) -> str:
-        self.sent.append((room_id, body, thread_id))
+        self.sent.append((room_id, body, thread_id, mentions))
         return "$sent"
 
     async def send_file(
@@ -114,7 +116,34 @@ async def test_tools_return_pydantic_models() -> None:
     assert await tools.matrix_send_message("!mind:example.com", "hi", thread_id="$root") == {
         "event_id": "$sent"
     }
-    assert matrix.sent == [("!mind:example.com", "hi", "$root")]
+    assert matrix.sent == [("!mind:example.com", "hi", "$root", None)]
+
+
+@pytest.mark.asyncio
+async def test_registered_stdio_tool_dispatches_explicit_mentions() -> None:
+    matrix = FakeMatrixClient()
+    server = create_mcp_server(client_factory=lambda: matrix)
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "matrix_send_message",
+            {
+                "room_id": "!mind:example.com",
+                "body": "hi",
+                "thread_id": "$root",
+                "mentions": ["@alice:example.com", "@helper:example.com"],
+            },
+        )
+
+    assert result.data == {"event_id": "$sent"}
+    assert matrix.sent == [
+        (
+            "!mind:example.com",
+            "hi",
+            "$root",
+            ["@alice:example.com", "@helper:example.com"],
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -151,3 +180,24 @@ async def test_send_message_requires_text_or_attachment() -> None:
 
     with pytest.raises(ValueError, match="body or file_path"):
         await tools.matrix_send_message("!mind:example.com")
+
+
+@pytest.mark.asyncio
+async def test_file_send_rejects_mentions_before_creating_client() -> None:
+    created = False
+
+    def client_factory() -> FakeMatrixClient:
+        nonlocal created
+        created = True
+        return FakeMatrixClient()
+
+    tools = MatrixMCPTools(client_factory=client_factory)
+
+    with pytest.raises(ValueError, match=r"mentions.*text messages"):
+        await tools.matrix_send_message(
+            "!mind:example.com",
+            file_path="workspace/report.txt",
+            mentions=["@alice:example.com"],
+        )
+
+    assert not created
