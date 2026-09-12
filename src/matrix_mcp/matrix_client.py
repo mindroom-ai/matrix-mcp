@@ -415,6 +415,7 @@ class NioMatrixDriver:
         if event.edited or event.redacted:
             return _event_from_timeline(event)
 
+        latest: tuple[tuple[int, str], TimelineEvent] | None = None
         scanned = 0
         async for replacement in self._client.room_get_event_relations(
             room_id,
@@ -432,12 +433,17 @@ class NioMatrixDriver:
                     replacement=replacement_source,
                 )
                 if updated.edited:
-                    return _event_from_timeline(updated)
+                    key = (
+                        cast("int", replacement_source["origin_server_ts"]),
+                        cast("str", replacement_source["event_id"]),
+                    )
+                    if latest is None or key > latest[0]:
+                        latest = key, updated
             scanned += 1
             if scanned >= page_size:
                 break
 
-        return _event_from_timeline(event)
+        return _event_from_timeline(event if latest is None else latest[1])
 
     async def send_message(
         self,

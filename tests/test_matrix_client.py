@@ -524,6 +524,32 @@ async def test_nio_driver_uses_newest_edit_when_replacement_scan_is_capped(
     assert events[0].edited is True
 
 
+@pytest.mark.asyncio
+async def test_nio_driver_orders_bounded_edits_by_timestamp_then_event_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    FakeNioClient.instances[0].replacement_events["$root"] = [
+        edit_event("$tie-z", replaces="$root", timestamp_ms=300, body="latest tie"),
+        edit_event("$tie-a", replaces="$root", timestamp_ms=300, body="earlier tie"),
+        edit_event("$topology-first", replaces="$root", timestamp_ms=200, body="topology first"),
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=3)
+
+    assert events[0].body == "latest tie"
+    assert events[0].edited is True
+
+
 def parsed_message_event(  # noqa: PLR0913 - Raw event fixture builder.
     event_id: str,
     *,
