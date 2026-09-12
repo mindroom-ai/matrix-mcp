@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
+    from matrix_mcp.matrix_client import MatrixDriver
+
 
 class FakeDriver:
     def __init__(self) -> None:
@@ -508,7 +510,7 @@ async def test_client_builds_default_driver_from_config(
 @pytest.mark.asyncio
 async def test_list_rooms_reads_joined_room_names() -> None:
     driver = FakeDriver()
-    client = MatrixAPIClient(driver=driver)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
 
     rooms = await client.list_rooms()
 
@@ -519,7 +521,7 @@ async def test_list_rooms_reads_joined_room_names() -> None:
 async def test_client_adds_and_accepts_numeric_refs(tmp_path: Path) -> None:
     driver = FakeDriver()
     id_store = MatrixIdStore(tmp_path / "ids.json")
-    client = MatrixAPIClient(driver=driver, id_store=id_store)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver), id_store=id_store)
 
     rooms = await client.list_rooms()
     assert rooms == [MatrixRoom(id=1, room_id="!room:example.com", name="Mind")]
@@ -563,7 +565,7 @@ async def test_client_adds_and_accepts_numeric_refs(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_read_room_recent_normalizes_text_events() -> None:
     driver = FakeDriver()
-    client = MatrixAPIClient(driver=driver)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
 
     events = await client.read_room_recent("!room:example.com", limit=10)
 
@@ -581,7 +583,7 @@ async def test_read_room_recent_normalizes_text_events() -> None:
 @pytest.mark.asyncio
 async def test_read_thread_returns_root_and_replies() -> None:
     driver = FakeDriver()
-    client = MatrixAPIClient(driver=driver)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
 
     events = await client.read_thread("!room:example.com", "$root", limit=25)
 
@@ -606,7 +608,7 @@ async def test_read_thread_returns_root_and_replies() -> None:
 @pytest.mark.asyncio
 async def test_send_message_uses_transaction_id_and_optional_thread() -> None:
     driver = FakeDriver()
-    client = MatrixAPIClient(driver=driver)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
 
     event_id = await client.send_message("!room:example.com", "hi", thread_id="$root")
 
@@ -645,7 +647,7 @@ async def test_send_file_accepts_optional_thread_and_metadata(tmp_path: Path) ->
     path = tmp_path / "report.txt"
     path.write_text("hello", encoding="utf-8")
     driver = FakeDriver()
-    client = MatrixAPIClient(driver=driver)
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
 
     event_id = await client.send_file(
         "!room:example.com",

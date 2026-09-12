@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 import pytest
 from fastmcp import Client
 
 from matrix_mcp.matrix_client import MatrixEvent, MatrixRoom
 from matrix_mcp.mcp_server import MatrixMCPTools, create_mcp_server
+
+if TYPE_CHECKING:
+    from matrix_mcp.mcp_server import MatrixMCPClient
 
 
 class FakeMatrixClient:
@@ -81,7 +86,7 @@ class FakeMatrixClient:
 @pytest.mark.asyncio
 async def test_tools_return_pydantic_models() -> None:
     matrix = FakeMatrixClient()
-    tools = MatrixMCPTools(client_factory=lambda: matrix)
+    tools = MatrixMCPTools(client_factory=lambda: cast("MatrixMCPClient", matrix))
 
     assert await tools.matrix_whoami() == {
         "user_id": "@alice:example.com",
@@ -122,7 +127,7 @@ async def test_tools_return_pydantic_models() -> None:
 @pytest.mark.asyncio
 async def test_registered_stdio_tool_dispatches_explicit_mentions() -> None:
     matrix = FakeMatrixClient()
-    server = create_mcp_server(client_factory=lambda: matrix)
+    server = create_mcp_server(client_factory=lambda: cast("MatrixMCPClient", matrix))
 
     async with Client(server) as client:
         result = await client.call_tool(
@@ -149,7 +154,7 @@ async def test_registered_stdio_tool_dispatches_explicit_mentions() -> None:
 @pytest.mark.asyncio
 async def test_file_tools_send_room_and_thread_attachments() -> None:
     matrix = FakeMatrixClient()
-    tools = MatrixMCPTools(client_factory=lambda: matrix)
+    tools = MatrixMCPTools(client_factory=lambda: cast("MatrixMCPClient", matrix))
 
     report_path = "workspace/report.txt"
     thread_report_path = "workspace/thread-report.txt"
@@ -176,7 +181,7 @@ async def test_file_tools_send_room_and_thread_attachments() -> None:
 @pytest.mark.asyncio
 async def test_send_message_requires_text_or_attachment() -> None:
     matrix = FakeMatrixClient()
-    tools = MatrixMCPTools(client_factory=lambda: matrix)
+    tools = MatrixMCPTools(client_factory=lambda: cast("MatrixMCPClient", matrix))
 
     with pytest.raises(ValueError, match="body or file_path"):
         await tools.matrix_send_message("!mind:example.com")
@@ -191,7 +196,7 @@ async def test_file_send_rejects_mentions_before_creating_client() -> None:
         created = True
         return FakeMatrixClient()
 
-    tools = MatrixMCPTools(client_factory=client_factory)
+    tools = MatrixMCPTools(client_factory=lambda: cast("MatrixMCPClient", client_factory()))
 
     with pytest.raises(ValueError, match=r"mentions.*text messages"):
         await tools.matrix_send_message(

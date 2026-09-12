@@ -26,6 +26,10 @@ class FakeMatrix:
     refreshes: dict[str, str] = field(default_factory=dict)
     logins: dict[str, str] = field(default_factory=dict)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    invitations: list[dict[str, str]] = field(default_factory=list)
+    room_writes: list[dict[str, Any]] = field(default_factory=list)
+    profiles: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    room_state: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
     logout_fails: bool = False
     legacy: bool = False
     expires_in_ms: float | str | None = 3_600_000
@@ -51,6 +55,7 @@ class FakeMatrix:
         access = f"matrix-access-{secrets.token_urlsafe(24)}"
         device = device or secrets.token_hex(8)
         identity = (f"@{user}:example.com", device)
+        self.profiles.setdefault(identity[0], {"displayname": user, "avatar_url": None})
         self.sessions[access] = identity
         result: dict[str, Any] = {
             "access_token": access,
@@ -106,8 +111,9 @@ class FakeMatrix:
             return web.json_response({})
         if path.endswith("/joined_rooms"):
             return web.json_response({"joined_rooms": ["!room:example.com"]})
-        if "/state/m.room.name" in path:
-            return web.json_response({"name": "Example room"})
+        management = await self.room_profile_request(request, identity[0])
+        if management is not None:
+            return management
         if "/state/m.room.encryption" in path:
             data = (
                 {"algorithm": "m.megolm.v1.aes-sha2"}
@@ -126,6 +132,85 @@ class FakeMatrix:
         if "/relations/" in path:
             return web.json_response({"chunk": []})
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+
+    async def room_profile_request(  # noqa: C901, PLR0911, PLR0912 - Fake API routes.
+        self, request: web.Request, actor: str
+    ) -> web.Response | None:
+        path = request.path.rstrip("/")
+        if "/rooms/" in path:
+            room_id = path.split("/rooms/", 1)[1].split("/", 1)[0]
+            if room_id == "!forbidden:example.com":
+                return web.json_response(
+                    {"errcode": "M_FORBIDDEN", "error": "Room access denied"}, status=403
+                )
+            if path.endswith("/joined_members") and request.method == "GET":
+                return web.json_response(
+                    {
+                        "joined": {
+                            user_id: {
+                                "display_name": profile["displayname"],
+                                "avatar_url": profile["avatar_url"],
+                            }
+                            for user_id, profile in reversed(list(self.profiles.items()))
+                        }
+                    }
+                )
+            if path.endswith("/invite") and request.method == "POST":
+                content = await request.json()
+                self.invitations.append(
+                    {"actor": actor, "room_id": room_id, "user_id": content["user_id"]}
+                )
+                return web.json_response({})
+            if "/state/" in path:
+                event_type = path.split("/state/", 1)[1]
+                if event_type in {"m.room.name", "m.room.topic", "m.room.avatar"}:
+                    if request.method == "PUT":
+                        content = await request.json()
+                        self.room_state[room_id, event_type] = content
+                        self.room_writes.append(
+                            {"actor": actor, "type": event_type, "content": content}
+                        )
+                        return web.json_response({"event_id": f"$state{len(self.room_writes)}"})
+                    if request.method == "GET":
+                        content = self.room_state.get((room_id, event_type))
+                        if content is None and event_type == "m.room.name":
+                            content = {"name": "Example room"}
+                        if content is not None:
+                            return web.json_response(content)
+                        return web.json_response(
+                            {"errcode": "M_NOT_FOUND", "error": "No state event"}, status=404
+                        )
+        if "/profile/" in path:
+            parts = path.split("/profile/", 1)[1].split("/")
+            user_id = parts[0]
+            if request.method == "GET" and len(parts) == 1:
+                return web.json_response(
+                    {
+                        key: value
+                        for key, value in self.profiles.get(user_id, {}).items()
+                        if value is not None
+                    }
+                )
+            if request.method == "PUT" and len(parts) == 2:
+                if user_id != actor:
+                    return web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+                content = await request.json()
+                self.profiles[actor].update(content)
+                return web.json_response({})
+        if path.endswith("/user_directory/search") and request.method == "POST":
+            content = await request.json()
+            matches = [
+                {
+                    "user_id": user_id,
+                    "display_name": profile["displayname"],
+                    "avatar_url": profile["avatar_url"],
+                }
+                for user_id, profile in self.profiles.items()
+                if content["search_term"].lower() in user_id.lower()
+            ]
+            limit = content["limit"]
+            return web.json_response({"results": matches[:limit], "limited": len(matches) > limit})
+        return None
 
     @staticmethod
     def event() -> dict[str, Any]:

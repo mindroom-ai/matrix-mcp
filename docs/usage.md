@@ -124,6 +124,54 @@ matrix_send_message(room_id=1, file_path="workspace/report.txt", thread_id=42)
 
 Use send tools only when the user explicitly asks to post.
 
+### Room Members and Invitations
+
+```text
+matrix_list_room_members(room_id=1, limit=25)
+matrix_list_room_members(room_id=1, limit=25, offset=25)
+matrix_search_users(search_term="Bob", limit=10)
+matrix_invite_user(room_id=1, user_id="@bob:example.com")
+```
+
+Member lists include joined users, their display names, and avatar URIs, sorted by user ID.
+They exclude pending invitations and users who left.
+Use the returned `next_offset` for another page; `null` means the end.
+Each call reads current membership, so pages can change when people join or leave.
+Member and directory queries accept limits from 1 to 100.
+Directory visibility depends on the homeserver; `limited: true` means more matches exist, so narrow the search.
+An invitation uses a full Matrix user ID and succeeds only when the connected account may invite that user.
+It does not automatically join the invited user.
+
+### Room Details
+
+```text
+matrix_get_room_info(room_id=1)
+matrix_set_room_name(room_id=1, name="Project discussion")
+matrix_set_room_topic(room_id=1, topic="Plans and updates")
+matrix_set_room_avatar(room_id=1, avatar_url="mxc://example.com/room-avatar")
+```
+
+Read the current details before changing them.
+Each setter changes one field and returns its Matrix event ID.
+Room permissions apply normally; permission failures are returned as tool errors.
+
+### User Profiles
+
+```text
+matrix_get_profile()
+matrix_get_profile(user_id="@bob:example.com")
+matrix_set_display_name(displayname="Alice")
+matrix_set_avatar(avatar_url="mxc://example.com/profile-avatar")
+```
+
+Profile setters change only the connected account's global profile, which may update its appearance across rooms.
+Avatar setters use existing Matrix `mxc://` media URIs.
+Upload an image through a Matrix client first, then use its media URI; HTTP URLs and local file paths are not accepted by avatar setters.
+Pass an empty string to clear a display name, room name, topic, or avatar.
+Invite people and change room/profile details only when the user explicitly requests that action.
+
+These tools also work in authenticated HTTP mode, using raw Matrix room IDs instead of numeric references.
+
 ## Stored Files
 
 Credentials are stored in the user config directory reported by:

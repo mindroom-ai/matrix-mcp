@@ -16,7 +16,7 @@ It is intended to make MindRoom conversations available to local coding agents w
 
 For remote clients, opt into [authenticated HTTP](docs/hosted.md).
 Each caller connects its own Matrix account through browser SSO.
-Hosted tools use raw Matrix IDs and support reads and text sends, with no local-file access.
+Hosted tools use raw Matrix IDs and support conversations, room membership, and room/profile updates, with no local-file access.
 
 ## Install
 
@@ -145,6 +145,16 @@ It does not expose a local HTTP port during normal MCP operation.
 - `matrix_read_room_recent`: read recent text events from a room.
 - `matrix_read_thread`: read a Matrix thread root and its recent text replies.
 - `matrix_send_message`: send a text message or local file, optionally as a Matrix thread reply.
+- `matrix_list_room_members`: page through joined members and their profiles.
+- `matrix_search_users`: find user IDs in the homeserver's visible user directory.
+- `matrix_invite_user`: invite a user to a room.
+- `matrix_get_room_info`: read a room's name, topic, and avatar.
+- `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar`: update room details.
+- `matrix_get_profile`: look up your own or another user's profile.
+- `matrix_set_display_name`, `matrix_set_avatar`: update your own global profile.
+
+All actions use the connected account's Matrix permissions.
+See [room and profile examples](docs/usage.md#room-members-and-invitations) for arguments, pagination, and avatar media URIs.
 
 Rooms and events returned by read/list tools include stable numeric `id` fields.
 Thread replies also include `thread_ref`, which is the numeric event ref of the thread root.

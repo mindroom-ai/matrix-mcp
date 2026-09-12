@@ -1,25 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 import re
+from http import HTTPStatus
 from typing import Protocol, cast
+from urllib.parse import urlsplit
 
+from aiohttp import ContentTypeError
 from anyio import Path as AsyncPath
 from nio import (
     AsyncClient,
     AsyncClientConfig,
+    ErrorResponse,
+    JoinedMembersResponse,
     JoinedRoomsResponse,
     MessageDirection,
+    ProfileGetResponse,
+    ProfileSetAvatarResponse,
+    ProfileSetDisplayNameResponse,
     RoomGetEventResponse,
+    RoomGetStateEventError,
     RoomGetStateEventResponse,
+    RoomInviteResponse,
     RoomMessagesResponse,
     RoomMessageText,
+    RoomPutStateResponse,
     RoomSendResponse,
     UploadResponse,
 )
 from nio.api import RelationshipType
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import resolve_http_headers
@@ -33,6 +45,36 @@ class MatrixRoom(BaseModel):
     id: int | None = None
     room_id: str
     name: str | None = None
+
+
+class MatrixRoomInfo(MatrixRoom):
+    topic: str | None = None
+    avatar_url: str | None = None
+
+
+class MatrixProfile(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    user_id: str
+    displayname: str | None = Field(
+        default=None, validation_alias=AliasChoices("displayname", "display_name")
+    )
+    avatar_url: str | None = None
+
+
+class MatrixRoomMembers(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    members: list[MatrixProfile]
+    total: int
+    next_offset: int | None
+
+
+class MatrixUserSearch(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    results: list[MatrixProfile]
+    limited: bool
 
 
 class MatrixEvent(BaseModel):
@@ -51,6 +93,28 @@ class MatrixDriver(Protocol):
     async def whoami(self) -> dict[str, str | None]: ...
 
     async def list_rooms(self) -> list[MatrixRoom]: ...
+
+    async def list_room_members(
+        self, room_id: str, *, limit: int = 100, offset: int = 0
+    ) -> MatrixRoomMembers: ...
+
+    async def invite_user(self, room_id: str, user_id: str) -> None: ...
+
+    async def get_room_info(self, room_id: str) -> MatrixRoomInfo: ...
+
+    async def set_room_name(self, room_id: str, name: str) -> str: ...
+
+    async def set_room_topic(self, room_id: str, topic: str) -> str: ...
+
+    async def set_room_avatar(self, room_id: str, avatar_url: str) -> str: ...
+
+    async def get_profile(self, user_id: str | None = None) -> MatrixProfile: ...
+
+    async def set_display_name(self, displayname: str) -> None: ...
+
+    async def set_avatar(self, avatar_url: str) -> None: ...
+
+    async def search_users(self, search_term: str, *, limit: int = 25) -> MatrixUserSearch: ...
 
     async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]: ...
 
@@ -128,6 +192,152 @@ class NioMatrixDriver:
             return None
         name = response.content.get("name")
         return name if isinstance(name, str) else None
+
+    async def list_room_members(
+        self, room_id: str, *, limit: int = 100, offset: int = 0
+    ) -> MatrixRoomMembers:
+        _validate_limit(limit)
+        if offset < 0:
+            msg = "offset must be nonnegative"
+            raise ValueError(msg)
+        response = await self._client.joined_members(room_id)
+        if isinstance(response, JoinedMembersResponse):
+            members = sorted(response.members, key=lambda member: member.user_id)
+            total = len(members)
+            return MatrixRoomMembers(
+                members=[
+                    MatrixProfile(
+                        user_id=member.user_id,
+                        displayname=member.display_name,
+                        avatar_url=member.avatar_url,
+                    )
+                    for member in members[offset : offset + limit]
+                ],
+                total=total,
+                next_offset=offset + limit if offset + limit < total else None,
+            )
+        msg = f"Matrix joined_members failed: {response}"
+        raise RuntimeError(msg)
+
+    async def invite_user(self, room_id: str, user_id: str) -> None:
+        _validate_user_id(user_id)
+        response = await self._client.room_invite(room_id, user_id)
+        if isinstance(response, RoomInviteResponse):
+            return
+        msg = f"Matrix room_invite failed: {response}"
+        raise RuntimeError(msg)
+
+    async def get_room_info(self, room_id: str) -> MatrixRoomInfo:
+        name, topic, avatar_url = await asyncio.gather(
+            self._room_state_value(room_id, "m.room.name", "name"),
+            self._room_state_value(room_id, "m.room.topic", "topic"),
+            self._room_state_value(room_id, "m.room.avatar", "url"),
+        )
+        return MatrixRoomInfo(room_id=room_id, name=name, topic=topic, avatar_url=avatar_url)
+
+    async def _room_state_value(self, room_id: str, event_type: str, key: str) -> str | None:
+        response = await self._client.room_get_state_event(room_id, event_type, state_key="")
+        # Nio only classifies HTTP 404 as a room-state error itself.
+        if (
+            isinstance(response, RoomGetStateEventResponse)
+            and response.transport_response is not None
+            and response.transport_response.status >= HTTPStatus.BAD_REQUEST
+        ):
+            response = RoomGetStateEventError.from_dict(response.content, room_id)
+        if isinstance(response, RoomGetStateEventResponse):
+            value = response.content.get(key)
+            return value if isinstance(value, str) else None
+        if isinstance(response, RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
+            return None
+        msg = f"Matrix room_get_state_event failed: {response}"
+        raise RuntimeError(msg)
+
+    async def set_room_name(self, room_id: str, name: str) -> str:
+        return await self._put_room_state(room_id, "m.room.name", {"name": name})
+
+    async def set_room_topic(self, room_id: str, topic: str) -> str:
+        return await self._put_room_state(room_id, "m.room.topic", {"topic": topic})
+
+    async def set_room_avatar(self, room_id: str, avatar_url: str) -> str:
+        _validate_avatar_url(avatar_url)
+        return await self._put_room_state(room_id, "m.room.avatar", {"url": avatar_url})
+
+    async def _put_room_state(self, room_id: str, event_type: str, content: dict[str, str]) -> str:
+        response = await self._client.room_put_state(room_id, event_type, content, state_key="")
+        if isinstance(response, RoomPutStateResponse):
+            return cast("str", response.event_id)
+        msg = f"Matrix room_put_state failed: {response}"
+        raise RuntimeError(msg)
+
+    async def get_profile(self, user_id: str | None = None) -> MatrixProfile:
+        target = self._client.user_id if user_id is None else user_id
+        _validate_user_id(target)
+        response = await self._client.get_profile(target)
+        if isinstance(response, ProfileGetResponse):
+            return MatrixProfile(
+                user_id=target,
+                displayname=response.displayname,
+                avatar_url=response.avatar_url,
+            )
+        msg = f"Matrix get_profile failed: {response}"
+        raise RuntimeError(msg)
+
+    async def set_display_name(self, displayname: str) -> None:
+        response = await self._client.set_displayname(displayname)
+        if isinstance(response, ProfileSetDisplayNameResponse):
+            return
+        msg = f"Matrix set_displayname failed: {response}"
+        raise RuntimeError(msg)
+
+    async def set_avatar(self, avatar_url: str) -> None:
+        _validate_avatar_url(avatar_url)
+        response = await self._client.set_avatar(avatar_url)
+        if isinstance(response, ProfileSetAvatarResponse):
+            return
+        msg = f"Matrix set_avatar failed: {response}"
+        raise RuntimeError(msg)
+
+    async def search_users(self, search_term: str, *, limit: int = 25) -> MatrixUserSearch:
+        _validate_limit(limit)
+        if not search_term.strip():
+            msg = "search_term must not be empty"
+            raise ValueError(msg)
+        # Nio has no user-directory method; reuse its public HTTP transport.
+        headers = dict(self._client.config.custom_headers or {})
+        headers.update(
+            {
+                "Authorization": f"Bearer {self._client.access_token}",
+                "Content-Type": "application/json",
+            }
+        )
+        async with await self._client.send(
+            "POST",
+            "/_matrix/client/v3/user_directory/search",
+            data=json.dumps({"search_term": search_term, "limit": limit}),
+            headers=headers,
+        ) as response:
+            try:
+                payload = await response.json()
+            except (ContentTypeError, ValueError) as exc:
+                msg = "Matrix user search returned an invalid JSON response"
+                raise RuntimeError(msg) from exc
+            if response.status != HTTPStatus.OK:
+                detail = (
+                    ErrorResponse.from_dict(payload)
+                    if isinstance(payload, dict)
+                    else response.status
+                )
+                msg = f"Matrix user search failed: {detail}"
+                raise RuntimeError(msg)
+        try:
+            result = MatrixUserSearch.model_validate(payload, strict=True)
+        except ValidationError as exc:
+            msg = "Matrix user search returned an invalid response"
+            raise RuntimeError(msg) from exc
+        return MatrixUserSearch(
+            results=result.results[:limit],
+            limited=result.limited or len(result.results) > limit,
+        )
 
     async def read_room_recent(self, room_id: str, *, limit: int = 20) -> list[MatrixEvent]:
         response = await self._client.room_messages(
@@ -282,13 +492,20 @@ class MatrixAPIClient:
         driver: MatrixDriver | None = None,
         id_store: MatrixIdStore | None = None,
     ) -> None:
+        self._owned_driver: NioMatrixDriver | None = None
         if driver is not None:
             self._driver = driver
             self._id_store = id_store
             return
         config = config or MatrixMCPConfig.load()
-        self._driver = NioMatrixDriver(config)
+        self._owned_driver = NioMatrixDriver(config)
+        self._driver = self._owned_driver
         self._id_store = id_store or MatrixIdStore.for_config(config)
+
+    async def aclose(self) -> None:
+        """Close the internally created driver; injected drivers belong to the caller."""
+        if self._owned_driver is not None:
+            await self._owned_driver.aclose()
 
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()
@@ -296,6 +513,41 @@ class MatrixAPIClient:
     async def list_rooms(self) -> list[MatrixRoom]:
         rooms = await self._driver.list_rooms()
         return [self._with_room_ref(room) for room in rooms]
+
+    async def list_room_members(
+        self, room_id: str | int, *, limit: int = 100, offset: int = 0
+    ) -> MatrixRoomMembers:
+        return await self._driver.list_room_members(
+            self._resolve_room(room_id), limit=limit, offset=offset
+        )
+
+    async def invite_user(self, room_id: str | int, user_id: str) -> None:
+        await self._driver.invite_user(self._resolve_room(room_id), user_id)
+
+    async def get_room_info(self, room_id: str | int) -> MatrixRoomInfo:
+        room = await self._driver.get_room_info(self._resolve_room(room_id))
+        return self._with_room_ref(room)
+
+    async def set_room_name(self, room_id: str | int, name: str) -> str:
+        return await self._driver.set_room_name(self._resolve_room(room_id), name)
+
+    async def set_room_topic(self, room_id: str | int, topic: str) -> str:
+        return await self._driver.set_room_topic(self._resolve_room(room_id), topic)
+
+    async def set_room_avatar(self, room_id: str | int, avatar_url: str) -> str:
+        return await self._driver.set_room_avatar(self._resolve_room(room_id), avatar_url)
+
+    async def get_profile(self, user_id: str | None = None) -> MatrixProfile:
+        return await self._driver.get_profile(user_id)
+
+    async def set_display_name(self, displayname: str) -> None:
+        await self._driver.set_display_name(displayname)
+
+    async def set_avatar(self, avatar_url: str) -> None:
+        await self._driver.set_avatar(avatar_url)
+
+    async def search_users(self, search_term: str, *, limit: int = 25) -> MatrixUserSearch:
+        return await self._driver.search_users(search_term, limit=limit)
 
     async def read_room_recent(self, room_id: str | int, *, limit: int = 20) -> list[MatrixEvent]:
         resolved_room_id = self._resolve_room(room_id)
@@ -342,7 +594,7 @@ class MatrixAPIClient:
             content_type=content_type,
         )
 
-    def _with_room_ref(self, room: MatrixRoom) -> MatrixRoom:
+    def _with_room_ref[RoomT: MatrixRoom](self, room: RoomT) -> RoomT:
         if self._id_store is None:
             return room
         return room.model_copy(update={"id": self._id_store.room_ref(room.room_id)})
@@ -374,6 +626,37 @@ class MatrixAPIClient:
         if event_id_or_ref is None:
             return None
         return self._resolve_event(event_id_or_ref)
+
+
+def _validate_limit(limit: int) -> None:
+    if not 1 <= limit <= 100:  # noqa: PLR2004 - Public tool page-size bound.
+        msg = "limit must be between 1 and 100"
+        raise ValueError(msg)
+
+
+def _validate_user_id(user_id: str) -> None:
+    if re.fullmatch(r"@[^\s:]+:[^\s/?#@]+", user_id) is None:
+        msg = f"Invalid Matrix user ID: {user_id}"
+        raise ValueError(msg)
+
+
+def _validate_avatar_url(avatar_url: str) -> None:
+    if not avatar_url:
+        return
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    hostname = rf"(?:{label}\.)*{label}\.?"
+    match = re.fullmatch(
+        rf"mxc://(?:{hostname}|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?/"
+        r"[A-Za-z0-9_-]+",
+        avatar_url,
+    )
+    try:
+        valid = match is not None and urlsplit(avatar_url).port != 0
+    except ValueError:
+        valid = False
+    if not valid:
+        msg = "avatar_url must be a valid mxc://server/media_id URI or an empty string"
+        raise ValueError(msg)
 
 
 def _event_from_nio(raw: object) -> MatrixEvent | None:
