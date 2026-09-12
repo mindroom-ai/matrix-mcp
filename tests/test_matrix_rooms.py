@@ -142,6 +142,59 @@ async def test_denied_event_never_updates_read_state(
     assert [request["method"] for request in endpoint.requests] == ["GET"]
 
 
+async def test_mark_read_reports_partial_success_when_unread_clear_fails(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", f"{ROOM_PATH}/event/$last")] = (
+        {
+            "event_id": "$last",
+            "sender": "@bob:example.com",
+            "type": "m.room.message",
+            "content": {"body": "hello", "msgtype": "m.text"},
+        },
+        200,
+    )
+    endpoint.responses[("POST", f"{ROOM_PATH}/read_markers")] = ({}, 200)
+    marked_unread_path = (
+        f"/_matrix/client/v3/user/@alice:example.com/rooms/{ROOM}/account_data/m.marked_unread"
+    )
+    endpoint.responses[("PUT", marked_unread_path)] = (
+        {"errcode": "M_UNKNOWN", "error": "do-not-echo-this"},
+        500,
+    )
+
+    with pytest.raises(RuntimeError, match=r"read markers were updated.*safe to retry") as error:
+        await rooms.mark_read(ROOM, "$last")
+
+    assert "do-not-echo-this" not in str(error.value)
+    assert [request["method"] for request in endpoint.requests] == ["GET", "POST", "PUT"]
+
+
+async def test_mark_read_does_not_clear_unread_after_marker_failure(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", f"{ROOM_PATH}/event/$last")] = (
+        {
+            "event_id": "$last",
+            "sender": "@bob:example.com",
+            "type": "m.room.message",
+            "content": {"body": "hello", "msgtype": "m.text"},
+        },
+        200,
+    )
+    endpoint.responses[("POST", f"{ROOM_PATH}/read_markers")] = (
+        {"errcode": "M_FORBIDDEN"},
+        403,
+    )
+
+    with pytest.raises(RuntimeError, match="M_FORBIDDEN"):
+        await rooms.mark_read(ROOM, "$last")
+
+    assert [request["method"] for request in endpoint.requests] == ["GET", "POST"]
+
+
 @pytest.mark.parametrize("identifier", ["room", "https://example.com", "!room:example.com/leave"])
 async def test_invalid_join_target_is_rejected_before_http(
     matrix: tuple[MatrixRooms, RoomEndpoint], identifier: str

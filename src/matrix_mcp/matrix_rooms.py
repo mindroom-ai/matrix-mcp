@@ -236,11 +236,18 @@ class MatrixRooms:
             },
         )
         user = _identifier(self.http.user_id, sigils="@")
-        await self.http.json(
-            "PUT",
-            f"/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread",
-            body={"unread": False},
-        )
+        try:
+            await self.http.json(
+                "PUT",
+                f"/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread",
+                body={"unread": False},
+            )
+        except RuntimeError:
+            msg = (
+                "Matrix read markers were updated, but the manual unread flag could not be "
+                "cleared; it is safe to retry"
+            )
+            raise RuntimeError(msg) from None
 
     async def _sync(
         self,
