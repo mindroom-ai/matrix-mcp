@@ -492,13 +492,20 @@ class MatrixAPIClient:
         driver: MatrixDriver | None = None,
         id_store: MatrixIdStore | None = None,
     ) -> None:
+        self._owned_driver: NioMatrixDriver | None = None
         if driver is not None:
             self._driver = driver
             self._id_store = id_store
             return
         config = config or MatrixMCPConfig.load()
-        self._driver = NioMatrixDriver(config)
+        self._owned_driver = NioMatrixDriver(config)
+        self._driver = self._owned_driver
         self._id_store = id_store or MatrixIdStore.for_config(config)
+
+    async def aclose(self) -> None:
+        """Close the internally created driver; injected drivers belong to the caller."""
+        if self._owned_driver is not None:
+            await self._owned_driver.aclose()
 
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()

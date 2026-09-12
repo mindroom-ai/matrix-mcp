@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Protocol
 
 from fastmcp import FastMCP
@@ -16,7 +17,7 @@ from matrix_mcp.matrix_client import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from matrix_mcp.hosted_server import HostedMatrixTools
 
@@ -80,13 +81,24 @@ class MatrixMCPTools:
     def __init__(self, client_factory: Callable[[], MatrixMCPClient] = MatrixAPIClient) -> None:
         self._client_factory = client_factory
 
+    @asynccontextmanager
+    async def _client(self) -> AsyncIterator[MatrixMCPClient]:
+        client = self._client_factory()
+        try:
+            yield client
+        finally:
+            if isinstance(client, MatrixAPIClient):
+                await client.aclose()
+
     async def matrix_whoami(self) -> dict[str, str | None]:
         """Return the Matrix user and device for the configured session."""
-        return await self._client_factory().whoami()
+        async with self._client() as client:
+            return await client.whoami()
 
     async def matrix_list_rooms(self) -> list[MatrixRoom]:
         """List joined Matrix rooms visible to the authenticated user."""
-        return await self._client_factory().list_rooms()
+        async with self._client() as client:
+            return await client.list_rooms()
 
     async def matrix_list_room_members(
         self,
@@ -98,54 +110,65 @@ class MatrixMCPTools:
 
         Follow next_offset for another page; invited or departed users are excluded.
         """
-        return await self._client_factory().list_room_members(room_id, limit=limit, offset=offset)
+        async with self._client() as client:
+            return await client.list_room_members(room_id, limit=limit, offset=offset)
 
     async def matrix_invite_user(self, room_id: str | int, user_id: str) -> dict[str, str]:
         """Invite a full Matrix user ID to a room when the user requests it."""
-        await self._client_factory().invite_user(room_id, user_id)
+        async with self._client() as client:
+            await client.invite_user(room_id, user_id)
         return {"status": "invited"}
 
     async def matrix_get_room_info(self, room_id: str | int) -> MatrixRoomInfo:
         """Read the room name, topic, and avatar before changing room details."""
-        return await self._client_factory().get_room_info(room_id)
+        async with self._client() as client:
+            return await client.get_room_info(room_id)
 
     async def matrix_set_room_name(self, room_id: str | int, name: str) -> dict[str, str]:
         """Change a room's name; an empty string clears it. Requires room permission."""
-        return {"event_id": await self._client_factory().set_room_name(room_id, name)}
+        async with self._client() as client:
+            return {"event_id": await client.set_room_name(room_id, name)}
 
     async def matrix_set_room_topic(self, room_id: str | int, topic: str) -> dict[str, str]:
         """Change a room's topic; an empty string clears it. Requires room permission."""
-        return {"event_id": await self._client_factory().set_room_topic(room_id, topic)}
+        async with self._client() as client:
+            return {"event_id": await client.set_room_topic(room_id, topic)}
 
     async def matrix_set_room_avatar(self, room_id: str | int, avatar_url: str) -> dict[str, str]:
         """Set a room avatar from an existing mxc:// media URI, or clear it with an empty string."""
-        return {"event_id": await self._client_factory().set_room_avatar(room_id, avatar_url)}
+        async with self._client() as client:
+            return {"event_id": await client.set_room_avatar(room_id, avatar_url)}
 
     async def matrix_get_profile(self, user_id: str | None = None) -> MatrixProfile:
         """Read a Matrix profile; omit user_id to read the connected user's profile."""
-        return await self._client_factory().get_profile(user_id)
+        async with self._client() as client:
+            return await client.get_profile(user_id)
 
     async def matrix_set_display_name(self, displayname: str) -> dict[str, str]:
         """Change the connected user's global display name; an empty string clears it."""
-        await self._client_factory().set_display_name(displayname)
+        async with self._client() as client:
+            await client.set_display_name(displayname)
         return {"status": "updated"}
 
     async def matrix_set_avatar(self, avatar_url: str) -> dict[str, str]:
         """Set your global avatar from mxc:// media, or clear it with an empty string."""
-        await self._client_factory().set_avatar(avatar_url)
+        async with self._client() as client:
+            await client.set_avatar(avatar_url)
         return {"status": "updated"}
 
     async def matrix_search_users(
         self, search_term: str, limit: Annotated[int, Field(ge=1, le=100)] = 25
     ) -> MatrixUserSearch:
         """Find Matrix user IDs by name or ID using the homeserver's visible user directory."""
-        return await self._client_factory().search_users(search_term, limit=limit)
+        async with self._client() as client:
+            return await client.search_users(search_term, limit=limit)
 
     async def matrix_read_room_recent(
         self, room_id: str | int, limit: int = 20
     ) -> list[MatrixEvent]:
         """Read recent text messages from one Matrix room by Matrix room ID or numeric room ref."""
-        return await self._client_factory().read_room_recent(room_id, limit=limit)
+        async with self._client() as client:
+            return await client.read_room_recent(room_id, limit=limit)
 
     async def matrix_read_thread(
         self,
@@ -154,7 +177,8 @@ class MatrixMCPTools:
         limit: int = 50,
     ) -> list[MatrixEvent]:
         """Read a Matrix thread root and its recent text replies by Matrix ID or numeric ref."""
-        return await self._client_factory().read_thread(room_id, thread_id, limit=limit)
+        async with self._client() as client:
+            return await client.read_thread(room_id, thread_id, limit=limit)
 
     async def matrix_send_message(
         self,
@@ -171,23 +195,25 @@ class MatrixMCPTools:
             if mentions is not None:
                 msg = "mentions are supported only for text messages"
                 raise ValueError(msg)
-            event_id = await self._client_factory().send_file(
-                room_id,
-                file_path,
-                thread_id=thread_id,
-                filename=filename,
-                content_type=content_type,
-            )
+            async with self._client() as client:
+                event_id = await client.send_file(
+                    room_id,
+                    file_path,
+                    thread_id=thread_id,
+                    filename=filename,
+                    content_type=content_type,
+                )
             return {"event_id": event_id}
         if body is None:
             msg = "matrix_send_message requires either body or file_path"
             raise ValueError(msg)
-        event_id = await self._client_factory().send_message(
-            room_id,
-            body,
-            thread_id=thread_id,
-            mentions=mentions,
-        )
+        async with self._client() as client:
+            event_id = await client.send_message(
+                room_id,
+                body,
+                thread_id=thread_id,
+                mentions=mentions,
+            )
         return {"event_id": event_id}
 
 
