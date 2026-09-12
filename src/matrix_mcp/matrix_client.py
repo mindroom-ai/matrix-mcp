@@ -390,7 +390,7 @@ class NioMatrixDriver:
             thread_id,
             rel_type=RelationshipType.thread,
             event_type="m.room.message",
-            direction=MessageDirection.front,
+            direction=MessageDirection.back,
             limit=max_replies,
         ):
             source = _source_from_nio(raw)

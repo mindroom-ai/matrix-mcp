@@ -254,7 +254,10 @@ class FakeNioClient:
             return
 
         self.relations_call = call
-        for event in self.thread_events:
+        thread_events = self.thread_events
+        if kwargs.get("direction") == MessageDirection.back:
+            thread_events = list(reversed(thread_events))
+        for event in thread_events:
             yield event
 
     async def room_send(
@@ -364,7 +367,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         "event_id": "$root",
         "rel_type": RelationshipType.thread,
         "event_type": "m.room.message",
-        "direction": MessageDirection.front,
+        "direction": MessageDirection.back,
         "limit": 100,
     }
 
@@ -666,6 +669,53 @@ async def test_nio_thread_keeps_nontext_and_redacted_events(
 
 
 @pytest.mark.asyncio
+async def test_nio_thread_limit_keeps_the_most_recent_media_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [
+        parsed_message_event(
+            "$older-text",
+            timestamp_ms=200,
+            msgtype="m.text",
+            body="older",
+        ),
+        parsed_message_event(
+            "$newer-image",
+            timestamp_ms=300,
+            msgtype="m.image",
+            body="latest.png",
+            content_update={
+                "url": "mxc://example.com/latest",
+                "info": {"mimetype": "image/png", "size": 6},
+            },
+        ),
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=1)
+
+    assert [event.event_id for event in events] == ["$root", "$newer-image"]
+    assert events[1].media == MediaMetadata(
+        url="mxc://example.com/latest",
+        filename="latest.png",
+        mimetype="image/png",
+        size=6,
+    )
+    assert nio_client.relations_call is not None
+    assert nio_client.relations_call["direction"] == MessageDirection.back
+
+
+@pytest.mark.asyncio
 async def test_nio_thread_applies_bundled_attachment_edit_with_original_relationship(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -729,7 +779,7 @@ async def test_nio_thread_applies_bundled_attachment_edit_with_original_relation
 
 
 @pytest.mark.asyncio
-async def test_nio_driver_bounds_thread_relation_traversal(
+async def test_nio_driver_bounds_thread_relation_traversal_to_recent_replies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeNioClient.instances.clear()
@@ -755,7 +805,7 @@ async def test_nio_driver_bounds_thread_relation_traversal(
 
     events = await driver.read_thread("!room:example.com", "$root", limit=2)
 
-    assert [event.event_id for event in events] == ["$root", "$reply-0", "$reply-1"]
+    assert [event.event_id for event in events] == ["$root", "$reply-3", "$reply-4"]
 
 
 @pytest.mark.asyncio
