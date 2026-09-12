@@ -6,6 +6,7 @@ import pytest
 from anyio import Path as AsyncPath
 from nio import (
     AsyncClientConfig,
+    Event,
     JoinedRoomsResponse,
     MessageDirection,
     RoomGetEventResponse,
@@ -20,6 +21,7 @@ from nio.api import RelationshipType
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.id_state import MatrixIdStore
 from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom, NioMatrixDriver
+from matrix_mcp.matrix_events import HistoryPage, MatrixEvents, MediaMetadata, TimelineEvent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -108,20 +110,21 @@ def text_event(
     body: str = "hello",
     thread_id: str | None = None,
 ) -> RoomMessageText:
-    event = RoomMessageText(
+    content: dict[str, object] = {"body": body, "msgtype": "m.text"}
+    if thread_id is not None:
+        content["m.relates_to"] = {"rel_type": "m.thread", "event_id": thread_id}
+    return RoomMessageText(
         {
             "event_id": event_id,
             "sender": sender,
             "origin_server_ts": timestamp_ms,
-            "content": {"body": body, "msgtype": "m.text"},
+            "type": "m.room.message",
+            "content": content,
         },
         body,
         None,
         None,
     )
-    if thread_id is not None:
-        cast("Any", event).relates_to = {"rel_type": "m.thread", "event_id": thread_id}
-    return event
 
 
 def edit_event(
@@ -137,6 +140,7 @@ def edit_event(
             "event_id": event_id,
             "sender": sender,
             "origin_server_ts": timestamp_ms,
+            "type": "m.room.message",
             "content": {
                 "body": f"* {body}",
                 "msgtype": "m.text",
@@ -168,6 +172,16 @@ class FakeNioClient:
         self.restore_login_call: dict[str, str] | None = None
         self.room_messages_call: dict[str, object] | None = None
         self.relations_call: dict[str, object] | None = None
+        self.thread_events: list[object] = [
+            text_event(
+                "$reply",
+                sender="@bob:example.com",
+                timestamp_ms=200,
+                body="reply",
+                thread_id="$root",
+            )
+        ]
+        self.root_event: object = text_event("$root", timestamp_ms=100, body="root")
         self.replacement_events: dict[str, list[RoomMessageText]] = {}
         self.replacement_calls: list[dict[str, object]] = []
         self.room_send_calls: list[tuple[str, str, dict[str, object]]] = []
@@ -220,7 +234,7 @@ class FakeNioClient:
         assert room_id == "!room:example.com"
         assert event_id == "$root"
         response = RoomGetEventResponse()
-        response.event = text_event("$root", timestamp_ms=100, body="root")
+        response.event = cast("Any", self.root_event)
         return response
 
     async def room_get_event_relations(
@@ -228,22 +242,20 @@ class FakeNioClient:
         room_id: str,
         event_id: str,
         **kwargs: object,
-    ) -> AsyncIterator[RoomMessageText]:
+    ) -> AsyncIterator[object]:
         call = {"room_id": room_id, "event_id": event_id, **kwargs}
         if kwargs.get("rel_type") == RelationshipType.replacement:
             self.replacement_calls.append(call)
-            for event in self.replacement_events.get(event_id, []):
+            replacements = self.replacement_events.get(event_id, [])
+            if kwargs.get("direction") == MessageDirection.back:
+                replacements = list(reversed(replacements))
+            for event in replacements:
                 yield event
             return
 
         self.relations_call = call
-        yield text_event(
-            "$reply",
-            sender="@bob:example.com",
-            timestamp_ms=200,
-            body="reply",
-            thread_id="$root",
-        )
+        for event in self.thread_events:
+            yield event
 
     async def room_send(
         self, room_id: str, event_type: str, content: dict[str, object]
@@ -317,6 +329,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
             event_id="$event",
             sender="@alice:example.com",
             timestamp_ms=123,
+            msgtype="m.text",
             body="recent",
             thread_id=None,
         )
@@ -333,6 +346,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
             event_id="$root",
             sender="@alice:example.com",
             timestamp_ms=100,
+            msgtype="m.text",
             body="root",
             thread_id=None,
         ),
@@ -340,6 +354,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
             event_id="$reply",
             sender="@bob:example.com",
             timestamp_ms=200,
+            msgtype="m.text",
             body="reply",
             thread_id="$root",
         ),
@@ -449,15 +464,19 @@ async def test_nio_driver_applies_latest_thread_message_edits(
             event_id="$root",
             sender="@alice:example.com",
             timestamp_ms=100,
+            msgtype="m.text",
             body="root final",
             thread_id=None,
+            edited=True,
         ),
         MatrixEvent(
             event_id="$reply",
             sender="@bob:example.com",
             timestamp_ms=200,
+            msgtype="m.text",
             body="reply final",
             thread_id="$root",
+            edited=True,
         ),
     ]
     assert nio_client.replacement_calls == [
@@ -466,7 +485,7 @@ async def test_nio_driver_applies_latest_thread_message_edits(
             "event_id": "$root",
             "rel_type": RelationshipType.replacement,
             "event_type": "m.room.message",
-            "direction": MessageDirection.front,
+            "direction": MessageDirection.back,
             "limit": 25,
         },
         {
@@ -474,10 +493,398 @@ async def test_nio_driver_applies_latest_thread_message_edits(
             "event_id": "$reply",
             "rel_type": RelationshipType.replacement,
             "event_type": "m.room.message",
-            "direction": MessageDirection.front,
+            "direction": MessageDirection.back,
             "limit": 25,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_nio_driver_uses_newest_edit_when_replacement_scan_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    FakeNioClient.instances[0].replacement_events["$root"] = [
+        edit_event("$old", replaces="$root", timestamp_ms=150, body="old edit"),
+        edit_event("$latest", replaces="$root", timestamp_ms=250, body="latest edit"),
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=1)
+
+    assert events[0].body == "latest edit"
+    assert events[0].edited is True
+
+
+@pytest.mark.asyncio
+async def test_nio_driver_orders_bounded_edits_by_timestamp_then_event_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    FakeNioClient.instances[0].replacement_events["$root"] = [
+        edit_event("$tie-z", replaces="$root", timestamp_ms=300, body="latest tie"),
+        edit_event("$tie-a", replaces="$root", timestamp_ms=300, body="earlier tie"),
+        edit_event("$topology-first", replaces="$root", timestamp_ms=200, body="topology first"),
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=3)
+
+    assert events[0].body == "latest tie"
+    assert events[0].edited is True
+
+
+def parsed_message_event(  # noqa: PLR0913 - Raw event fixture builder.
+    event_id: str,
+    *,
+    timestamp_ms: int,
+    msgtype: str,
+    body: str,
+    content_update: dict[str, Any] | None = None,
+    unsigned: dict[str, Any] | None = None,
+) -> object:
+    content: dict[str, Any] = {
+        "msgtype": msgtype,
+        "body": body,
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "$root",
+            "is_falling_back": False,
+        },
+        **(content_update or {}),
+    }
+    raw: dict[str, Any] = {
+        "event_id": event_id,
+        "sender": "@bob:example.com",
+        "origin_server_ts": timestamp_ms,
+        "type": "m.room.message",
+        "content": content,
+    }
+    if unsigned is not None:
+        raw["unsigned"] = unsigned
+    return Event.parse_event(raw)
+
+
+@pytest.mark.asyncio
+async def test_nio_thread_keeps_nontext_and_redacted_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [
+        parsed_message_event(
+            "$image",
+            timestamp_ms=200,
+            msgtype="m.image",
+            body="image.png",
+            content_update={
+                "url": "mxc://example.com/image",
+                "info": {"mimetype": "image/png", "size": 6, "w": 10, "h": 20},
+            },
+        ),
+        parsed_message_event(
+            "$notice",
+            timestamp_ms=210,
+            msgtype="m.notice",
+            body="notice",
+        ),
+        parsed_message_event(
+            "$emote",
+            timestamp_ms=220,
+            msgtype="m.emote",
+            body="waves",
+        ),
+        Event.parse_event(
+            {
+                "event_id": "$redacted",
+                "sender": "@bob:example.com",
+                "origin_server_ts": 230,
+                "type": "m.room.message",
+                "content": {},
+                "unsigned": {
+                    "redacted_because": {
+                        "event_id": "$redaction",
+                        "sender": "@bob:example.com",
+                        "origin_server_ts": 240,
+                        "type": "m.room.redaction",
+                        "content": {},
+                        "redacts": "$redacted",
+                    }
+                },
+            }
+        ),
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=4)
+
+    assert [event.event_id for event in events] == [
+        "$root",
+        "$image",
+        "$notice",
+        "$emote",
+        "$redacted",
+    ]
+    assert events[1].media == MediaMetadata(
+        url="mxc://example.com/image",
+        filename="image.png",
+        mimetype="image/png",
+        size=6,
+        width=10,
+        height=20,
+    )
+    assert events[1].thread_id == "$root"
+    assert events[2].msgtype == "m.notice"
+    assert events[3].msgtype == "m.emote"
+    assert events[4].body is None
+    assert events[4].redacted is True
+    assert events[4].thread_id == "$root"
+
+
+@pytest.mark.asyncio
+async def test_nio_thread_applies_bundled_attachment_edit_with_original_relationship(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    replacement = {
+        "event_id": "$image-edit",
+        "sender": "@bob:example.com",
+        "origin_server_ts": 300,
+        "type": "m.room.message",
+        "content": {
+            "msgtype": "m.image",
+            "body": "* final.png",
+            "m.new_content": {
+                "msgtype": "m.image",
+                "body": "final.png",
+                "url": "mxc://example.com/final",
+                "info": {"mimetype": "image/png", "size": 8, "w": 30, "h": 40},
+            },
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$image"},
+        },
+    }
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [
+        parsed_message_event(
+            "$image",
+            timestamp_ms=200,
+            msgtype="m.image",
+            body="draft.png",
+            content_update={
+                "url": "mxc://example.com/draft",
+                "info": {"mimetype": "image/png", "size": 4, "w": 10, "h": 20},
+            },
+            unsigned={"m.relations": {"m.replace": replacement}},
+        )
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=1)
+
+    image = events[1]
+    assert image.body == "final.png"
+    assert image.media == MediaMetadata(
+        url="mxc://example.com/final",
+        filename="final.png",
+        mimetype="image/png",
+        size=8,
+        width=30,
+        height=40,
+    )
+    assert image.thread_id == "$root"
+    assert image.edited is True
+    assert all(call["event_id"] != "$image" for call in nio_client.replacement_calls)
+
+
+@pytest.mark.asyncio
+async def test_nio_driver_bounds_thread_relation_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeNioClient.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    driver = NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        )
+    )
+    FakeNioClient.instances[0].thread_events = [
+        text_event(
+            f"$reply-{index}",
+            sender="@bob:example.com",
+            timestamp_ms=200 + index,
+            body=f"reply {index}",
+            thread_id="$root",
+        )
+        for index in range(5)
+    ]
+
+    events = await driver.read_thread("!room:example.com", "$root", limit=2)
+
+    assert [event.event_id for event in events] == ["$root", "$reply-0", "$reply-1"]
+
+
+@pytest.mark.asyncio
+async def test_client_recent_history_uses_grouped_normalization_and_keeps_refs(
+    tmp_path: Path,
+) -> None:
+    class Events(MatrixEvents):
+        async def history(
+            self, room_id: str, *, limit: int = 20, before: str | None = None
+        ) -> HistoryPage:
+            assert room_id == "!room:example.com"
+            assert limit == 10
+            assert before is None
+            return HistoryPage(
+                events=[
+                    TimelineEvent(
+                        event_id="$media",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        msgtype="m.file",
+                        body="final.txt",
+                        media=MediaMetadata(
+                            url="mxc://example.com/media",
+                            filename="final.txt",
+                            mimetype="text/plain",
+                            size=5,
+                        ),
+                        edited=True,
+                    ),
+                    TimelineEvent(
+                        event_id="$notice",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        msgtype="m.notice",
+                        body="notice",
+                    ),
+                    TimelineEvent(
+                        event_id="$emote",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        msgtype="m.emote",
+                        body="waves",
+                    ),
+                    TimelineEvent(
+                        event_id="$redacted",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        body=None,
+                        redacted=True,
+                    ),
+                    TimelineEvent(
+                        event_id="$reaction",
+                        sender="@alice:example.com",
+                        type="m.reaction",
+                        body=None,
+                    ),
+                    TimelineEvent(
+                        event_id="$redaction",
+                        sender="@alice:example.com",
+                        type="m.room.redaction",
+                        body=None,
+                    ),
+                    TimelineEvent(
+                        event_id="$state",
+                        sender="@alice:example.com",
+                        type="m.room.name",
+                        body=None,
+                    ),
+                ]
+            )
+
+    driver = FakeDriver()
+    cast("Any", driver).events = Events(cast("Any", object()))
+    client = MatrixAPIClient(
+        driver=cast("MatrixDriver", driver),
+        id_store=MatrixIdStore(tmp_path / "ids.json"),
+    )
+
+    events = await client.read_room_recent("!room:example.com", limit=10)
+
+    assert events == [
+        MatrixEvent(
+            id=1,
+            event_id="$media",
+            sender="@alice:example.com",
+            type="m.room.message",
+            msgtype="m.file",
+            body="final.txt",
+            media=MediaMetadata(
+                url="mxc://example.com/media",
+                filename="final.txt",
+                mimetype="text/plain",
+                size=5,
+            ),
+            edited=True,
+        ),
+        MatrixEvent(
+            id=2,
+            event_id="$notice",
+            sender="@alice:example.com",
+            type="m.room.message",
+            msgtype="m.notice",
+            body="notice",
+        ),
+        MatrixEvent(
+            id=3,
+            event_id="$emote",
+            sender="@alice:example.com",
+            type="m.room.message",
+            msgtype="m.emote",
+            body="waves",
+        ),
+        MatrixEvent(
+            id=4,
+            event_id="$redacted",
+            sender="@alice:example.com",
+            type="m.room.message",
+            body=None,
+            redacted=True,
+        ),
+    ]
+
+
+def test_client_grouped_properties_reject_legacy_drivers_clearly() -> None:
+    client = MatrixAPIClient(driver=cast("MatrixDriver", FakeDriver()))
+
+    for name in ("events", "rooms", "media"):
+        with pytest.raises(RuntimeError, match=rf"does not support {name} operations"):
+            getattr(client, name)
 
 
 @pytest.mark.asyncio

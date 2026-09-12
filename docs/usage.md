@@ -166,11 +166,103 @@ matrix_set_avatar(avatar_url="mxc://example.com/profile-avatar")
 
 Profile setters change only the connected account's global profile, which may update its appearance across rooms.
 Avatar setters use existing Matrix `mxc://` media URIs.
-Upload an image through a Matrix client first, then use its media URI; HTTP URLs and local file paths are not accepted by avatar setters.
+Upload an image with `matrix_upload_media` or another Matrix client first, then use its media URI; HTTP URLs and local file paths are not accepted by avatar setters.
 Pass an empty string to clear a display name, room name, topic, or avatar.
 Invite people and change room/profile details only when the user explicitly requests that action.
 
 These tools also work in authenticated HTTP mode, using raw Matrix room IDs instead of numeric references.
+
+### History and Message Context
+
+The following tools use raw Matrix IDs in both stdio and HTTP mode.
+
+```text
+matrix_read_history(room_id="!room:example.com", limit=20)
+matrix_read_history(room_id="!room:example.com", limit=20, before="cursor-from-next_batch")
+matrix_get_event_context(room_id="!room:example.com", event_id="$message", limit=10)
+```
+
+History pages contain newest-first events and a `next_batch` cursor for older messages.
+Pass that cursor unchanged as `before`; `null` means the end.
+History supports up to 100 entries per page; context supports up to 50 surrounding entries.
+Results preserve message types, attachment metadata, reply and thread relationships, edits, and redacted placeholders.
+Edit resolution accepts valid replacements from the original sender found in server bundles, the returned page or context, and an advertised bounded recovery scan.
+If a homeserver omits a replacement bundle and does not return the replacement alongside its original event, the original content may be shown.
+`edit_resolution_truncated` specifically reports an incomplete bounded recovery scan.
+Reading never changes read markers.
+
+### Replies, Reactions, and Corrections
+
+```text
+matrix_reply(room_id="!room:example.com", event_id="$message", body="I can help.")
+matrix_react(room_id="!room:example.com", event_id="$message", key="👍")
+matrix_edit_message(room_id="!room:example.com", event_id="$my-message", body="Corrected text")
+matrix_redact_event(room_id="!room:example.com", event_id="$my-reaction")
+```
+
+Replies target a specific event and preserve its thread relationship.
+Edits and redactions are limited to the connected account's own events.
+Redacting your reaction removes it; Matrix redaction removes content and is not an undoable local delete.
+Event writes accept an optional `transaction_id` so clients can retry the same intended operation without posting it twice.
+Reuse a transaction ID only for an identical operation.
+Use these actions only when explicitly requested.
+
+### Join, Leave, and Create Rooms
+
+```text
+matrix_list_invitations(limit=25)
+matrix_join_room(room_id_or_alias="!invited:example.com")
+matrix_join_room(room_id_or_alias="#project:example.com")
+matrix_leave_room(room_id="!room:example.com", reason="No longer needed")
+matrix_create_room(name="Project planning", invite=["@bob:example.com"])
+```
+
+Joining an invited room accepts its invitation; leaving an invited room declines it.
+Invitation pages return `next_offset`; each page reflects a new filtered sync snapshot.
+The offset and limit are applied after the snapshot is downloaded and do not reduce its upstream byte size.
+Snapshots over the 2 MiB JSON limit fail with a size error, and choosing a smaller page limit does not change that limit.
+New rooms use the private-chat preset, are not published in the public directory, and do not enable encryption.
+Other members still need to accept their invitations.
+
+### Files, Images, and Avatars
+
+```text
+matrix_upload_media(data_base64="SGVsbG8K", filename="hello.txt", content_type="text/plain")
+matrix_send_media(room_id="!room:example.com", media_url="mxc://example.com/uploaded", filename="hello.txt", content_type="text/plain", size=6)
+matrix_download_media(media_url="mxc://example.com/uploaded")
+```
+
+Uploads return `content_uri`, filename, MIME type, and decoded byte size.
+Pass `content_type` as a bare MIME type/subtype, such as `image/png`, without parameters.
+Use that URI to send a file or, after uploading an image, pass it as `avatar_url` to an existing avatar setter.
+Downloads return base64 content and metadata.
+Each upload or download is limited to 5 MiB of decoded data.
+Media downloads use the configured homeserver's authenticated media API and require its support for that endpoint.
+HTTP URLs, redirects, and server filesystem paths are not accepted.
+Transfers request identity HTTP encoding; servers that force HTTP compression are rejected to preserve the byte limit.
+`matrix_send_media` accepts an optional `thread_id` and `transaction_id`.
+File and image sends perform the same best-effort encryption check as new text actions.
+
+### Unread Catch-Up
+
+```text
+matrix_get_unread(limit=25, timeline_limit=20)
+matrix_get_unread(limit=25, offset=25, timeline_limit=20)
+matrix_mark_read(room_id="!room:example.com", event_id="$last-read")
+```
+
+Catch-up returns rooms selected by homeserver notification/highlight counts or a marked-unread flag.
+Explicit mentions are bounded details within those rooms and do not independently make an already-read room unread.
+Counts depend on homeserver push rules; recent mention events are not a complete historical search.
+Room results include the server's timeline truncation flag and older-history cursor.
+Follow `next_offset` for more rooms.
+Each call fetches a fresh snapshot, so concurrent activity may change pages.
+The offset and limit are applied after the filtered snapshot is downloaded and do not reduce its upstream byte size.
+Snapshots over the 2 MiB JSON limit fail with a size error, and choosing a smaller page limit does not change that limit.
+No background sync or unread state is stored by the MCP server.
+`matrix_mark_read` updates the fully-read marker, clears the room's marked-unread flag, and sends a private receipt by default.
+Pass `public_receipt=true` only when the user wants others to see the receipt.
+History and catch-up reads never mark messages read automatically.
 
 ## Stored Files
 

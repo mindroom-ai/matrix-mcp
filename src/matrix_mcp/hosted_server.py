@@ -13,6 +13,13 @@ from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.conversation_tools import (
+    ConversationTools,
+    EventID,
+    RoomID,
+    UserID,
+    register_conversation_tools,
+)
 from matrix_mcp.hosted_auth import HostedSettings, MatrixOAuthProvider
 from matrix_mcp.matrix_client import (
     MatrixAPIClient,
@@ -28,10 +35,6 @@ from matrix_mcp.mcp_server import register_room_profile_tools
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-
-RoomID = Annotated[str, Field(pattern=r"^![^\s:]+:[^\s]+$")]
-EventID = Annotated[str, Field(pattern=r"^\$[^\s]+$")]
-UserID = Annotated[str, Field(pattern=r"^@[^\s:]+:[^\s]+$")]
 
 
 class HostedMatrixTools:
@@ -131,7 +134,7 @@ class HostedMatrixTools:
             return await client.search_users(search_term, limit=limit)
 
     async def matrix_read_room_recent(self, room_id: RoomID, limit: int = 20) -> list[MatrixEvent]:
-        """Read recent text messages from a raw Matrix room ID."""
+        """Read recent messages and attachments from a raw Matrix room ID."""
         async with self.client() as client:
             return await client.read_room_recent(room_id, limit=limit)
 
@@ -204,4 +207,5 @@ def create_hosted_server(settings: HostedSettings) -> FastMCP:
     server.tool(tools.matrix_read_thread)
     server.tool(tools.matrix_send_message)
     register_room_profile_tools(server, tools)
+    register_conversation_tools(server, ConversationTools(tools.client))
     return server

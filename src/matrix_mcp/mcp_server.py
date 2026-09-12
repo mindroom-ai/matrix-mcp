@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Annotated, Protocol
 from fastmcp import FastMCP
 from pydantic import Field
 
+from matrix_mcp.conversation_tools import (
+    ConversationClient,
+    ConversationTools,
+    register_conversation_tools,
+)
 from matrix_mcp.matrix_client import (
     MatrixAPIClient,
     MatrixEvent,
@@ -22,7 +27,7 @@ if TYPE_CHECKING:
     from matrix_mcp.hosted_server import HostedMatrixTools
 
 
-class MatrixMCPClient(Protocol):
+class MatrixMCPClient(ConversationClient, Protocol):
     async def whoami(self) -> dict[str, str | None]: ...
 
     async def list_rooms(self) -> list[MatrixRoom]: ...
@@ -166,7 +171,7 @@ class MatrixMCPTools:
     async def matrix_read_room_recent(
         self, room_id: str | int, limit: int = 20
     ) -> list[MatrixEvent]:
-        """Read recent text messages from one Matrix room by Matrix room ID or numeric room ref."""
+        """Read recent messages and attachments by Matrix room ID or numeric room ref."""
         async with self._client() as client:
             return await client.read_room_recent(room_id, limit=limit)
 
@@ -176,7 +181,7 @@ class MatrixMCPTools:
         thread_id: str | int,
         limit: int = 50,
     ) -> list[MatrixEvent]:
-        """Read a Matrix thread root and its recent text replies by Matrix ID or numeric ref."""
+        """Read a Matrix thread root and its recent message replies by Matrix ID or numeric ref."""
         async with self._client() as client:
             return await client.read_thread(room_id, thread_id, limit=limit)
 
@@ -222,8 +227,8 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
         "matrix-mcp",
         instructions=(
             "Use these tools to inspect and participate in Matrix conversations. "
-            "Read and list tools return stable numeric refs; prefer those refs in later calls "
-            "instead of raw Matrix IDs. "
+            "Legacy read and list tools return stable numeric refs for legacy follow-up tools. "
+            "Conversation tools require raw Matrix IDs. "
             "Prefer read tools first. Send messages, invite users, or change room/profile details "
             "only when the user explicitly requests that action."
         ),
@@ -235,6 +240,7 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
     mcp.tool(tools.matrix_read_thread)
     mcp.tool(tools.matrix_send_message)
     register_room_profile_tools(mcp, tools)
+    register_conversation_tools(mcp, ConversationTools(tools._client))  # noqa: SLF001
     return mcp
 
 

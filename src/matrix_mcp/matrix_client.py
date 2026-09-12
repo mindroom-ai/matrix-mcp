@@ -5,7 +5,7 @@ import json
 import mimetypes
 import re
 from http import HTTPStatus
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from aiohttp import ContentTypeError
@@ -25,7 +25,6 @@ from nio import (
     RoomGetStateEventResponse,
     RoomInviteResponse,
     RoomMessagesResponse,
-    RoomMessageText,
     RoomPutStateResponse,
     RoomSendResponse,
     UploadResponse,
@@ -36,6 +35,15 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.id_state import MatrixIdStore
+from matrix_mcp.matrix_events import (
+    MatrixEvents,
+    MediaMetadata,
+    TimelineEvent,
+    normalize_timeline_event,
+)
+from matrix_mcp.matrix_http import MatrixHTTP
+from matrix_mcp.matrix_media import MatrixMedia
+from matrix_mcp.matrix_rooms import MatrixRooms
 from matrix_mcp.tls import default_ssl_context
 
 
@@ -84,9 +92,15 @@ class MatrixEvent(BaseModel):
     event_id: str
     sender: str
     timestamp_ms: int | None = None
-    body: str
+    type: str = "m.room.message"
+    msgtype: str | None = None
+    body: str | None
     thread_id: str | None = None
     thread_ref: int | None = None
+    reply_to: str | None = None
+    media: MediaMetadata | None = None
+    edited: bool = False
+    redacted: bool = False
 
 
 class MatrixDriver(Protocol):
@@ -149,6 +163,10 @@ class NioMatrixDriver:
             msg = "Matrix credentials are incomplete. Run `matrix-mcp auth` first."
             raise RuntimeError(msg)
         self._config = config
+        self.http = MatrixHTTP(config)
+        self.events = MatrixEvents(self.http)
+        self.rooms = MatrixRooms(self.http)
+        self.media = MatrixMedia(self.http)
         self._client = AsyncClient(
             config.normalized_homeserver,
             config.user_id,
@@ -346,7 +364,11 @@ class NioMatrixDriver:
             limit=max(1, min(limit, 100)),
         )
         if isinstance(response, RoomMessagesResponse):
-            return [event for raw in response.chunk if (event := _event_from_nio(raw)) is not None]
+            return [
+                event
+                for raw in response.chunk
+                if (event := _event_from_nio(room_id, raw)) is not None
+            ]
         msg = f"Matrix room_messages failed: {response}"
         raise RuntimeError(msg)
 
@@ -354,14 +376,15 @@ class NioMatrixDriver:
         self, room_id: str, thread_id: str, *, limit: int = 50
     ) -> list[MatrixEvent]:
         max_replies = max(1, min(limit, 100))
-        events: list[MatrixEvent] = []
+        raw_events: list[tuple[dict[str, Any], bool]] = []
 
         root_response = await self._client.room_get_event(room_id, thread_id)
         if isinstance(root_response, RoomGetEventResponse):
-            root = _event_from_nio(root_response.event)
+            root = _source_from_nio(root_response.event)
             if root is not None:
-                events.append(root)
+                raw_events.append((root, False))
 
+        reply_count = 0
         async for raw in self._client.room_get_event_relations(
             room_id,
             thread_id,
@@ -370,44 +393,57 @@ class NioMatrixDriver:
             direction=MessageDirection.front,
             limit=max_replies,
         ):
-            event = _event_from_nio(raw)
-            if event is not None:
-                events.append(event)
+            source = _source_from_nio(raw)
+            if source is not None:
+                raw_events.append((source, True))
+            reply_count += 1
+            if reply_count >= max_replies:
+                break
 
-        events = [
-            await self._event_with_latest_edit(room_id, event, page_size=max_replies)
-            for event in events
-        ]
+        events: list[MatrixEvent] = []
+        for raw, is_reply in raw_events:
+            event = await self._event_with_latest_edit(room_id, raw, page_size=max_replies)
+            if is_reply and event.thread_id is None:
+                event = event.model_copy(update={"thread_id": thread_id})
+            events.append(event)
         return sorted(events, key=_event_sort_key)
 
     async def _event_with_latest_edit(
-        self, room_id: str, event: MatrixEvent, *, page_size: int
+        self, room_id: str, raw: dict[str, Any], *, page_size: int
     ) -> MatrixEvent:
-        latest_body: str | None = None
-        latest_key: tuple[int, str] | None = None
+        event = normalize_timeline_event(room_id, raw)
+        if event.edited or event.redacted:
+            return _event_from_timeline(event)
 
-        async for raw in self._client.room_get_event_relations(
+        latest: tuple[tuple[int, str], TimelineEvent] | None = None
+        scanned = 0
+        async for replacement in self._client.room_get_event_relations(
             room_id,
             event.event_id,
             rel_type=RelationshipType.replacement,
             event_type="m.room.message",
-            direction=MessageDirection.front,
+            direction=MessageDirection.back,
             limit=page_size,
         ):
-            body = _replacement_body_for(raw, event)
-            if body is None:
-                continue
-            key = (
-                raw.server_timestamp if raw.server_timestamp is not None else -1,
-                raw.event_id,
-            )
-            if latest_key is None or key > latest_key:
-                latest_key = key
-                latest_body = body
+            replacement_source = _source_from_nio(replacement)
+            if replacement_source is not None:
+                updated = normalize_timeline_event(
+                    room_id,
+                    raw,
+                    replacement=replacement_source,
+                )
+                if updated.edited:
+                    key = (
+                        cast("int", replacement_source["origin_server_ts"]),
+                        cast("str", replacement_source["event_id"]),
+                    )
+                    if latest is None or key > latest[0]:
+                        latest = key, updated
+            scanned += 1
+            if scanned >= page_size:
+                break
 
-        if latest_body is None:
-            return event
-        return event.model_copy(update={"body": latest_body})
+        return _event_from_timeline(event if latest is None else latest[1])
 
     async def send_message(
         self,
@@ -507,6 +543,18 @@ class MatrixAPIClient:
         if self._owned_driver is not None:
             await self._owned_driver.aclose()
 
+    @property
+    def events(self) -> MatrixEvents:
+        return cast("MatrixEvents", self._grouped_driver_property("events"))
+
+    @property
+    def rooms(self) -> MatrixRooms:
+        return cast("MatrixRooms", self._grouped_driver_property("rooms"))
+
+    @property
+    def media(self) -> MatrixMedia:
+        return cast("MatrixMedia", self._grouped_driver_property("media"))
+
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()
 
@@ -551,7 +599,16 @@ class MatrixAPIClient:
 
     async def read_room_recent(self, room_id: str | int, *, limit: int = 20) -> list[MatrixEvent]:
         resolved_room_id = self._resolve_room(room_id)
-        events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
+        grouped_events = getattr(self._driver, "events", None)
+        if isinstance(grouped_events, MatrixEvents):
+            page = await grouped_events.history(resolved_room_id, limit=limit)
+            events = [
+                _event_from_timeline(event)
+                for event in page.events
+                if event.type == "m.room.message"
+            ]
+        else:
+            events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
         return [self._with_event_refs(event) for event in events]
 
     async def read_thread(
@@ -627,6 +684,13 @@ class MatrixAPIClient:
             return None
         return self._resolve_event(event_id_or_ref)
 
+    def _grouped_driver_property(self, name: str) -> object:
+        value = getattr(self._driver, name, None)
+        if value is not None:
+            return value
+        msg = f"The configured Matrix driver does not support {name} operations"
+        raise RuntimeError(msg)
+
 
 def _validate_limit(limit: int) -> None:
     if not 1 <= limit <= 100:  # noqa: PLR2004 - Public tool page-size bound.
@@ -659,68 +723,34 @@ def _validate_avatar_url(avatar_url: str) -> None:
         raise ValueError(msg)
 
 
-def _event_from_nio(raw: object) -> MatrixEvent | None:
-    if not isinstance(raw, RoomMessageText):
+def _event_from_nio(room_id: str, raw: object) -> MatrixEvent | None:
+    source = _source_from_nio(raw)
+    if source is None:
         return None
-    thread_id = None
-    relates_to = _relates_to_from_nio(raw)
-    if relates_to is not None and _relationship_type(relates_to) == RelationshipType.thread.value:
-        raw_thread_id = relates_to.get("event_id")
-        thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
-    return MatrixEvent(
-        event_id=raw.event_id,
-        sender=raw.sender,
-        timestamp_ms=raw.server_timestamp,
-        body=raw.body,
-        thread_id=thread_id,
-    )
+    return _event_from_timeline(normalize_timeline_event(room_id, source))
 
 
-def _replacement_body_for(raw: object, event: MatrixEvent) -> str | None:
-    if not isinstance(raw, RoomMessageText):
-        return None
-    if raw.sender != event.sender:
-        return None
-
-    relates_to = _relates_to_from_nio(raw)
-    if relates_to is None or _relationship_type(relates_to) != RelationshipType.replacement.value:
-        return None
-    if relates_to.get("event_id") != event.event_id:
-        return None
-
-    content = _content_from_nio(raw)
-    new_content = content.get("m.new_content") if content is not None else None
-    if not isinstance(new_content, dict):
-        return None
-    body = cast("dict[str, object]", new_content).get("body")
-    return body if isinstance(body, str) else None
-
-
-def _relates_to_from_nio(raw: RoomMessageText) -> dict[str, object] | None:
-    relates_to = getattr(raw, "relates_to", None)
-    if isinstance(relates_to, dict):
-        return cast("dict[str, object]", relates_to)
-
-    content = _content_from_nio(raw)
-    if content is None:
-        return None
-    relates_to = content.get("m.relates_to")
-    return cast("dict[str, object]", relates_to) if isinstance(relates_to, dict) else None
-
-
-def _content_from_nio(raw: RoomMessageText) -> dict[str, object] | None:
+def _source_from_nio(raw: object) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return cast("dict[str, Any]", raw)
     source = getattr(raw, "source", None)
-    if not isinstance(source, dict):
-        return None
-    content = source.get("content")
-    return cast("dict[str, object]", content) if isinstance(content, dict) else None
+    return cast("dict[str, Any]", source) if isinstance(source, dict) else None
 
 
-def _relationship_type(relates_to: dict[str, object]) -> str | None:
-    rel_type = relates_to.get("rel_type")
-    if isinstance(rel_type, RelationshipType):
-        return cast("str", rel_type.value)
-    return rel_type if isinstance(rel_type, str) else None
+def _event_from_timeline(event: TimelineEvent) -> MatrixEvent:
+    return MatrixEvent(
+        event_id=event.event_id,
+        sender=event.sender,
+        timestamp_ms=event.timestamp_ms,
+        type=event.type,
+        msgtype=event.msgtype,
+        body=event.body,
+        thread_id=event.thread_id,
+        reply_to=event.reply_to,
+        media=event.media,
+        edited=event.edited,
+        redacted=event.redacted,
+    )
 
 
 def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:
