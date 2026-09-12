@@ -343,6 +343,23 @@ async def test_json_rejects_rate_limit_delay_over_five_seconds(
     assert len(endpoint.requests) == 1
 
 
+async def test_json_rejects_extreme_integer_rate_limit_without_overflow(
+    matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
+) -> None:
+    http, endpoint = matrix_http
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/messages",
+        {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 10**1000},
+        status=429,
+    )
+
+    with pytest.raises(MatrixHTTPError, match="5 seconds"):
+        await http.json("GET", "/_matrix/client/v3/rooms/%21room%3Aexample.com/messages")
+
+    assert len(endpoint.requests) == 1
+
+
 async def test_require_unencrypted_treats_missing_state_as_plaintext(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
 ) -> None:
@@ -419,6 +436,18 @@ def test_constructor_requires_credentials() -> None:
     config = MatrixMCPConfig(homeserver="https://matrix.example.com")
 
     with pytest.raises(RuntimeError, match="credentials"):
+        MatrixHTTP(config)
+
+
+@pytest.mark.parametrize("suffix", ["?tenant=example", "?", "#fragment", "#"])
+def test_constructor_rejects_homeserver_query_and_fragment(suffix: str) -> None:
+    config = MatrixMCPConfig(
+        homeserver=f"https://matrix.example.com/prefix{suffix}",
+        user_id="@alice:example.com",
+        access_token="test-token",
+    )
+
+    with pytest.raises(ValueError, match=r"query|fragment"):
         MatrixHTTP(config)
 
 

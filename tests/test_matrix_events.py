@@ -43,6 +43,23 @@ def message(  # noqa: PLR0913
     }
 
 
+def replacement(
+    event_id: str,
+    *,
+    target: str,
+    body: str,
+    timestamp: int,
+) -> dict[str, Any]:
+    event = message(
+        event_id,
+        body=f"* {body}",
+        timestamp=timestamp,
+        relates_to={"rel_type": "m.replace", "event_id": target},
+    )
+    event["content"]["m.new_content"] = {"msgtype": "m.text", "body": body}
+    return event
+
+
 @dataclass
 class MatrixEndpoint:
     responses: dict[tuple[str, str], list[tuple[object, int]]] = field(default_factory=dict)
@@ -205,6 +222,38 @@ async def test_history_applies_valid_bundled_media_edit_and_preserves_relationsh
     assert len(endpoint.requests) == 1
 
 
+async def test_history_uses_latest_valid_bundle_or_same_page_replacement(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    original = message(
+        "$original",
+        body="original",
+        unsigned={
+            "m.relations": {
+                "m.replace": replacement(
+                    "$bundle", target="$original", body="bundled", timestamp=200
+                )
+            }
+        },
+    )
+    page_a = replacement("$page-a", target="$original", body="page a", timestamp=300)
+    page_z = replacement("$page-z", target="$original", body="page z", timestamp=300)
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/messages",
+        {"chunk": [page_a, original, page_z]},
+    )
+
+    page = await events.history(ROOM, limit=3)
+
+    assert [event.event_id for event in page.events] == ["$original"]
+    assert page.events[0].body == "page z"
+    assert page.events[0].edited is True
+    assert page.edit_resolution_truncated is False
+    assert len(endpoint.requests) == 1
+
+
 async def test_history_ignores_forged_and_redacted_replacements_and_discloses_truncation(
     matrix: tuple[MatrixEvents, MatrixEndpoint],
 ) -> None:
@@ -274,6 +323,29 @@ async def test_history_ignores_forged_and_redacted_replacements_and_discloses_tr
     assert relation_requests[1]["query"]["from"] == "more"
 
 
+async def test_history_shares_a_bounded_replacement_fetch_budget(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    originals = [
+        message(
+            f"$original-{number}",
+            unsigned={"m.relations": {"m.replace": {"event_id": f"$invalid-{number}"}}},
+        )
+        for number in range(5)
+    ]
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": originals})
+
+    page = await events.history(ROOM, limit=5)
+
+    relation_requests = [
+        request for request in endpoint.requests if "/relations/" in request["path"]
+    ]
+    assert len(relation_requests) == 4
+    assert page.edit_resolution_truncated is True
+    assert [event.body for event in page.events] == ["hello"] * 5
+
+
 async def test_history_keeps_redacted_placeholder_and_hides_replacement_events(
     matrix: tuple[MatrixEvents, MatrixEndpoint],
 ) -> None:
@@ -325,6 +397,61 @@ async def test_context_preserves_tokens_and_expands_each_section(
     assert context.end == "older"
     assert context.edit_resolution_truncated is False
     assert endpoint.requests[0]["query"] == {"limit": "50"}
+
+
+async def test_context_applies_replacement_returned_with_surrounding_events(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/context/$target",
+        {
+            "event": message("$target", body="original"),
+            "events_before": [
+                replacement("$edit", target="$target", body="updated", timestamp=200)
+            ],
+            "events_after": [],
+        },
+    )
+
+    context = await events.context(ROOM, "$target", limit=1)
+
+    assert context.event.body == "updated"
+    assert context.event.edited is True
+    assert context.events_before == []
+    assert context.edit_resolution_truncated is False
+    assert len(endpoint.requests) == 1
+
+
+async def test_context_shares_a_bounded_replacement_fetch_budget_across_sections(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+
+    def incomplete(event_id: str) -> dict[str, Any]:
+        return message(
+            event_id,
+            unsigned={"m.relations": {"m.replace": {"event_id": f"$invalid-{event_id[1:]}"}}},
+        )
+
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/context/$target",
+        {
+            "event": incomplete("$target"),
+            "events_before": [incomplete("$before-1"), incomplete("$before-2")],
+            "events_after": [incomplete("$after-1"), incomplete("$after-2")],
+        },
+    )
+
+    context = await events.context(ROOM, "$target", limit=4)
+
+    relation_requests = [
+        request for request in endpoint.requests if "/relations/" in request["path"]
+    ]
+    assert len(relation_requests) == 4
+    assert context.edit_resolution_truncated is True
 
 
 async def test_context_rejects_surrounding_events_over_requested_limit(

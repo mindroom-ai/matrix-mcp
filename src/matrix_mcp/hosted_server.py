@@ -134,7 +134,7 @@ class HostedMatrixTools:
             return await client.search_users(search_term, limit=limit)
 
     async def matrix_read_room_recent(self, room_id: RoomID, limit: int = 20) -> list[MatrixEvent]:
-        """Read recent text messages from a raw Matrix room ID."""
+        """Read recent messages and attachments from a raw Matrix room ID."""
         async with self.client() as client:
             return await client.read_room_recent(room_id, limit=limit)
 

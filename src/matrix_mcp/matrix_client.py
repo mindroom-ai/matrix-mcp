@@ -602,7 +602,11 @@ class MatrixAPIClient:
         grouped_events = getattr(self._driver, "events", None)
         if isinstance(grouped_events, MatrixEvents):
             page = await grouped_events.history(resolved_room_id, limit=limit)
-            events = [_event_from_timeline(event) for event in page.events]
+            events = [
+                _event_from_timeline(event)
+                for event in page.events
+                if event.type == "m.room.message"
+            ]
         else:
             events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
         return [self._with_event_refs(event) for event in events]

@@ -83,7 +83,12 @@ class ConversationTools:
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
         before: str | None = None,
     ) -> HistoryPage:
-        """Read a newest-first history page from a raw room ID without marking it read."""
+        """Read newest-first history without marking it read.
+
+        Edits use valid server bundles, replacements returned in the page, and a bounded
+        advertised recovery scan. Original content can remain when the homeserver omits both
+        direct sources.
+        """
         async with self.client() as client:
             return await client.events.history(room_id, limit=limit, before=before)
 
@@ -93,7 +98,12 @@ class ConversationTools:
         event_id: EventID,
         limit: Annotated[int, Field(ge=1, le=50)] = 10,
     ) -> EventContext:
-        """Read one event and bounded surrounding events without marking the room read."""
+        """Read one event and bounded surrounding events without marking the room read.
+
+        Edits use valid server bundles, replacements returned in the context, and a bounded
+        advertised recovery scan. Original content can remain when the homeserver omits both
+        direct sources.
+        """
         async with self.client() as client:
             return await client.events.context(room_id, event_id, limit=limit)
 
@@ -170,7 +180,10 @@ class ConversationTools:
         limit: Annotated[int, Field(ge=1, le=100)] = 50,
         offset: Annotated[int, Field(ge=0)] = 0,
     ) -> InvitationPage:
-        """List current room invitations without joining or declining them."""
+        """List current invitations from a fresh bounded sync snapshot.
+
+        Limit and offset page the snapshot output after download; they do not reduce its bytes.
+        """
         async with self.client() as client:
             return await client.rooms.invitations(limit=limit, offset=offset)
 
@@ -209,8 +222,9 @@ class ConversationTools:
     ) -> UnreadPage:
         """Read a fresh unread snapshot without marking anything read.
 
-        Counts depend on homeserver push rules, recent mentions are bounded, and pages can
-        change concurrently.
+        Rooms require homeserver unread counts or a marked-unread flag. Mentions are bounded
+        details within those rooms. Limit and offset page output after the bounded snapshot is
+        downloaded, and pages can change concurrently.
         """
         async with self.client() as client:
             return await client.rooms.unread(
@@ -225,7 +239,7 @@ class ConversationTools:
         event_id: EventID,
         public_receipt: bool = False,  # noqa: FBT001, FBT002 - MCP exposes a named flag.
     ) -> StatusResult:
-        """Mark through an event read only when explicitly requested; defaults to private."""
+        """Mark through an event read, clear its manual unread flag, and default to private."""
         async with self.client() as client:
             await client.rooms.mark_read(
                 room_id,

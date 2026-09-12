@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_RATE_LIMIT_DELAY_SECONDS = 5.0
-_RATE_LIMIT_RETRIES = 2
+RATE_LIMIT_RETRIES = 2
 _CONTROL_CODE_BOUNDARY = 32
 _MAX_TRANSACTION_ID_LENGTH = 255
 _ERRCODE_PATTERN = re.compile(r"M_[A-Z_0-9]{1,80}")
@@ -44,6 +44,9 @@ class MatrixHTTP:
         self._config = config
         self._access_token = token
         self._homeserver = config.normalized_homeserver
+        if "?" in self._homeserver or "#" in self._homeserver:
+            msg = "Matrix homeserver URL must not include a query or fragment"
+            raise ValueError(msg)
         self.user_id = config.user_id
 
     def client(self) -> AbstractAsyncContextManager[httpx.AsyncClient]:
@@ -93,7 +96,7 @@ class MatrixHTTP:
         request_headers["Accept-Encoding"] = "identity"
         url = f"{self._homeserver}{path}"
         async with self.client() as client:
-            for attempt in range(_RATE_LIMIT_RETRIES + 1):
+            for attempt in range(RATE_LIMIT_RETRIES + 1):
                 try:
                     async with client.stream(
                         method,
@@ -115,19 +118,12 @@ class MatrixHTTP:
 
                 payload = _response_payload(response, response_content)
                 errcode = _safe_errcode(payload.get("errcode"))
-                if (
-                    response.status_code == HTTPStatus.TOO_MANY_REQUESTS
-                    and attempt < _RATE_LIMIT_RETRIES
+                if await retry_rate_limited(
+                    response,
+                    payload,
+                    attempt=attempt,
+                    errcode=errcode,
                 ):
-                    delay = _retry_delay(response, payload)
-                    if delay > _MAX_RATE_LIMIT_DELAY_SECONDS:
-                        msg = "Matrix API rate limit requires waiting more than 5 seconds"
-                        raise MatrixHTTPError(
-                            msg,
-                            status_code=response.status_code,
-                            errcode=errcode,
-                        )
-                    await asyncio.sleep(delay)
                     continue
                 if response.is_error:
                     detail = f" ({errcode})" if errcode else ""
@@ -223,6 +219,27 @@ def _response_payload(response: httpx.Response, content: bytes) -> dict[str, Any
         raise
 
 
+async def retry_rate_limited(
+    response: httpx.Response,
+    payload: dict[str, Any],
+    *,
+    attempt: int,
+    errcode: str | None,
+) -> bool:
+    if response.status_code != HTTPStatus.TOO_MANY_REQUESTS or attempt >= RATE_LIMIT_RETRIES:
+        return False
+    delay = _retry_delay(response, payload)
+    if delay > _MAX_RATE_LIMIT_DELAY_SECONDS:
+        msg = "Matrix API rate limit requires waiting more than 5 seconds"
+        raise MatrixHTTPError(
+            msg,
+            status_code=response.status_code,
+            errcode=errcode,
+        )
+    await asyncio.sleep(delay)
+    return True
+
+
 def _retry_delay(response: httpx.Response, payload: dict[str, Any]) -> float:
     retry_after = response.headers.get("retry-after")
     if retry_after is not None:
@@ -238,6 +255,10 @@ def _retry_delay(response: httpx.Response, payload: dict[str, Any]) -> float:
                 pass
     retry_after_ms = payload.get("retry_after_ms")
     if isinstance(retry_after_ms, int) and not isinstance(retry_after_ms, bool):
+        if retry_after_ms <= 0:
+            return 0.0
+        if retry_after_ms > _MAX_RATE_LIMIT_DELAY_SECONDS * 1000:
+            return _MAX_RATE_LIMIT_DELAY_SECONDS + 1
         return max(0.0, retry_after_ms / 1000)
     return 0.0
 

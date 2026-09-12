@@ -11,7 +11,13 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel
 
-from matrix_mcp.matrix_http import MatrixHTTPError, quote_matrix_id, quote_transaction_id
+from matrix_mcp.matrix_http import (
+    RATE_LIMIT_RETRIES,
+    MatrixHTTPError,
+    quote_matrix_id,
+    quote_transaction_id,
+    retry_rate_limited,
+)
 
 if TYPE_CHECKING:
     from matrix_mcp.matrix_http import MatrixHTTP
@@ -94,17 +100,36 @@ class MatrixMedia:
             f"/_matrix/client/v1/media/download/{quote(server, safe='')}/{quote(media_id, safe='')}"
         )
         try:
-            async with (
-                self.http.client() as client,
-                client.stream("GET", route, headers={"Accept-Encoding": "identity"}) as response,
-            ):
-                if response.is_redirect:
-                    msg = f"Matrix media download refused HTTP redirect ({response.status_code})"
-                    raise MatrixHTTPError(msg, status_code=response.status_code)
-                data = await _read_media(response)
-                if response.is_error:
-                    _raise_download_error(response.status_code, data)
-                content_type = response.headers.get("content-type", "application/octet-stream")
+            async with self.http.client() as client:
+                for attempt in range(RATE_LIMIT_RETRIES + 1):
+                    async with client.stream(
+                        "GET", route, headers={"Accept-Encoding": "identity"}
+                    ) as response:
+                        if response.is_redirect:
+                            msg = (
+                                "Matrix media download refused HTTP redirect "
+                                f"({response.status_code})"
+                            )
+                            raise MatrixHTTPError(msg, status_code=response.status_code)
+                        data = await _read_media(response)
+                        if response.is_error:
+                            payload = _download_error_payload(data)
+                            errcode = _download_errcode(payload)
+                            if await retry_rate_limited(
+                                response,
+                                payload,
+                                attempt=attempt,
+                                errcode=errcode,
+                            ):
+                                continue
+                            _raise_download_error(
+                                response.status_code,
+                                errcode=errcode,
+                            )
+                        content_type = response.headers.get(
+                            "content-type", "application/octet-stream"
+                        )
+                        break
         except httpx.HTTPError as exc:
             msg = "Matrix media download failed before receiving complete content"
             raise RuntimeError(msg) from exc
@@ -232,16 +257,22 @@ async def _read_media(response: httpx.Response) -> bytes:
     return bytes(content)
 
 
-def _raise_download_error(status: int, content: bytes) -> None:
-    errcode = None
+def _download_error_payload(content: bytes) -> dict[str, object]:
     try:
         payload = json.loads(content)
-    except (ValueError, UnicodeDecodeError):
-        payload = None
-    if isinstance(payload, dict):
-        value = payload.get("errcode")
-        if isinstance(value, str) and re.fullmatch(r"M_[A-Z_0-9]{1,80}", value):
-            errcode = value
+    except (RecursionError, ValueError, UnicodeDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _download_errcode(payload: dict[str, object]) -> str | None:
+    value = payload.get("errcode")
+    if isinstance(value, str) and re.fullmatch(r"M_[A-Z_0-9]{1,80}", value):
+        return value
+    return None
+
+
+def _raise_download_error(status: int, *, errcode: str | None) -> None:
     detail = f" ({errcode})" if errcode else ""
     msg = f"Matrix media download failed with HTTP {status}{detail}"
     raise MatrixHTTPError(msg, status_code=status, errcode=errcode)

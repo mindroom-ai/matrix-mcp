@@ -113,12 +113,20 @@ async def test_mark_read_defaults_to_private_receipt(
         200,
     )
     endpoint.responses[("POST", f"{ROOM_PATH}/read_markers")] = ({}, 200)
+    marked_unread_path = (
+        f"/_matrix/client/v3/user/@alice:example.com/rooms/{ROOM}/account_data/m.marked_unread"
+    )
+    endpoint.responses[("PUT", marked_unread_path)] = ({}, 200)
     if public_receipt:
         await rooms.mark_read(ROOM, "$last", public_receipt=True)
     else:
         await rooms.mark_read(ROOM, "$last")
     receipt = "m.read" if public_receipt else "m.read.private"
-    assert endpoint.requests[-1]["body"] == {"m.fully_read": "$last", receipt: "$last"}
+    assert endpoint.requests[-2]["body"] == {"m.fully_read": "$last", receipt: "$last"}
+    clear_request = endpoint.requests[-1]
+    assert clear_request["method"] == "PUT"
+    assert clear_request["path"] == marked_unread_path
+    assert clear_request["body"] == {"unread": False}
 
 
 async def test_denied_event_never_updates_read_state(
@@ -192,9 +200,21 @@ async def test_invitations_include_inviter_and_stable_pages(
     assert second.next_offset is None
     assert {request["method"] for request in endpoint.requests} == {"GET"}
     sync_filter = json.loads(endpoint.requests[0]["query"]["filter"])
+    assert sync_filter["event_fields"] == [
+        "event_id",
+        "sender",
+        "origin_server_ts",
+        "state_key",
+        "type",
+        "content.body",
+        "content.m\\.mentions",
+        "content.name",
+        "content.unread",
+    ]
     assert "m.room.member" in sync_filter["room"]["state"]["types"]
     assert sync_filter["room"]["timeline"]["types"] == []
     assert sync_filter["room"]["timeline"]["limit"] > 0
+    assert endpoint.requests[0]["query"]["set_presence"] == "offline"
 
 
 async def test_unread_returns_counts_mentions_and_server_cursors_without_marking(
@@ -242,8 +262,21 @@ async def test_unread_returns_counts_mentions_and_server_cursors_without_marking
     assert room.prev_batch == "older"
     request = endpoint.requests[0]
     assert "since" not in request["query"]
-    assert json.loads(request["query"]["filter"])["room"]["timeline"]["limit"] == 7
-    assert json.loads(request["query"]["filter"])["room"]["timeline"]["types"] == ["m.room.message"]
+    sync_filter = json.loads(request["query"]["filter"])
+    assert sync_filter["event_fields"] == [
+        "event_id",
+        "sender",
+        "origin_server_ts",
+        "state_key",
+        "type",
+        "content.body",
+        "content.m\\.mentions",
+        "content.name",
+        "content.unread",
+    ]
+    assert sync_filter["room"]["timeline"]["limit"] == 7
+    assert sync_filter["room"]["timeline"]["types"] == ["m.room.message"]
+    assert request["query"]["set_presence"] == "offline"
     assert [request["method"] for request in endpoint.requests] == ["GET"]
 
 

@@ -186,7 +186,9 @@ History pages contain newest-first events and a `next_batch` cursor for older me
 Pass that cursor unchanged as `before`; `null` means the end.
 History supports up to 100 entries per page; context supports up to 50 surrounding entries.
 Results preserve message types, attachment metadata, reply and thread relationships, edits, and redacted placeholders.
-Edit resolution accepts only valid replacements from the original sender and reports when its bounded scan is incomplete.
+Edit resolution accepts valid replacements from the original sender found in server bundles, the returned page or context, and an advertised bounded recovery scan.
+If a homeserver omits a replacement bundle and does not return the replacement alongside its original event, the original content may be shown.
+`edit_resolution_truncated` specifically reports an incomplete bounded recovery scan.
 Reading never changes read markers.
 
 ### Replies, Reactions, and Corrections
@@ -216,7 +218,9 @@ matrix_create_room(name="Project planning", invite=["@bob:example.com"])
 ```
 
 Joining an invited room accepts its invitation; leaving an invited room declines it.
-Invitation pages return `next_offset`; each page reflects current server state.
+Invitation pages return `next_offset`; each page reflects a new filtered sync snapshot.
+The offset and limit are applied after the snapshot is downloaded and do not reduce its upstream byte size.
+Snapshots over the 2 MiB JSON limit fail with a size error, and choosing a smaller page limit does not change that limit.
 New rooms use the private-chat preset, are not published in the public directory, and do not enable encryption.
 Other members still need to accept their invitations.
 
@@ -247,13 +251,16 @@ matrix_get_unread(limit=25, offset=25, timeline_limit=20)
 matrix_mark_read(room_id="!room:example.com", event_id="$last-read")
 ```
 
-Catch-up returns rooms with unread or mention information, server notification/highlight counts, and mentions found in each room's bounded recent timeline.
+Catch-up returns rooms selected by homeserver notification/highlight counts or a marked-unread flag.
+Explicit mentions are bounded details within those rooms and do not independently make an already-read room unread.
 Counts depend on homeserver push rules; recent mention events are not a complete historical search.
 Room results include the server's timeline truncation flag and older-history cursor.
 Follow `next_offset` for more rooms.
 Each call fetches a fresh snapshot, so concurrent activity may change pages.
+The offset and limit are applied after the filtered snapshot is downloaded and do not reduce its upstream byte size.
+Snapshots over the 2 MiB JSON limit fail with a size error, and choosing a smaller page limit does not change that limit.
 No background sync or unread state is stored by the MCP server.
-`matrix_mark_read` updates the fully-read marker and sends a private receipt by default.
+`matrix_mark_read` updates the fully-read marker, clears the room's marked-unread flag, and sends a private receipt by default.
 Pass `public_receipt=true` only when the user wants others to see the receipt.
 History and catch-up reads never mark messages read automatically.
 

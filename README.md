@@ -142,8 +142,8 @@ It does not expose a local HTTP port during normal MCP operation.
 
 - `matrix_whoami`: show the configured Matrix user/device.
 - `matrix_list_rooms`: list rooms joined by the authenticated user.
-- `matrix_read_room_recent`: read recent text events from a room.
-- `matrix_read_thread`: read a Matrix thread root and its recent text replies.
+- `matrix_read_room_recent`: read recent messages and attachments from a room.
+- `matrix_read_thread`: read a Matrix thread root and its recent message replies.
 - `matrix_send_message`: send a text message or local file, optionally as a Matrix thread reply.
 - `matrix_list_room_members`: page through joined members and their profiles.
 - `matrix_search_users`: find user IDs in the homeserver's visible user directory.

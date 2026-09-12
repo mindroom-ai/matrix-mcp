@@ -154,7 +154,9 @@ Profile setters affect only that account's global display name or avatar.
 Avatar updates use existing `mxc://` media URIs.
 Use `matrix_upload_media` to obtain one for a new image.
 Read tools carry MCP read-only hints; invitations and updates are marked as mutations.
-Catch-up reads leave read state unchanged; `matrix_mark_read` requires an explicit call and defaults to a private receipt.
+Catch-up reads leave read state unchanged; `matrix_mark_read` requires an explicit call, clears a manual unread flag, and defaults to a private receipt.
+Invitation and catch-up offsets page a fresh filtered sync snapshot after download.
+The snapshot has a 2 MiB JSON limit; smaller output page limits do not reduce upstream snapshot bytes.
 Edits and redactions target only the connected user's events; room creation defaults to private, unencrypted rooms.
 
 Address a specific agent or user by passing full Matrix user IDs in `mentions`.

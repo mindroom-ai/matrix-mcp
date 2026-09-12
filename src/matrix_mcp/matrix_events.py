@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, quote_transaction_id
 
@@ -11,6 +11,7 @@ _MAX_HISTORY_LIMIT = 100
 _MAX_CONTEXT_LIMIT = 50
 _RELATION_PAGE_LIMIT = 50
 _MAX_RELATION_PAGES = 2
+_MAX_RELATION_REQUESTS = 4
 _EDITABLE_MSGTYPES = frozenset({"m.text", "m.notice", "m.emote"})
 _MEDIA_MSGTYPES = frozenset({"m.file", "m.image", "m.video", "m.audio"})
 
@@ -46,20 +47,38 @@ class TimelineEvent(BaseModel):
 class HistoryPage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    events: list[TimelineEvent]
+    events: list[TimelineEvent] = Field(
+        description=(
+            "Events with edits resolved from valid server bundles and replacements returned "
+            "in this page, plus a bounded advertised recovery scan; original content can "
+            "remain when a server omits both direct sources."
+        )
+    )
     next_batch: str | None = None
-    edit_resolution_truncated: bool = False
+    edit_resolution_truncated: bool = Field(
+        default=False,
+        description="Whether a bounded replacement-relation fallback scan was truncated.",
+    )
 
 
 class EventContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    event: TimelineEvent
+    event: TimelineEvent = Field(
+        description=(
+            "Requested event with edits resolved from valid server bundles and replacements "
+            "returned in this context, plus a bounded advertised recovery scan; original "
+            "content can remain when a server omits both direct sources."
+        )
+    )
     events_before: list[TimelineEvent]
     events_after: list[TimelineEvent]
     start: str | None = None
     end: str | None = None
-    edit_resolution_truncated: bool = False
+    edit_resolution_truncated: bool = Field(
+        default=False,
+        description="Whether a bounded replacement-relation fallback scan was truncated.",
+    )
 
 
 class MatrixEvents:
@@ -88,8 +107,15 @@ class MatrixEvents:
         )
         raw_events = _event_list(payload, "chunk", required=True)
         _require_page_bound(raw_events, page_limit)
+        replacements = _replacement_map(raw_events)
         visible = [raw for raw in raw_events if not _is_replacement(raw)]
-        expanded, truncated = await self._expand_many(room_id, visible)
+        relation_budget = _RelationFetchBudget()
+        expanded, truncated = await self._expand_many(
+            room_id,
+            visible,
+            replacements=replacements,
+            relation_budget=relation_budget,
+        )
         return HistoryPage(
             events=expanded,
             next_batch=_optional_string_field(payload, "end"),
@@ -115,11 +141,28 @@ class MatrixEvents:
         raw_before = _event_list(payload, "events_before")
         raw_after = _event_list(payload, "events_after")
         _require_page_bound(raw_before + raw_after, context_limit)
+        replacements = _replacement_map([raw_event, *raw_before, *raw_after])
         before = [raw for raw in raw_before if not _is_replacement(raw)]
         after = [raw for raw in raw_after if not _is_replacement(raw)]
-        center, center_truncated = await self._expand_one(room_id, raw_event)
-        events_before, before_truncated = await self._expand_many(room_id, before)
-        events_after, after_truncated = await self._expand_many(room_id, after)
+        relation_budget = _RelationFetchBudget()
+        center, center_truncated = await self._expand_one(
+            room_id,
+            raw_event,
+            replacements=replacements.get(_optional_string(raw_event.get("event_id")) or "", []),
+            relation_budget=relation_budget,
+        )
+        events_before, before_truncated = await self._expand_many(
+            room_id,
+            before,
+            replacements=replacements,
+            relation_budget=relation_budget,
+        )
+        events_after, after_truncated = await self._expand_many(
+            room_id,
+            after,
+            replacements=replacements,
+            relation_budget=relation_budget,
+        )
         return EventContext(
             event=center,
             events_before=events_before,
@@ -286,29 +329,59 @@ class MatrixEvents:
         return _required_string(payload, "event_id", context="Matrix send response")
 
     async def _expand_many(
-        self, room_id: str, raw_events: list[dict[str, Any]]
+        self,
+        room_id: str,
+        raw_events: list[dict[str, Any]],
+        *,
+        replacements: dict[str, list[dict[str, Any]]] | None = None,
+        relation_budget: _RelationFetchBudget,
     ) -> tuple[list[TimelineEvent], bool]:
         events: list[TimelineEvent] = []
         truncated = False
         for raw in raw_events:
-            event, event_truncated = await self._expand_one(room_id, raw)
+            event_id = _optional_string(raw.get("event_id")) or ""
+            event, event_truncated = await self._expand_one(
+                room_id,
+                raw,
+                replacements=[] if replacements is None else replacements.get(event_id, []),
+                relation_budget=relation_budget,
+            )
             events.append(event)
             truncated = truncated or event_truncated
         return events, truncated
 
-    async def _expand_one(self, room_id: str, raw: dict[str, Any]) -> tuple[TimelineEvent, bool]:
-        original = normalize_timeline_event(room_id, raw)
+    async def _expand_one(
+        self,
+        room_id: str,
+        raw: dict[str, Any],
+        *,
+        replacements: list[dict[str, Any]] | None = None,
+        relation_budget: _RelationFetchBudget,
+    ) -> tuple[TimelineEvent, bool]:
+        original = _timeline_event(raw)
         if original.redacted or _is_replacement(raw) or "state_key" in raw:
             return original, False
-        _, bundle_present = _bundled_replacement(raw)
-        if original.edited:
-            return original, False
-        if not bundle_present:
-            return original, False
-        replacements, truncated = await self._replacement_relations(room_id, original.event_id)
+        bundle, bundle_present = _bundled_replacement(raw)
+        candidates = list(replacements or [])
+        if bundle is not None:
+            candidates.append(bundle)
         valid = [
             replacement
-            for replacement in replacements
+            for replacement in candidates
+            if _valid_replacement(room_id, raw, replacement)
+        ]
+        if valid:
+            return _apply_replacement(original, max(valid, key=_replacement_order)), False
+        if not bundle_present:
+            return original, False
+        recovered, truncated = await self._replacement_relations(
+            room_id,
+            original.event_id,
+            relation_budget=relation_budget,
+        )
+        valid = [
+            replacement
+            for replacement in recovered
             if _valid_replacement(room_id, raw, replacement)
         ]
         if not valid:
@@ -317,7 +390,11 @@ class MatrixEvents:
         return _apply_replacement(original, latest), truncated
 
     async def _replacement_relations(
-        self, room_id: str, event_id: str
+        self,
+        room_id: str,
+        event_id: str,
+        *,
+        relation_budget: _RelationFetchBudget,
     ) -> tuple[list[dict[str, Any]], bool]:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         event = quote_matrix_id(event_id, sigil="$", label="event ID")
@@ -325,6 +402,8 @@ class MatrixEvents:
         replacements: list[dict[str, Any]] = []
         cursor: str | None = None
         for page_number in range(_MAX_RELATION_PAGES):
+            if not relation_budget.take():
+                return replacements, True
             params: dict[str, str | int] = {"dir": "b", "limit": _RELATION_PAGE_LIMIT}
             if cursor is not None:
                 params["from"] = cursor
@@ -338,6 +417,17 @@ class MatrixEvents:
             if page_number + 1 == _MAX_RELATION_PAGES:
                 return replacements, True
         return replacements, cursor is not None
+
+
+class _RelationFetchBudget:
+    def __init__(self) -> None:
+        self.remaining = _MAX_RELATION_REQUESTS
+
+    def take(self) -> bool:
+        if self.remaining == 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 def normalize_timeline_event(
@@ -413,6 +503,15 @@ def _bundled_replacement(raw: dict[str, Any]) -> tuple[dict[str, Any] | None, bo
         return None, False
     replacement = relations.get("m.replace")
     return (replacement if isinstance(replacement, dict) else None), True
+
+
+def _replacement_map(raw_events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    replacements: dict[str, list[dict[str, Any]]] = {}
+    for raw in raw_events:
+        target = _relationship_id(raw, "m.replace")
+        if target is not None:
+            replacements.setdefault(target, []).append(raw)
+    return replacements
 
 
 def _valid_replacement(room_id: str, original: dict[str, Any], replacement: dict[str, Any]) -> bool:

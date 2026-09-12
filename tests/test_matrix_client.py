@@ -784,7 +784,46 @@ async def test_client_recent_history_uses_grouped_normalization_and_keeps_refs(
                             size=5,
                         ),
                         edited=True,
-                    )
+                    ),
+                    TimelineEvent(
+                        event_id="$notice",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        msgtype="m.notice",
+                        body="notice",
+                    ),
+                    TimelineEvent(
+                        event_id="$emote",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        msgtype="m.emote",
+                        body="waves",
+                    ),
+                    TimelineEvent(
+                        event_id="$redacted",
+                        sender="@alice:example.com",
+                        type="m.room.message",
+                        body=None,
+                        redacted=True,
+                    ),
+                    TimelineEvent(
+                        event_id="$reaction",
+                        sender="@alice:example.com",
+                        type="m.reaction",
+                        body=None,
+                    ),
+                    TimelineEvent(
+                        event_id="$redaction",
+                        sender="@alice:example.com",
+                        type="m.room.redaction",
+                        body=None,
+                    ),
+                    TimelineEvent(
+                        event_id="$state",
+                        sender="@alice:example.com",
+                        type="m.room.name",
+                        body=None,
+                    ),
                 ]
             )
 
@@ -812,7 +851,31 @@ async def test_client_recent_history_uses_grouped_normalization_and_keeps_refs(
                 size=5,
             ),
             edited=True,
-        )
+        ),
+        MatrixEvent(
+            id=2,
+            event_id="$notice",
+            sender="@alice:example.com",
+            type="m.room.message",
+            msgtype="m.notice",
+            body="notice",
+        ),
+        MatrixEvent(
+            id=3,
+            event_id="$emote",
+            sender="@alice:example.com",
+            type="m.room.message",
+            msgtype="m.emote",
+            body="waves",
+        ),
+        MatrixEvent(
+            id=4,
+            event_id="$redacted",
+            sender="@alice:example.com",
+            type="m.room.message",
+            body=None,
+            redacted=True,
+        ),
     ]
 
 

@@ -171,7 +171,7 @@ class MatrixMCPTools:
     async def matrix_read_room_recent(
         self, room_id: str | int, limit: int = 20
     ) -> list[MatrixEvent]:
-        """Read recent text messages from one Matrix room by Matrix room ID or numeric room ref."""
+        """Read recent messages and attachments by Matrix room ID or numeric room ref."""
         async with self._client() as client:
             return await client.read_room_recent(room_id, limit=limit)
 
@@ -181,7 +181,7 @@ class MatrixMCPTools:
         thread_id: str | int,
         limit: int = 50,
     ) -> list[MatrixEvent]:
-        """Read a Matrix thread root and its recent text replies by Matrix ID or numeric ref."""
+        """Read a Matrix thread root and its recent message replies by Matrix ID or numeric ref."""
         async with self._client() as client:
             return await client.read_thread(room_id, thread_id, limit=limit)
 

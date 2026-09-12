@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import gzip
 import json
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +31,7 @@ class MediaEndpoint:
     download_headers: dict[str, str] = field(default_factory=dict)
     encrypted: bool = False
     chunked: bool = False
+    queued_downloads: deque[tuple[bytes, int, dict[str, str]]] = field(default_factory=deque)
 
     async def handle(  # noqa: PLR0911 - Fake HTTP endpoint dispatch.
         self,
@@ -47,6 +50,9 @@ class MediaEndpoint:
         if request.path == "/_matrix/media/v3/upload":
             return web.json_response({"content_uri": "mxc://example.com/file"})
         if request.path == DOWNLOAD:
+            if self.queued_downloads:
+                body, status, headers = self.queued_downloads.popleft()
+                return web.Response(body=body, status=status, headers=headers)
             if self.chunked:
                 stream = web.StreamResponse(headers={"Content-Type": "text/plain"})
                 await stream.prepare(request)
@@ -280,6 +286,72 @@ async def test_download_failure_does_not_echo_server_error_text(
     with pytest.raises(RuntimeError, match="M_FORBIDDEN") as error:
         await media.download("mxc://example.com/file")
     assert "do-not-echo-this" not in str(error.value)
+
+
+async def test_download_preserves_deep_json_file_bytes(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    deep_json = b"[" * 100_000 + b"0" + b"]" * 100_000
+    endpoint.download = deep_json
+
+    result = await media.download("mxc://example.com/file")
+
+    assert base64.b64decode(result.data_base64) == deep_json
+
+
+async def test_download_sanitizes_recursive_error_json(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    endpoint.download_status = 500
+    endpoint.download = b"[" * 100_000 + b"0" + b"]" * 100_000
+
+    with pytest.raises(RuntimeError, match=r"HTTP 500") as error:
+        await media.download("mxc://example.com/file")
+
+    assert "M_FORBIDDEN" not in str(error.value)
+
+
+async def test_download_sanitizes_malformed_error_body(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    endpoint.download_status = 500
+    endpoint.download = b'\xff{"errcode":"M_FORBIDDEN"}'
+
+    with pytest.raises(RuntimeError, match=r"HTTP 500") as error:
+        await media.download("mxc://example.com/file")
+
+    assert "M_FORBIDDEN" not in str(error.value)
+
+
+async def test_download_retries_a_rate_limited_response(
+    matrix: tuple[MatrixMedia, MediaEndpoint], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media, endpoint = matrix
+    endpoint.queued_downloads.extend(
+        [
+            (
+                json.dumps({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 1}).encode(),
+                429,
+                {"Content-Type": "application/json"},
+            ),
+            (b"retried\n", 200, {"Content-Type": "text/plain"}),
+        ]
+    )
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_delay)
+
+    result = await media.download("mxc://example.com/file")
+
+    assert base64.b64decode(result.data_base64) == b"retried\n"
+    assert [request["path"] for request in endpoint.requests] == [DOWNLOAD, DOWNLOAD]
+    assert delays == [0.001]
 
 
 async def test_download_enforces_byte_limit_without_content_length(

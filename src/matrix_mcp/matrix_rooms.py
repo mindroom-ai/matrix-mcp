@@ -15,6 +15,17 @@ if TYPE_CHECKING:
 
 _MAX_PAGE = 100
 _MAX_INVITEES = 100
+_SYNC_EVENT_FIELDS = [
+    "event_id",
+    "sender",
+    "origin_server_ts",
+    "state_key",
+    "type",
+    "content.body",
+    "content.m\\.mentions",
+    "content.name",
+    "content.unread",
+]
 
 
 class Invitation(BaseModel):
@@ -224,6 +235,12 @@ class MatrixRooms:
                 receipt: event_id,
             },
         )
+        user = _identifier(self.http.user_id, sigils="@")
+        await self.http.json(
+            "PUT",
+            f"/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread",
+            body={"unread": False},
+        )
 
     async def _sync(
         self,
@@ -232,6 +249,7 @@ class MatrixRooms:
         include_invites: bool = False,
     ) -> _Sync:
         sync_filter = {
+            "event_fields": _SYNC_EVENT_FIELDS,
             "presence": {"types": []},
             "account_data": {"types": []},
             "room": {
@@ -249,7 +267,11 @@ class MatrixRooms:
                 "account_data": {"types": ["m.marked_unread"]},
             },
         }
-        params: dict[str, str | int] = {"timeout": 0, "filter": json.dumps(sync_filter)}
+        params: dict[str, str | int] = {
+            "timeout": 0,
+            "set_presence": "offline",
+            "filter": json.dumps(sync_filter),
+        }
         result = await self.http.json("GET", "/_matrix/client/v3/sync", params=params)
         try:
             return _Sync.model_validate(result, strict=True)
