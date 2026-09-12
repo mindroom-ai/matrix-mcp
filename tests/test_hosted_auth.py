@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
 from contextlib import asynccontextmanager
@@ -541,7 +542,9 @@ async def test_two_users_tools_use_request_identity_without_local_files(
     tools = response.json()["result"]["tools"]
     for tool in tools:
         properties = tool["inputSchema"]["properties"]
-        assert not ({"file_path", "filename", "content_type", "homeserver"} & properties.keys())
+        assert not ({"file_path", "homeserver", "access_token", "http_url"} & properties.keys())
+        if tool["name"] == "matrix_send_message":
+            assert not ({"filename", "content_type"} & properties.keys())
         if tool["name"] not in {"matrix_invite_user", "matrix_get_profile"}:
             assert "user_id" not in properties
         if "room_id" in properties:
@@ -557,6 +560,131 @@ async def test_two_users_tools_use_request_identity_without_local_files(
     assert response.json()["result"]["isError"]
     assert not (tmp_path / "config").exists()
     assert not (tmp_path / "data").exists()
+
+
+async def test_two_users_conversation_tools_keep_request_identity(browser: OAuthBrowser) -> None:
+    alice = await browser.login(await browser.register(), "alice")
+    bob = await browser.login(await browser.register(), "bob")
+
+    for user, tokens in (("alice", alice), ("bob", bob)):
+        access = tokens["access_token"]
+        history = await browser.call(
+            access,
+            "matrix_read_history",
+            {"room_id": "!v12hash", "limit": 5},
+        )
+        assert history["structuredContent"]["events"][0]["body"] == "Hello"
+        await browser.call(
+            access,
+            "matrix_reply",
+            {"room_id": "!v12hash", "event_id": "$root", "body": f"reply from {user}"},
+        )
+        await browser.call(
+            access,
+            "matrix_react",
+            {"room_id": "!v12hash", "event_id": "$root", "key": user},
+        )
+        joined = await browser.call(
+            access,
+            "matrix_join_room",
+            {"room_id_or_alias": "#general:example.com"},
+        )
+        assert joined["structuredContent"]["room_id"] == "!joined:example.com"
+        uploaded = await browser.call(
+            access,
+            "matrix_upload_media",
+            {
+                "data_base64": base64.b64encode(user.encode()).decode(),
+                "filename": f"{user}.txt",
+                "content_type": "text/plain",
+            },
+        )
+        media_url = uploaded["structuredContent"]["content_uri"]
+        downloaded = await browser.call(
+            access,
+            "matrix_download_media",
+            {"media_url": media_url},
+        )
+        assert base64.b64decode(downloaded["structuredContent"]["data_base64"]).decode() == user
+        await browser.call(
+            access,
+            "matrix_send_media",
+            {
+                "room_id": "!v12hash",
+                "media_url": media_url,
+                "filename": f"{user}.txt",
+                "content_type": "text/plain",
+                "size": len(user),
+            },
+        )
+
+    for operation in ("history", "reply", "react", "join", "upload", "download", "send_media"):
+        assert {
+            request["actor"]
+            for request in browser.matrix.conversation_requests
+            if request["operation"] == operation
+        } == {"@alice:example.com", "@bob:example.com"}
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("matrix_read_history", {"room_id": "not-a-room"}),
+        ("matrix_get_event_context", {"room_id": "!v12hash", "event_id": "event"}),
+        ("matrix_reply", {"room_id": "!v12hash", "event_id": "$event", "body": ""}),
+        ("matrix_join_room", {"room_id_or_alias": "general"}),
+        ("matrix_get_unread", {"limit": 0}),
+        ("matrix_upload_media", {"data_base64": "%%%", "filename": "bad.txt"}),
+        ("matrix_download_media", {"media_url": "https://example.com/media"}),
+        (
+            "matrix_send_media",
+            {
+                "room_id": "!v12hash",
+                "media_url": "mxc://example.com/media",
+                "filename": "x.txt",
+                "size": -1,
+            },
+        ),
+    ],
+)
+async def test_hosted_conversation_tools_reject_malformed_input(
+    browser: OAuthBrowser,
+    tool: str,
+    arguments: dict[str, Any],
+) -> None:
+    tokens = await browser.login(await browser.register())
+    response = await browser.rpc(
+        tokens["access_token"],
+        "tools/call",
+        {"name": tool, "arguments": arguments},
+    )
+    assert response.json()["result"]["isError"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("matrix_read_history", {}),
+        ("matrix_reply", {"event_id": "$root", "body": "denied"}),
+    ],
+)
+async def test_hosted_conversation_tools_surface_room_denials(
+    browser: OAuthBrowser,
+    tool: str,
+    arguments: dict[str, Any],
+) -> None:
+    tokens = await browser.login(await browser.register())
+    response = await browser.rpc(
+        tokens["access_token"],
+        "tools/call",
+        {
+            "name": tool,
+            "arguments": {"room_id": "!forbidden:example.com", **arguments},
+        },
+    )
+    result = response.json()["result"]
+    assert result["isError"]
+    assert "M_FORBIDDEN" in str(result)
 
 
 async def test_room_profile_tools_use_each_callers_matrix_identity(browser: OAuthBrowser) -> None:

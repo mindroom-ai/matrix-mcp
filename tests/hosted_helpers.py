@@ -28,6 +28,8 @@ class FakeMatrix:
     messages: list[dict[str, Any]] = field(default_factory=list)
     invitations: list[dict[str, str]] = field(default_factory=list)
     room_writes: list[dict[str, Any]] = field(default_factory=list)
+    conversation_requests: list[dict[str, Any]] = field(default_factory=list)
+    media_store: dict[str, tuple[bytes, str]] = field(default_factory=dict)
     profiles: dict[str, dict[str, str | None]] = field(default_factory=dict)
     room_state: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
     logout_fails: bool = False
@@ -68,7 +70,7 @@ class FakeMatrix:
             result.update(refresh_token=refresh, expires_in_ms=self.expires_in_ms)
         return result
 
-    async def handle(self, request: web.Request) -> web.Response:  # noqa: C901, PLR0911, PLR0912 - Fake HTTP API dispatch.
+    async def handle(self, request: web.Request) -> web.Response:  # noqa: C901, PLR0911, PLR0912, PLR0915 - Fake HTTP API dispatch.
         path = request.path
         if path.endswith("/login") and request.method == "POST":
             data = await request.json()
@@ -124,14 +126,59 @@ class FakeMatrix:
         if "/send/m.room.message/" in path:
             content = await request.json()
             self.messages.append({"sender": identity[0], "content": content, "path": path})
+            if content.get("url") is not None:
+                self._record_conversation("send_media", identity[0], path)
+            elif (
+                isinstance(content.get("m.relates_to"), dict)
+                and "m.in_reply_to" in content["m.relates_to"]
+            ):
+                self._record_conversation("reply", identity[0], path)
             return web.json_response({"event_id": f"$event{len(self.messages)}"})
+        if "/send/m.reaction/" in path:
+            self._record_conversation("react", identity[0], path)
+            return web.json_response({"event_id": f"$reaction{len(self.conversation_requests)}"})
+        if "/redact/" in path and request.method == "PUT":
+            self._record_conversation("redact", identity[0], path)
+            return web.json_response({"event_id": f"$redaction{len(self.conversation_requests)}"})
         if path.endswith("/messages"):
+            self._record_conversation("history", identity[0], path)
             return web.json_response({"chunk": [self.event()], "start": "start", "end": "end"})
+        if "/context/" in path:
+            self._record_conversation("context", identity[0], path)
+            return web.json_response(
+                {"event": self.event(), "events_before": [], "events_after": []}
+            )
         if "/event/" in path:
             return web.json_response(self.event())
         if "/relations/" in path:
             return web.json_response({"chunk": []})
+        if path.endswith("/sync"):
+            self._record_conversation("unread", identity[0], path)
+            return web.json_response({"next_batch": "sync", "rooms": {}})
+        if "/join/" in path and request.method == "POST":
+            self._record_conversation("join", identity[0], path)
+            return web.json_response({"room_id": "!joined:example.com"})
+        if path.endswith("/createRoom") and request.method == "POST":
+            self._record_conversation("create", identity[0], path)
+            return web.json_response({"room_id": "!created:example.com"})
+        if path.endswith("/_matrix/media/v3/upload") and request.method == "POST":
+            data = await request.read()
+            media_id = f"media-{len(self.media_store) + 1}"
+            content_type = request.headers.get("Content-Type", "application/octet-stream")
+            self.media_store[media_id] = (data, content_type)
+            self._record_conversation("upload", identity[0], path)
+            return web.json_response({"content_uri": f"mxc://example.com/{media_id}"})
+        if "/_matrix/client/v1/media/download/" in path and request.method == "GET":
+            media_id = path.rsplit("/", 1)[-1]
+            media = self.media_store.get(media_id)
+            if media is None:
+                return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+            self._record_conversation("download", identity[0], path)
+            return web.Response(body=media[0], headers={"Content-Type": media[1]})
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+
+    def _record_conversation(self, operation: str, actor: str, path: str) -> None:
+        self.conversation_requests.append({"operation": operation, "actor": actor, "path": path})
 
     async def room_profile_request(  # noqa: C901, PLR0911, PLR0912 - Fake API routes.
         self, request: web.Request, actor: str

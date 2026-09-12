@@ -152,11 +152,18 @@ It does not expose a local HTTP port during normal MCP operation.
 - `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar`: update room details.
 - `matrix_get_profile`: look up your own or another user's profile.
 - `matrix_set_display_name`, `matrix_set_avatar`: update your own global profile.
+- `matrix_read_history`, `matrix_get_event_context`: page through history and inspect a message's context.
+- `matrix_reply`, `matrix_react`: reply to a specific event or add a reaction.
+- `matrix_edit_message`, `matrix_redact_event`: correct your messages or remove your event content, including reactions.
+- `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room`: manage your room membership and create private rooms.
+- `matrix_upload_media`, `matrix_download_media`, `matrix_send_media`: transfer bounded files and images using Matrix media URIs.
+- `matrix_get_unread`, `matrix_mark_read`: inspect unread activity and explicitly update read markers.
 
 All actions use the connected account's Matrix permissions.
 See [room and profile examples](docs/usage.md#room-members-and-invitations) for arguments, pagination, and avatar media URIs.
 
-Rooms and events returned by read/list tools include stable numeric `id` fields.
+The original stdio read/list tools include stable numeric `id` fields.
+The new history, message-action, membership, media, and catch-up tools use raw Matrix IDs on both transports.
 Thread replies also include `thread_ref`, which is the numeric event ref of the thread root.
 Use these integers in later tool calls instead of copying raw Matrix IDs:
 
