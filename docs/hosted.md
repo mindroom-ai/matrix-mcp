@@ -142,10 +142,14 @@ Revoke the Matrix device/session or the MCP connection.
 
 ## Tools and limits
 
-Hosted mode exposes `matrix_whoami`, `matrix_list_rooms`, `matrix_read_room_recent`, `matrix_read_thread`, and text-only `matrix_send_message`.
+Hosted mode exposes the [conversation, room, membership, directory, and profile tools](usage.md#mcp-tools), with text-only `matrix_send_message`.
 Use raw Matrix room and event IDs.
 Numeric references and local-file upload remain stdio features.
 Each hosted tool opens its own Matrix client with the request's verified credential and closes it after the call.
+Invitations and room updates require the connected account's normal Matrix permissions.
+Profile setters affect only that account's global display name or avatar.
+Avatar updates use existing `mxc://` media URIs.
+Read tools carry MCP read-only hints; invitations and updates are marked as mutations.
 
 Address a specific agent or user by passing full Matrix user IDs in `mentions`.
 For a threaded request, reuse the root event ID when reading the reply:

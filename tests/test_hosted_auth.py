@@ -10,11 +10,15 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 import pytest
 from aiohttp import web
+from fastmcp import Client
 from nio import AsyncClient
 
 from matrix_mcp import hosted_auth, matrix_client
+from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.hosted_auth import HostedSettings
 from matrix_mcp.hosted_server import create_hosted_server
+from matrix_mcp.id_state import MatrixIdStore
+from matrix_mcp.mcp_server import create_mcp_server
 from tests.hosted_helpers import CALLBACK, FakeMatrix, OAuthBrowser, PausedOAuthRequest
 
 if TYPE_CHECKING:
@@ -535,12 +539,11 @@ async def test_two_users_tools_use_request_identity_without_local_files(
         assert result
     response = await browser.rpc(alice["access_token"], "tools/list", {})
     tools = response.json()["result"]["tools"]
-    assert len(tools) == 5
     for tool in tools:
         properties = tool["inputSchema"]["properties"]
-        assert not (
-            {"file_path", "filename", "content_type", "user_id", "homeserver"} & properties.keys()
-        )
+        assert not ({"file_path", "filename", "content_type", "homeserver"} & properties.keys())
+        if tool["name"] not in {"matrix_invite_user", "matrix_get_profile"}:
+            assert "user_id" not in properties
         if "room_id" in properties:
             assert properties["room_id"]["type"] == "string"
     response = await browser.rpc(
@@ -554,6 +557,210 @@ async def test_two_users_tools_use_request_identity_without_local_files(
     assert response.json()["result"]["isError"]
     assert not (tmp_path / "config").exists()
     assert not (tmp_path / "data").exists()
+
+
+async def test_room_profile_tools_use_each_callers_matrix_identity(browser: OAuthBrowser) -> None:
+    alice = await browser.login(await browser.register(), "alice")
+    bob = await browser.login(await browser.register(), "bob")
+    room = {"room_id": "!room:example.com"}
+    for user, tokens in [("alice", alice), ("bob", bob)]:
+        access = tokens["access_token"]
+        profile = await browser.call(access, "matrix_get_profile", {})
+        assert profile["structuredContent"]["user_id"] == f"@{user}:example.com"
+        await browser.call(access, "matrix_set_display_name", {"displayname": user.title()})
+        await browser.call(access, "matrix_set_avatar", {"avatar_url": f"mxc://example.com/{user}"})
+        await browser.call(
+            access, "matrix_invite_user", {**room, "user_id": f"@{user}-friend:example.com"}
+        )
+        for tool, arguments in [
+            ("matrix_set_room_name", {"name": f"{user}'s room"}),
+            ("matrix_set_room_topic", {"topic": f"Topic from {user}"}),
+            ("matrix_set_room_avatar", {"avatar_url": f"mxc://example.com/{user}"}),
+        ]:
+            result = await browser.call(access, tool, {**room, **arguments})
+            assert result["structuredContent"]["event_id"].startswith("$state")
+    assert browser.matrix.profiles == {
+        "@alice:example.com": {"displayname": "Alice", "avatar_url": "mxc://example.com/alice"},
+        "@bob:example.com": {"displayname": "Bob", "avatar_url": "mxc://example.com/bob"},
+    }
+    assert browser.matrix.invitations == [
+        {
+            "actor": "@alice:example.com",
+            "room_id": "!room:example.com",
+            "user_id": "@alice-friend:example.com",
+        },
+        {
+            "actor": "@bob:example.com",
+            "room_id": "!room:example.com",
+            "user_id": "@bob-friend:example.com",
+        },
+    ]
+    assert [change["actor"] for change in browser.matrix.room_writes] == [
+        "@alice:example.com",
+        "@alice:example.com",
+        "@alice:example.com",
+        "@bob:example.com",
+        "@bob:example.com",
+        "@bob:example.com",
+    ]
+    info = await browser.call(alice["access_token"], "matrix_get_room_info", room)
+    assert info["structuredContent"] == {
+        "id": None,
+        "room_id": "!room:example.com",
+        "name": "bob's room",
+        "topic": "Topic from bob",
+        "avatar_url": "mxc://example.com/bob",
+    }
+    members = await browser.call(
+        alice["access_token"], "matrix_list_room_members", {**room, "limit": 1}
+    )
+    assert members["structuredContent"] == {
+        "members": [
+            {
+                "user_id": "@alice:example.com",
+                "displayname": "Alice",
+                "avatar_url": "mxc://example.com/alice",
+            }
+        ],
+        "total": 2,
+        "next_offset": 1,
+    }
+    second = await browser.call(
+        alice["access_token"], "matrix_list_room_members", {**room, "limit": 1, "offset": 1}
+    )
+    assert second["structuredContent"]["members"][0]["user_id"] == "@bob:example.com"
+    assert second["structuredContent"]["next_offset"] is None
+    search = await browser.call(
+        alice["access_token"], "matrix_search_users", {"search_term": "bob", "limit": 1}
+    )
+    assert search["structuredContent"] == {
+        "results": [
+            {
+                "user_id": "@bob:example.com",
+                "displayname": "Bob",
+                "avatar_url": "mxc://example.com/bob",
+            }
+        ],
+        "limited": False,
+    }
+
+
+async def test_stdio_room_tools_resolve_numeric_refs(
+    matrix: tuple[FakeMatrix, str], tmp_path: Path
+) -> None:
+    tokens = matrix[0].session("alice")
+    config = MatrixMCPConfig(
+        homeserver=matrix[1],
+        **{key: tokens[key] for key in ("access_token", "user_id", "device_id")},
+    )
+    driver = matrix_client.NioMatrixDriver(config)
+    api = matrix_client.MatrixAPIClient(
+        driver=driver, id_store=MatrixIdStore(tmp_path / "ids.json")
+    )
+    try:
+        async with Client(create_mcp_server(client_factory=lambda: api)) as client:
+            rooms = await client.call_tool("matrix_list_rooms", {})
+            assert rooms.structured_content is not None
+            room_ref = rooms.structured_content["result"][0]["id"]
+            await client.call_tool(
+                "matrix_invite_user",
+                {
+                    "room_id": room_ref,
+                    "user_id": "@bob:example.com",
+                },
+            )
+            await client.call_tool(
+                "matrix_set_room_topic",
+                {
+                    "room_id": str(room_ref),
+                    "topic": "Updated by room ref",
+                },
+            )
+            info = await client.call_tool("matrix_get_room_info", {"room_id": room_ref})
+            assert info.structured_content is not None
+            assert info.structured_content["topic"] == "Updated by room ref"
+            assert info.structured_content["id"] == room_ref
+            assert info.structured_content["room_id"] == "!room:example.com"
+            members = await client.call_tool("matrix_list_room_members", {"room_id": room_ref})
+            assert members.structured_content is not None
+            assert members.structured_content["members"][0]["user_id"] == "@alice:example.com"
+        assert matrix[0].invitations == [
+            {
+                "actor": "@alice:example.com",
+                "room_id": "!room:example.com",
+                "user_id": "@bob:example.com",
+            }
+        ]
+    finally:
+        await driver.close()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("matrix_list_room_members", {}),
+        ("matrix_get_room_info", {}),
+        ("matrix_invite_user", {"user_id": "@friend:example.com"}),
+        ("matrix_set_room_name", {"name": "Denied"}),
+        ("matrix_set_room_topic", {"topic": "Denied"}),
+        ("matrix_set_room_avatar", {"avatar_url": "mxc://example.com/avatar"}),
+    ],
+)
+async def test_room_tools_surface_homeserver_permission_denials(
+    browser: OAuthBrowser, tool: str, arguments: dict[str, str]
+) -> None:
+    tokens = await browser.login(await browser.register())
+    response = await browser.rpc(
+        tokens["access_token"],
+        "tools/call",
+        {
+            "name": tool,
+            "arguments": {"room_id": "!forbidden:example.com", **arguments},
+        },
+    )
+    result = response.json()["result"]
+    assert result["isError"]
+    assert "M_FORBIDDEN" in str(result) or "Room access denied" in str(result)
+    assert browser.matrix.invitations == []
+    assert browser.matrix.room_writes == []
+
+
+async def test_room_profile_tool_hints_and_input_boundaries(browser: OAuthBrowser) -> None:
+    tokens = await browser.login(await browser.register())
+    access = tokens["access_token"]
+    response = await browser.rpc(access, "tools/list", {})
+    tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+    for name in (
+        "matrix_list_room_members",
+        "matrix_get_room_info",
+        "matrix_get_profile",
+        "matrix_search_users",
+    ):
+        assert tools[name]["annotations"]["readOnlyHint"] is True
+    for name in (
+        "matrix_invite_user",
+        "matrix_set_room_name",
+        "matrix_set_room_topic",
+        "matrix_set_room_avatar",
+        "matrix_set_display_name",
+        "matrix_set_avatar",
+    ):
+        assert tools[name]["annotations"]["readOnlyHint"] is False
+    assert tools["matrix_invite_user"]["annotations"]["destructiveHint"] is False
+    assert tools["matrix_set_room_avatar"]["annotations"]["destructiveHint"] is True
+    for name, arguments in [
+        ("matrix_invite_user", {"room_id": "12", "user_id": "@bob:example.com"}),
+        ("matrix_invite_user", {"room_id": "!room:example.com", "user_id": "bob"}),
+        ("matrix_list_room_members", {"room_id": "!room:example.com", "limit": 0}),
+        ("matrix_list_room_members", {"room_id": "!room:example.com", "offset": -1}),
+        ("matrix_set_avatar", {"avatar_url": "https://example.com/avatar.png"}),
+        ("matrix_search_users", {"search_term": " "}),
+    ]:
+        result = await browser.rpc(access, "tools/call", {"name": name, "arguments": arguments})
+        assert result.json()["result"]["isError"]
+    assert browser.matrix.invitations == []
+    assert browser.matrix.room_writes == []
+    assert browser.matrix.profiles["@alice:example.com"]["avatar_url"] is None
 
 
 @pytest.mark.parametrize("encryption_status", [200, 403, 500])
