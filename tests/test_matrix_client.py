@@ -466,7 +466,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         mentions=["@alice:example.com", "@helper:example.com"],
     )
     assert mentioned_id == "$sent2"
-    mentioned = cast("dict[str, Any]", sends[-1][2])
+    mentioned: dict[str, Any] = sends[-1][2]
     assert mentioned["m.mentions"] == {"user_ids": ["@alice:example.com", "@helper:example.com"]}
     assert mentioned["m.relates_to"]["rel_type"] == "m.thread"
     assert mentioned["m.relates_to"]["event_id"] == "$root"
