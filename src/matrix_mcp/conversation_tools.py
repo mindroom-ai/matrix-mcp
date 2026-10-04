@@ -275,7 +275,7 @@ class ConversationTools:
         """Download bounded media from an mxc URI without accepting an HTTP URL or path.
 
         For an encrypted attachment (media.encrypted), also pass the room_id and event_id of
-        its message so the file can be decrypted. Text files come back as text.
+        its message so the file can be decrypted.
         """
         if room_id is None or event_id is None:
             if room_id is not None or event_id is not None:

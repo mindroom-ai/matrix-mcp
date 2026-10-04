@@ -9,6 +9,7 @@ with a token:
 
 from __future__ import annotations
 
+import base64
 import os
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
@@ -172,7 +173,7 @@ async def assert_mcp_reads(
     async with tool_call(config) as client:
         attachment = await client.events.attachment(room_id, attachment_id)
         downloaded = await client.media.download(media.url, attachment=attachment)
-    assert downloaded.text == SECRET_FILE.decode()
+    assert base64.b64decode(downloaded.data_base64) == SECRET_FILE
     assert downloaded.content_type == "text/plain"
 
     async with tool_call(config) as client:

@@ -62,7 +62,7 @@ class TimelineEvent(BaseModel):
         default=None,
         description=(
             "Why an encrypted event could not be decrypted; its body is then null. "
-            "'missing room key': sent before this device could receive the key."
+            "'missing room key': this device never received the message's key."
         ),
     )
     # Relations stay readable on undecryptable events; used to tell reactions apart.
@@ -218,8 +218,6 @@ class MatrixEvents:
         transaction = _transaction_path(transaction_id)
         _validate_body(body)
         target = await self._fetch_event(room_id, event_id)
-        # An undecryptable target keeps its cleartext relation, which is enough here.
-        [target], _ = await self.decrypt_raw(room_id, [target])
         relation: dict[str, object] = {"m.in_reply_to": {"event_id": event_id}}
         thread_id = _relationship_id(target, "m.thread")
         if thread_id is not None:
@@ -353,21 +351,10 @@ class MatrixEvents:
         content: dict[str, Any],
         *,
         transaction_id: str | None = None,
-        expect_encrypted: bool | None = None,
     ) -> str:
-        """Send one room event, encrypting it when the room is end-to-end encrypted.
-
-        Content that references media uploaded for a known encryption state passes
-        expect_encrypted, so a room whose state differs at send time is refused.
-        """
+        """Send one room event, encrypting it when the room is end-to-end encrypted."""
         quote_matrix_id(room_id, sigil="!", label="room ID")
-        return await self._send(
-            room_id,
-            event_type,
-            content,
-            _transaction_path(transaction_id),
-            expect_encrypted=expect_encrypted,
-        )
+        return await self._send(room_id, event_type, content, _transaction_path(transaction_id))
 
     async def attachment(self, room_id: str, event_id: str) -> EventAttachment:
         """Read a message's attachment, including decryption info for encrypted media."""
@@ -431,18 +418,9 @@ class MatrixEvents:
         event_type: str,
         content: dict[str, Any],
         transaction: str,
-        *,
-        expect_encrypted: bool | None = None,
     ) -> str:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
-        encrypted = await self.http.room_is_encrypted(room_id)
-        if expect_encrypted is not None and encrypted != expect_encrypted:
-            msg = (
-                "The room's end-to-end encryption state changed after the attachment was "
-                "uploaded; nothing was sent, send the file again"
-            )
-            raise RuntimeError(msg)
-        if encrypted:
+        if await self.http.room_is_encrypted(room_id):
             if self.crypto is None:
                 msg = "Sending to end-to-end encrypted Matrix rooms is not supported in this mode"
                 raise RuntimeError(msg)

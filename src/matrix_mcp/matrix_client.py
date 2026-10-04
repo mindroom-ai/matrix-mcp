@@ -51,7 +51,6 @@ from matrix_mcp.tls import default_ssl_context
 
 # Thread and recent reads keep undecryptable messages so agents know they exist.
 _THREAD_MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted"})
-_THREAD_SCAN_FACTOR = 3
 
 
 class MatrixRoom(BaseModel):
@@ -115,7 +114,7 @@ class MatrixEvent(BaseModel):
         default=None,
         description=(
             "Why an encrypted event could not be decrypted; its body is then null. "
-            "'missing room key': sent before this device could receive the key."
+            "'missing room key': this device never received the message's key."
         ),
     )
 
@@ -408,9 +407,7 @@ class NioMatrixDriver:
                 raw_events.append((root, False))
 
         reply_count = 0
-        scanned = 0
-        # No event type filter: encrypted replies have type m.room.encrypted. Only
-        # message-like events count toward the limit; the scan itself stays bounded.
+        # No event type filter: encrypted replies have type m.room.encrypted.
         async for raw in self._client.room_get_event_relations(
             room_id,
             thread_id,
@@ -419,11 +416,10 @@ class NioMatrixDriver:
             limit=max_replies,
         ):
             source = _source_from_nio(raw)
-            if source is not None and source.get("type") in _THREAD_MESSAGE_TYPES:
+            if source is not None:
                 raw_events.append((source, True))
-                reply_count += 1
-            scanned += 1
-            if reply_count >= max_replies or scanned >= max_replies * _THREAD_SCAN_FACTOR:
+            reply_count += 1
+            if reply_count >= max_replies:
                 break
 
         decrypted, encryption = await self.events.decrypt_raw(
@@ -529,17 +525,14 @@ class NioMatrixDriver:
         resolved_content_type = resolved_content_type or "application/octet-stream"
         size = (await path.stat()).st_size
         encrypted = await self.http.room_is_encrypted(room_id)
-        if encrypted and self.crypto is None:
-            msg = "Sending to end-to-end encrypted Matrix rooms is not supported in this mode"
-            raise RuntimeError(msg)
 
         def upload_path(_got_429: int, _got_timeouts: int) -> str:
             return str(path)
 
-        # Encrypted uploads hide the file name and type from the homeserver.
+        # Encrypted uploads hide the file name (nio also hides the type) from the homeserver.
         upload_response, encryption = await self._client.upload(
             upload_path,
-            content_type="application/octet-stream" if encrypted else resolved_content_type,
+            content_type=resolved_content_type,
             filename=None if encrypted else display_name,
             filesize=size,
             encrypt=encrypted,
@@ -553,9 +546,7 @@ class NioMatrixDriver:
                 thread_id=thread_id,
                 encryption=encryption,
             )
-            return await self.events.send(
-                room_id, "m.room.message", content, expect_encrypted=encryption is not None
-            )
+            return await self.events.send(room_id, "m.room.message", content)
         msg = f"Matrix media upload failed: {upload_response}"
         raise RuntimeError(msg)
 

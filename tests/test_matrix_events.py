@@ -125,13 +125,12 @@ class FakeCrypto:
         readable: bool = True,
         unsigned: dict[str, object] | None = None,
         event_type: str = "m.room.message",
-        cleartext_relation: bool = True,
     ) -> dict[str, Any]:
         ciphertext = f"cipher-{event_id}"
         if readable:
             self.plaintexts[ciphertext] = {"type": event_type, "content": content}
         outer: dict[str, Any] = {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": ciphertext}
-        if "m.relates_to" in content and cleartext_relation:
+        if "m.relates_to" in content:
             outer["m.relates_to"] = content["m.relates_to"]
         return {
             "event_id": event_id,
@@ -1104,23 +1103,6 @@ async def test_plaintext_replacements_cannot_edit_encrypted_messages(
     ]
 
 
-@pytest.mark.parametrize("room_encrypted", [True, False])
-async def test_send_refuses_a_room_whose_encryption_state_changed(
-    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto], room_encrypted: str
-) -> None:
-    events, endpoint, crypto = encrypted_matrix
-    if room_encrypted:
-        endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
-
-    with pytest.raises(RuntimeError, match="send the file again"):
-        await events.send(
-            ROOM, "m.room.message", {"body": "file"}, expect_encrypted=not room_encrypted
-        )
-
-    assert crypto.encrypted == []
-    assert all(request["method"] == "GET" for request in endpoint.requests)
-
-
 async def test_undecryptable_messages_skip_the_edit_lookup(
     encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
 ) -> None:
@@ -1162,29 +1144,6 @@ async def test_replacement_trust_follows_decryption_not_event_ids(
     page = await events.history(ROOM, limit=3)
 
     assert [event.body for event in page.events] == ["real"]
-
-
-async def test_reply_keeps_a_thread_named_only_inside_the_encrypted_target(
-    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
-) -> None:
-    events, endpoint, crypto = encrypted_matrix
-    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
-    endpoint.respond(
-        "GET",
-        f"{ROOM_PATH}/event/$target",
-        crypto.seal(
-            "$target",
-            {"msgtype": "m.text", "body": "in thread", "m.relates_to": THREAD},
-            cleartext_relation=False,
-        ),
-    )
-    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.encrypted/txn", {"event_id": "$reply"})
-
-    await events.reply(ROOM, "$target", "answer", transaction_id="txn")
-
-    [(_, _, content)] = crypto.encrypted
-    assert content["m.relates_to"]["rel_type"] == "m.thread"
-    assert content["m.relates_to"]["event_id"] == "$root"
 
 
 async def test_undecryptable_reactions_are_recognizable_without_their_content(

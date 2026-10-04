@@ -46,9 +46,7 @@ class CryptoEndpoint:
     to_device_batches: list[list[dict[str, Any]]] = field(default_factory=list)
     batch: int = 0
     whoami_device: str = DEVICE
-    failures: dict[str, dict[str, Any]] = field(default_factory=dict)
     other_devices: dict[str, dict[str, Any]] = field(default_factory=dict)
-    lose_upload_response: bool = False
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -81,13 +79,9 @@ class CryptoEndpoint:
         if path == "/_matrix/client/v3/keys/query":
             devices = {DEVICE: self.device_keys} if self.device_keys else {}
             devices.update(self.other_devices)
-            return web.json_response(
-                {"device_keys": {USER: devices}, "failures": self.failures.get("query", {})}
-            )
+            return web.json_response({"device_keys": {USER: devices}, "failures": {}})
         if path == "/_matrix/client/v3/keys/claim":
-            return web.json_response(
-                {"one_time_keys": {}, "failures": self.failures.get("claim", {})}
-            )
+            return web.json_response({"one_time_keys": {}, "failures": {}})
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
 
     def upload(self, body: dict[str, Any]) -> web.Response:
@@ -102,8 +96,6 @@ class CryptoEndpoint:
             else:
                 self.other_devices[body["device_keys"]["device_id"]] = body["device_keys"]
         self.one_time_keys += len(body.get("one_time_keys", {}))
-        if self.lose_upload_response:
-            return web.json_response({"errcode": "M_UNKNOWN"}, status=502)
         return web.json_response({"one_time_key_counts": {"signed_curve25519": self.one_time_keys}})
 
     def syncs(self) -> list[dict[str, Any]]:
@@ -314,7 +306,7 @@ async def test_rejected_key_upload_makes_encryption_unavailable(
     config, endpoint = homeserver
     endpoint.upload_status = 400
 
-    with pytest.raises(E2EEUnavailableError, match="dedicated device"):
+    with pytest.raises(E2EEUnavailableError, match="upload failed"):
         await MatrixE2EE(config, store_path=tmp_path).setup()
 
     assert endpoint.syncs() == []
@@ -679,19 +671,6 @@ async def test_queued_to_device_messages_are_sent_after_catch_up(
     assert sent == [True]
 
 
-async def test_refused_fresh_store_is_removed(
-    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
-) -> None:
-    config, endpoint = homeserver
-    endpoint.whoami_device = "TOKENDEVICE"
-    store = tmp_path / "store"
-
-    with pytest.raises(E2EEUnavailableError):
-        await MatrixE2EE(config, store_path=store).setup()
-
-    assert not store.exists()
-
-
 async def test_local_storage_errors_stop_the_catch_up_without_acknowledging_keys(
     homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
     tmp_path: Path,
@@ -716,67 +695,66 @@ async def test_local_storage_errors_stop_the_catch_up_without_acknowledging_keys
     assert since == [None, "batch-1", "batch-1"]
 
 
-@pytest.mark.parametrize("step", ["query", "claim"])
-async def test_partial_key_failures_stop_the_send(
-    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    step: str,
-) -> None:
-    config, endpoint = homeserver
-    if step == "claim":
-        monkeypatch.setattr(
-            AsyncClient,
-            "get_missing_sessions",
-            lambda _client, _room: {"@bob:remote.example": ["X"]},
-        )
-    crypto = MatrixE2EE(config, store_path=tmp_path)
-    try:
-        await crypto.decrypt(ROOM, megolm_event("$open", {}))
-        endpoint.failures[step] = {"remote.example": {"errcode": "M_UNREACHABLE"}}
-        with pytest.raises(RuntimeError, match=r"remote\.example"):
-            await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
-    finally:
-        await crypto.aclose()
-
-
-async def test_failed_key_delivery_is_retried_on_the_next_send(
-    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config, _endpoint = homeserver
-    undelivered = [{("@bob:example.com", "PHONE")}, set()]
-    monkeypatch.setattr("matrix_mcp.e2ee.undelivered_devices", lambda *_args: undelivered.pop(0))
-    crypto = MatrixE2EE(config, store_path=tmp_path)
-    try:
-        with pytest.raises(RuntimeError, match="delivery failed"):
-            await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
-        await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
-    finally:
-        await crypto.aclose()
-
-    assert undelivered == []
-
-
-async def test_store_is_kept_when_its_keys_may_have_been_published(
-    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
-) -> None:
-    config, endpoint = homeserver
-    endpoint.lose_upload_response = True
-    store = tmp_path / "store"
-
-    with pytest.raises(E2EEUnavailableError):
-        await MatrixE2EE(config, store_path=store).setup()
-    endpoint.lose_upload_response = False
-    status = await MatrixE2EE(config, store_path=store).setup()
-
-    assert endpoint.device_keys is not None
-    assert status.fingerprint == endpoint.device_keys["keys"][f"ed25519:{DEVICE}"]
-
-
 def test_only_loggers_that_embed_event_content_are_silenced() -> None:
     assert logging.getLogger("nio.events.misc").getEffectiveLevel() == logging.CRITICAL
     assert logging.getLogger("nio.crypto.log").getEffectiveLevel() == logging.CRITICAL
     assert logging.getLogger("nio.http").getEffectiveLevel() < logging.CRITICAL
     assert logging.getLogger("nio.responses").getEffectiveLevel() < logging.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        "text",
+        {"type": "m.room.message", "content": {"msgtype": "m.text"}, "unsigned": "x"},
+    ],
+)
+async def test_hostile_payload_stays_encrypted_instead_of_failing_the_read(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path, payload: object
+) -> None:
+    config, _endpoint = homeserver
+    crypto = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "open"})
+        client = await crypto._session()  # noqa: SLF001 - Encrypt an arbitrary plaintext.
+        olm = client.olm
+        assert olm is not None
+        session = olm.outbound_group_sessions[ROOM]
+        ciphertext = session.encrypt(json.dumps(payload))
+        raw = megolm_event(
+            "$hostile",
+            {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": ciphertext,
+                "sender_key": olm.account.identity_keys["curve25519"],
+                "session_id": session.id,
+                "device_id": DEVICE,
+            },
+        )
+        bad_unsigned = {**raw, "unsigned": "x"}
+
+        results = [await crypto.decrypt(ROOM, raw), await crypto.decrypt(ROOM, bad_unsigned)]
+    finally:
+        await crypto.aclose()
+
+    assert all(result.error is not None for result in results)
+
+
+async def test_unusable_lock_file_degrades_reads(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _endpoint = homeserver
+
+    async def denied(_lock: object) -> None:
+        msg = "read-only file system"
+        raise PermissionError(msg)
+
+    monkeypatch.setattr("matrix_mcp.e2ee.AsyncFileLock.acquire", denied)
+
+    result = await MatrixE2EE(config, store_path=tmp_path).decrypt(ROOM, megolm_event("$x", {}))
+
+    assert result.error is not None
+    assert "read-only" in result.error

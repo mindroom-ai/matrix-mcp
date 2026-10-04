@@ -236,9 +236,9 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
             "only when the user explicitly requests that action. "
             "End-to-end encrypted rooms work like any other room. To share a file in an "
             "encrypted room, use matrix_send_message with file_path; matrix_upload_media "
-            "stores files unencrypted. A decryption_error of 'missing room key' means the "
-            "message was sent before this device could receive its key; the user can import "
-            "older keys with `matrix-mcp e2ee import-keys`."
+            "stores files unencrypted. A decryption_error of 'missing room key' means this "
+            "device never received the message's key, usually because the message predates "
+            "it; the user can import older keys with `matrix-mcp e2ee import-keys`."
         ),
     )
     tools = MatrixMCPTools(client_factory=client_factory)

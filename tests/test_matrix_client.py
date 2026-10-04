@@ -160,7 +160,6 @@ def record_sends(
     monkeypatch: pytest.MonkeyPatch,
     *,
     encrypted: bool = False,
-    expected_encryption: list[bool | None] | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Capture the driver's room sends instead of performing HTTP requests."""
     sends: list[tuple[str, str, dict[str, Any]]] = []
@@ -175,12 +174,9 @@ def record_sends(
         content: dict[str, Any],
         *,
         transaction_id: str | None = None,
-        expect_encrypted: bool | None = None,
     ) -> str:
         del transaction_id
         sends.append((room_id, event_type, content))
-        if expected_encryption is not None:
-            expected_encryption.append(expect_encrypted)
         return f"$sent{len(sends)}"
 
     monkeypatch.setattr(driver.http, "room_is_encrypted", room_is_encrypted)
@@ -1264,7 +1260,6 @@ async def test_send_file_encrypts_attachment_for_encrypted_rooms(
     upload = FakeNioClient.instances[0].upload_call
     assert upload is not None
     assert upload["encrypt"] is True
-    assert upload["content_type"] == "application/octet-stream"
     assert upload["filename"] is None
     [(_, event_type, content)] = sends
     assert event_type == "m.room.message"
@@ -1277,21 +1272,6 @@ async def test_send_file_encrypts_attachment_for_encrypted_rooms(
         "hashes": {"sha256": "hash"},
     }
     assert content["info"] == {"mimetype": "text/plain", "size": 11}
-
-
-async def test_send_file_without_e2ee_refuses_encrypted_room_before_upload(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    driver = nio_driver(monkeypatch, e2ee=False)
-    sends = record_sends(driver, monkeypatch, encrypted=True)
-    path = tmp_path / "plan.txt"
-    path.write_text("secret plan", encoding="utf-8")
-
-    with pytest.raises(RuntimeError, match="encrypted"):
-        await driver.send_file("!room:example.com", str(path))
-
-    assert FakeNioClient.instances[0].upload_call is None
-    assert sends == []
 
 
 async def test_read_thread_decrypts_encrypted_replies_and_keeps_unreadable_ones(
@@ -1362,23 +1342,6 @@ async def test_recent_messages_include_undecryptable_events() -> None:
     ]
 
 
-async def test_file_sends_require_the_encryption_state_they_were_uploaded_for(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    driver = nio_driver(monkeypatch)
-    expected: list[bool | None] = []
-    record_sends(driver, monkeypatch, encrypted=False, expected_encryption=expected)
-    path = tmp_path / "plan.txt"
-    path.write_text("plan", encoding="utf-8")
-
-    await driver.send_file("!room:example.com", str(path))
-    await driver.send_message("!room:example.com", "text")
-    record_sends(driver, monkeypatch, encrypted=True, expected_encryption=expected)
-    await driver.send_file("!room:example.com", str(path))
-
-    assert expected == [False, None, True]
-
-
 async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1393,24 +1356,3 @@ async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
 
     reply = thread[-1]
     assert (reply.body, reply.edited) == ("original reply", False)
-
-
-async def test_thread_limit_counts_only_messages(monkeypatch: pytest.MonkeyPatch) -> None:
-    driver = nio_driver(monkeypatch)
-    nio_client = FakeNioClient.instances[0]
-    poll = {
-        "event_id": "$poll",
-        "sender": "@bob:example.com",
-        "origin_server_ts": 400,
-        "type": "org.matrix.msc3381.poll.start",
-        "content": {"m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}},
-    }
-    nio_client.thread_events = [
-        text_event("$reply-1", timestamp_ms=200, body="one", thread_id="$root"),
-        text_event("$reply-2", timestamp_ms=300, body="two", thread_id="$root"),
-        poll,
-    ]
-
-    thread = await driver.read_thread("!room:example.com", "$root", limit=2)
-
-    assert [event.event_id for event in thread] == ["$root", "$reply-1", "$reply-2"]

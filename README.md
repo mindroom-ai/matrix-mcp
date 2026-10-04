@@ -142,7 +142,7 @@ Clients configured to withhold keys from unverified devices will not share room 
 Use a device created by a `matrix-mcp auth` login: an access token borrowed from another client's device cannot be used for encryption, because that device already has its own keys.
 If setup fails at login, plaintext rooms still work; retry with `matrix-mcp e2ee setup`.
 
-The keys live in a private store next to the config file, and `matrix-mcp auth logout` deletes them.
+The keys live in a private per-device store in the default config directory, and `matrix-mcp auth logout` deletes them.
 Several MCP clients on one machine can run `matrix-mcp serve` for the same device; they take turns using the store.
 See [End-to-End Encryption](docs/usage.md#end-to-end-encryption) for limitations.
 Authenticated HTTP mode does not support end-to-end encryption.

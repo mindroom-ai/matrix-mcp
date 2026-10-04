@@ -85,7 +85,7 @@ Messages sent before the device existed are returned with `type: "m.room.encrypt
 
 The device is not cross-signed and appears as an unverified session in other clients.
 Encryption needs a device created by a `matrix-mcp auth` login; a token borrowed from another client's device already has keys of its own.
-Keys are stored next to the config file and are readable only by your user.
+Keys are stored per device in the default config directory (the one `matrix-mcp config-path` reports), even with `--config`, and are readable only by your user.
 Several `matrix-mcp serve` processes can share one device; each tool call that needs encryption waits for its turn on the store.
 
 Each tool call checks that the access token and the homeserver's published keys still belong to this store before it syncs or uploads keys.
@@ -97,9 +97,9 @@ Limitations:
 - Megolm replay detection only covers a single tool call, because it is not stored between calls.
 - Room keys go to joined members; invited users cannot read messages sent before they join.
 - Edits of encrypted messages count only when the edit itself was encrypted.
-- Before sending, Matrix MCP checks that every device with an encryption session received the room key, and refuses to send otherwise. Devices that have run out of one-time keys are skipped, as in other clients. Sends also stop while the homeserver cannot fetch device keys from another server in the room.
+- Before sending, Matrix MCP checks that every device with an encryption session received the room key, and refuses to send otherwise. Devices it cannot reach, such as devices out of one-time keys or on an unreachable server, are skipped, as in other clients.
 - The encryption check and the send are separate requests, so a room that enables encryption between them can still receive one plaintext message.
-- Thread reads scan at most three times `limit` thread events, so a thread with many non-message events, such as polls, may return fewer messages than `limit`.
+- Thread reads count every thread event toward `limit`, so a thread with non-message events, such as polls, may return fewer messages than `limit`.
 - Repairing a broken encryption session with another device is best effort and only works for devices this store already knows.
 - `auth logout` deletes the local keys but does not sign the device out on the homeserver; remove it from another client's session list if needed.
 
@@ -273,7 +273,7 @@ matrix_download_media(media_url="mxc://example.com/sealed", room_id="!room:examp
 Uploads return `content_uri`, filename, MIME type, and decoded byte size.
 Pass `content_type` as a bare MIME type/subtype, such as `image/png`, without parameters.
 Use that URI to send a file or, after uploading an image, pass it as `avatar_url` to an existing avatar setter.
-Downloads return metadata plus the content: UTF-8 text files (`text/*`, JSON, XML, YAML) as `text`, other files as `data_base64`.
+Downloads return base64 content and metadata.
 Each upload or download is limited to 5 MiB of decoded data.
 Media downloads use the configured homeserver's authenticated media API and require its support for that endpoint.
 HTTP URLs, redirects, and server filesystem paths are not accepted.

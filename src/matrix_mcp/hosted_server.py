@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Annotated
-from urllib.parse import quote
 
-import httpx
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
@@ -158,7 +155,6 @@ class HostedMatrixTools:
         The encryption preflight is best effort. A room enabling encryption between
         the check and send can receive plaintext. Do not use where E2EE is required.
         """
-        await self._require_unencrypted_room(room_id)
         async with self.client() as client:
             return {
                 "event_id": await client.send_message(
@@ -168,25 +164,6 @@ class HostedMatrixTools:
                     mentions=mentions,
                 )
             }
-
-    async def _require_unencrypted_room(self, room_id: str) -> None:
-        token = get_access_token()
-        if token is None:
-            msg = "An authenticated Matrix connection is required"
-            raise RuntimeError(msg)
-        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-            response = await client.get(
-                f"{self.settings.matrix_api_url}/_matrix/client/v3/rooms/"
-                f"{quote(room_id, safe='')}/state/m.room.encryption",
-                headers={"Authorization": f"Bearer {token.token}"},
-            )
-        if (
-            response.status_code == HTTPStatus.NOT_FOUND
-            and response.json().get("errcode") == "M_NOT_FOUND"
-        ):
-            return
-        msg = "Text send refused: room is encrypted or encryption state could not be verified"
-        raise RuntimeError(msg)
 
 
 def create_hosted_server(settings: HostedSettings) -> FastMCP:

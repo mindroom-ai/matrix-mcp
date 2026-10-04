@@ -34,17 +34,6 @@ MXC_URI_PATTERN = (
 )
 _MAX_ENCODED_LENGTH = 4 * ((MAX_MEDIA_BYTES + 2) // 3)
 _CHUNK_BYTES = 64 * 1024
-_TEXT_APPLICATION_TYPES = frozenset(
-    {
-        "application/json",
-        "application/xml",
-        "application/javascript",
-        "application/x-yaml",
-        "application/yaml",
-        "application/toml",
-        "application/x-sh",
-    }
-)
 
 
 class EventAttachment(BaseModel):
@@ -68,12 +57,7 @@ class DownloadedMedia(BaseModel):
     media_url: str
     content_type: str
     size: int
-    text: str | None = Field(
-        default=None, description="Content of a UTF-8 text file; data_base64 is then null."
-    )
-    data_base64: str | None = Field(
-        default=None, description="Base64 content of any other file; text is then null."
-    )
+    data_base64: str
 
 
 class MatrixMedia:
@@ -169,13 +153,11 @@ class MatrixMedia:
         if attachment is not None and attachment.encryption is not None:
             data = _decrypt(data, attachment.encryption)
             content_type = attachment.mimetype or "application/octet-stream"
-        text = _as_text(data, content_type)
         return DownloadedMedia(
             media_url=media_url,
             content_type=content_type,
             size=len(data),
-            text=text,
-            data_base64=None if text is not None else base64.b64encode(data).decode("ascii"),
+            data_base64=base64.b64encode(data).decode("ascii"),
         )
 
     async def send(  # noqa: PLR0913 - Matrix attachment metadata.
@@ -241,22 +223,6 @@ class MatrixMedia:
             raise RuntimeError(msg)  # noqa: TRY004 - Invalid upstream response.
         quote_matrix_id(event_id, sigil="$", label="event ID")
         return event_id
-
-
-def _as_text(data: bytes, content_type: str) -> str | None:
-    """Return text files as text; agents read them directly instead of decoding base64."""
-    mime = content_type.split(";", 1)[0].strip().lower()
-    textual = (
-        mime.startswith("text/")
-        or mime in _TEXT_APPLICATION_TYPES
-        or mime.endswith(("+json", "+xml"))
-    )
-    if not textual:
-        return None
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
 
 
 def _decrypt(ciphertext: bytes, encryption: dict[str, Any]) -> bytes:
