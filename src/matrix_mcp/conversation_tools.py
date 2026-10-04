@@ -254,7 +254,11 @@ class ConversationTools:
         filename: Filename,
         content_type: ContentType = "application/octet-stream",
     ) -> UploadedMedia:
-        """Upload base64 media only when explicitly requested; accepts no local file path."""
+        """Upload base64 media, such as an avatar image, only when explicitly requested.
+
+        Uploads are stored unencrypted on the homeserver. To share a file in an end-to-end
+        encrypted room, use matrix_send_message with file_path instead (local mode).
+        """
         async with self.client() as client:
             return await client.media.upload(
                 data_base64,
@@ -262,10 +266,26 @@ class ConversationTools:
                 content_type=content_type,
             )
 
-    async def matrix_download_media(self, media_url: MediaURL) -> DownloadedMedia:
-        """Download bounded media from an mxc URI without accepting an HTTP URL or path."""
+    async def matrix_download_media(
+        self,
+        media_url: MediaURL,
+        room_id: RoomID | None = None,
+        event_id: EventID | None = None,
+    ) -> DownloadedMedia:
+        """Download bounded media from an mxc URI without accepting an HTTP URL or path.
+
+        For an encrypted attachment (media.encrypted), also pass the room_id and event_id of
+        its message so the file can be decrypted.
+        """
+        if room_id is None or event_id is None:
+            if room_id is not None or event_id is not None:
+                msg = "Pass room_id and event_id together"
+                raise ValueError(msg)
+            async with self.client() as client:
+                return await client.media.download(media_url)
         async with self.client() as client:
-            return await client.media.download(media_url)
+            attachment = await client.events.attachment(room_id, event_id)
+            return await client.media.download(media_url, attachment=attachment)
 
     async def matrix_send_media(  # noqa: PLR0913 - MCP exposes attachment metadata directly.
         self,
@@ -277,7 +297,10 @@ class ConversationTools:
         thread_id: EventID | None = None,
         transaction_id: TransactionID | None = None,
     ) -> EventActionResult:
-        """Send uploaded media only when explicitly requested, optionally in a thread."""
+        """Send uploaded media only when explicitly requested, optionally in a thread.
+
+        Refuses end-to-end encrypted rooms; use matrix_send_message with file_path there.
+        """
         async with self.client() as client:
             result = await client.media.send(
                 room_id,

@@ -1,21 +1,67 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import Any, ClassVar
 
 import pytest
 import typer
+from filelock import FileLock
 from typer.testing import CliRunner
 
 from matrix_mcp import cli
 from matrix_mcp.auth import LoginResult
 from matrix_mcp.cli import _with_cloudflare_access_header_command, app
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.e2ee import E2EEStatus, E2EEUnavailableError, e2ee_lock_path, e2ee_store_path
 from matrix_mcp.http_headers import HTTPHeaderConfig
 
-if TYPE_CHECKING:
-    from pathlib import Path
+
+class FakeE2EE:
+    instances: ClassVar[list[FakeE2EE]] = []
+    failure: ClassVar[str | None] = None
+
+    def __init__(self, config: MatrixMCPConfig, **kwargs: Any) -> None:
+        del kwargs
+        self.config = config
+        self.imported: tuple[Path, str] | None = None
+        FakeE2EE.instances.append(self)
+
+    async def setup(self) -> E2EEStatus:
+        if FakeE2EE.failure is not None:
+            raise E2EEUnavailableError(FakeE2EE.failure)
+        assert self.config.device_id is not None
+        return E2EEStatus(
+            device_id=self.config.device_id,
+            fingerprint="FINGERPRINT",
+            store_path=Path("store"),
+        )
+
+    async def import_keys(self, path: Path, passphrase: str) -> None:
+        if passphrase != "right":
+            msg = "Could not import room keys: wrong passphrase or invalid key export file"
+            raise ValueError(msg)
+        self.imported = (path, passphrase)
+
+
+@pytest.fixture(autouse=True)
+def fake_e2ee(monkeypatch: pytest.MonkeyPatch) -> type[FakeE2EE]:
+    FakeE2EE.instances.clear()
+    FakeE2EE.failure = None
+    monkeypatch.setattr("matrix_mcp.e2ee.MatrixE2EE", FakeE2EE)
+    return FakeE2EE
+
+
+def write_config(path: Path, *, device_id: str | None = "TESTDEVICE") -> MatrixMCPConfig:
+    config = MatrixMCPConfig(
+        homeserver="https://matrix.example.com",
+        user_id="@alice:example.com",
+        device_id=device_id,
+        access_token="test-token",
+    )
+    config.save(path)
+    return config
 
 
 def test_auth_logout_removes_stored_credentials(tmp_path: Path) -> None:
@@ -607,3 +653,155 @@ def test_auth_providers_reports_empty_provider_list(monkeypatch: pytest.MonkeyPa
 
     assert result.exit_code == 0
     assert "No Matrix SSO providers advertised" in result.output
+
+
+def test_login_sets_up_encryption_for_the_new_device(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--device-id",
+            "TESTDEVICE",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "End-to-end encryption ready for device TESTDEVICE" in result.output
+    assert "FINGERPRINT" in result.output
+    assert FakeE2EE.instances[0].config.device_id == "TESTDEVICE"
+
+
+def test_login_keeps_credentials_when_encryption_setup_fails(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    FakeE2EE.failure = "Matrix rejected this device's encryption keys"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--device-id",
+            "TESTDEVICE",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert MatrixMCPConfig.load(config).access_token == "test-token"
+    assert "Matrix rejected this device's encryption keys" in result.output
+    assert "matrix-mcp e2ee setup" in result.output
+
+
+def test_login_without_device_id_skips_encryption_setup(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert FakeE2EE.instances == []
+    assert "device ID" in result.output
+
+
+def test_e2ee_setup_reports_device_and_failure(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    write_config(config)
+
+    ready = CliRunner().invoke(app, ["e2ee", "setup", "--config", str(config)])
+    FakeE2EE.failure = "store is in use"
+    failed = CliRunner().invoke(app, ["e2ee", "setup", "--config", str(config)])
+
+    assert ready.exit_code == 0
+    assert "TESTDEVICE" in ready.output
+    assert "FINGERPRINT" in ready.output
+    assert failed.exit_code == 1
+    assert "store is in use" in failed.output
+
+
+@pytest.mark.parametrize(("passphrase", "exit_code"), [("right", 0), ("wrong", 1)])
+def test_e2ee_import_keys_uses_prompted_passphrase(
+    tmp_path: Path, passphrase: str, exit_code: int
+) -> None:
+    config = tmp_path / "config.json"
+    write_config(config)
+    export = tmp_path / "element-keys.txt"
+    export.write_text("export", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        ["e2ee", "import-keys", str(export), "--config", str(config)],
+        input=f"{passphrase}\n",
+    )
+
+    assert result.exit_code == exit_code
+    if exit_code == 0:
+        assert FakeE2EE.instances[0].imported == (export, "right")
+        assert "Imported room keys" in result.output
+    else:
+        assert "wrong passphrase" in result.output
+
+
+def test_auth_logout_removes_the_device_encryption_store(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    store = e2ee_store_path(write_config(config))
+    store.mkdir()
+    (store / "keys.db").write_bytes(b"keys")
+
+    result = CliRunner().invoke(app, ["auth", "logout", "--config", str(config)])
+
+    assert result.exit_code == 0
+    assert not config.exists()
+    assert not store.exists()
+    assert "Removed end-to-end encryption keys" in result.output
+    assert "still registered" in result.output
+
+
+def test_auth_logout_waits_for_the_encryption_store_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("matrix_mcp.cli._E2EE_LOCK_TIMEOUT_SECONDS", 0.05)
+    config = tmp_path / "config.json"
+    store = e2ee_store_path(write_config(config))
+    store.mkdir()
+
+    with FileLock(e2ee_lock_path(store)):
+        result = CliRunner().invoke(app, ["auth", "logout", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "in use" in result.output
+    assert config.exists()
+    assert store.exists()
+
+
+@pytest.mark.parametrize("command", ["setup", "import-keys"])
+def test_e2ee_commands_explain_missing_credentials(tmp_path: Path, command: str) -> None:
+    export = tmp_path / "keys.txt"
+    export.write_text("export", encoding="utf-8")
+    arguments = ["e2ee", command, "--config", str(tmp_path / "missing.json")]
+    if command == "import-keys":
+        arguments.insert(2, str(export))
+
+    result = CliRunner().invoke(app, arguments, input="pass\n")
+
+    assert result.exit_code == 1
+    assert "Cannot read Matrix MCP credentials" in result.output

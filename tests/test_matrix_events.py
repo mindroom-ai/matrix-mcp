@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.e2ee import E2EE_UNSUPPORTED, MISSING_ROOM_KEY, DecryptedEvent
 from matrix_mcp.matrix_events import MatrixEvents
 from matrix_mcp.matrix_http import MatrixHTTP
 
@@ -89,8 +90,60 @@ class MatrixEndpoint:
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
 
 
+@dataclass
+class FakeCrypto:
+    """Seals content by name so tests can see exactly what was encrypted."""
+
+    plaintexts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    decrypted: list[str] = field(default_factory=list)
+    encrypted: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
+
+    async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
+        assert room_id == ROOM
+        self.decrypted.append(raw["event_id"])
+        plaintext = self.plaintexts.get(raw["content"].get("ciphertext", ""))
+        if plaintext is None:
+            return DecryptedEvent(raw, MISSING_ROOM_KEY)
+        return DecryptedEvent({**raw, **plaintext})
+
+    async def encrypt(
+        self, room_id: str, event_type: str, content: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        self.encrypted.append((room_id, event_type, content))
+        sealed: dict[str, Any] = {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "sealed"}
+        if "m.relates_to" in content:
+            sealed["m.relates_to"] = content["m.relates_to"]
+        return "m.room.encrypted", sealed
+
+    def seal(  # noqa: PLR0913
+        self,
+        event_id: str,
+        content: dict[str, Any],
+        *,
+        sender: str = "@alice:example.com",
+        timestamp: int = 100,
+        readable: bool = True,
+        unsigned: dict[str, object] | None = None,
+        event_type: str = "m.room.message",
+    ) -> dict[str, Any]:
+        ciphertext = f"cipher-{event_id}"
+        if readable:
+            self.plaintexts[ciphertext] = {"type": event_type, "content": content}
+        outer: dict[str, Any] = {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": ciphertext}
+        if "m.relates_to" in content:
+            outer["m.relates_to"] = content["m.relates_to"]
+        return {
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": timestamp,
+            "type": "m.room.encrypted",
+            "content": outer,
+            "unsigned": unsigned or {},
+        }
+
+
 @pytest.fixture
-async def matrix() -> AsyncIterator[tuple[MatrixEvents, MatrixEndpoint]]:
+async def server_config() -> AsyncIterator[tuple[MatrixMCPConfig, MatrixEndpoint]]:
     endpoint = MatrixEndpoint()
     app = web.Application()
     app.router.add_route("*", "/{path:.*}", endpoint.handle)
@@ -101,7 +154,24 @@ async def matrix() -> AsyncIterator[tuple[MatrixEvents, MatrixEndpoint]]:
             device_id="TESTDEVICE",
             access_token="test-token",
         )
-        yield MatrixEvents(MatrixHTTP(config)), endpoint
+        yield config, endpoint
+
+
+@pytest.fixture
+def matrix(
+    server_config: tuple[MatrixMCPConfig, MatrixEndpoint],
+) -> tuple[MatrixEvents, MatrixEndpoint]:
+    config, endpoint = server_config
+    return MatrixEvents(MatrixHTTP(config)), endpoint
+
+
+@pytest.fixture
+def encrypted_matrix(
+    server_config: tuple[MatrixMCPConfig, MatrixEndpoint],
+) -> tuple[MatrixEvents, MatrixEndpoint, FakeCrypto]:
+    config, endpoint = server_config
+    crypto = FakeCrypto()
+    return MatrixEvents(MatrixHTTP(config), crypto=crypto), endpoint, crypto
 
 
 async def test_history_preserves_cursor_and_attachment(
@@ -145,6 +215,7 @@ async def test_history_preserves_cursor_and_attachment(
         "width": None,
         "height": None,
         "duration_ms": None,
+        "encrypted": False,
     }
     assert endpoint.requests[0]["query"] == {
         "dir": "b",
@@ -263,7 +334,7 @@ async def test_history_ignores_forged_and_redacted_replacements_and_discloses_tr
         unsigned={"m.relations": {"m.replace": {"sender": "@mallory:example.com"}}},
     )
     endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [original]})
-    relation_path = f"{RELATIONS_PATH}/$original/m.replace/m.room.message"
+    relation_path = f"{RELATIONS_PATH}/$original/m.replace"
     forged = message(
         "$forged",
         sender="@mallory:example.com",
@@ -714,3 +785,380 @@ async def test_invalid_inputs_are_rejected_before_http(
             await getattr(events, method)(*args)
 
     assert endpoint.requests == []
+
+
+THREAD = {"rel_type": "m.thread", "event_id": "$root"}
+ENCRYPTION_STATE = {"algorithm": "m.megolm.v1.aes-sha2"}
+
+
+async def test_history_decrypts_messages_and_reports_missing_room_keys(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    readable = crypto.seal(
+        "$secret", {"msgtype": "m.text", "body": "secret", "m.relates_to": THREAD}
+    )
+    unreadable = crypto.seal(
+        "$unknown", {"msgtype": "m.text", "body": "hidden", "m.relates_to": THREAD}, readable=False
+    )
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/messages",
+        {"chunk": [readable, unreadable, message("$plain", body="plain")]},
+    )
+
+    page = await events.history(ROOM, limit=3)
+
+    secret, unknown, plain = page.events
+    assert (secret.type, secret.body, secret.thread_id) == ("m.room.message", "secret", "$root")
+    assert (secret.encrypted, secret.decryption_error) == (True, None)
+    assert (unknown.type, unknown.body, unknown.thread_id) == ("m.room.encrypted", None, "$root")
+    assert (unknown.encrypted, unknown.decryption_error) == (True, MISSING_ROOM_KEY)
+    assert (plain.encrypted, plain.decryption_error) == (False, None)
+    assert crypto.decrypted == ["$secret", "$unknown"]
+
+
+async def test_history_applies_encrypted_replacement_from_the_same_page(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    original = crypto.seal("$original", {"msgtype": "m.text", "body": "draft"})
+    edit = crypto.seal(
+        "$edit",
+        {
+            "msgtype": "m.text",
+            "body": "* final",
+            "m.new_content": {"msgtype": "m.text", "body": "final"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+        },
+        timestamp=200,
+    )
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [edit, original]})
+
+    page = await events.history(ROOM, limit=2)
+
+    assert [event.event_id for event in page.events] == ["$original"]
+    assert page.events[0].body == "final"
+    assert page.events[0].edited is True
+    assert page.events[0].encrypted is True
+
+
+async def test_history_recovers_encrypted_replacement_through_untyped_relations(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    original = crypto.seal(
+        "$original",
+        {"msgtype": "m.text", "body": "draft"},
+        unsigned={"m.relations": {"m.replace": {"event_id": "$edit"}}},
+    )
+    edit = crypto.seal(
+        "$edit",
+        {
+            "msgtype": "m.text",
+            "body": "* final",
+            "m.new_content": {"msgtype": "m.text", "body": "final"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+        },
+        timestamp=200,
+    )
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [original]})
+    endpoint.respond("GET", f"{RELATIONS_PATH}/$original/m.replace", {"chunk": [edit]})
+
+    page = await events.history(ROOM)
+
+    assert page.events[0].body == "final"
+    assert page.events[0].edited is True
+    assert crypto.decrypted == ["$original", "$edit"]
+
+
+async def test_plaintext_history_never_uses_crypto(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [message("$plain")]})
+
+    await events.history(ROOM)
+
+    assert crypto.decrypted == []
+
+
+async def test_context_decrypts_every_section(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/context/$target",
+        {
+            "event": crypto.seal("$target", {"msgtype": "m.text", "body": "target"}),
+            "events_before": [crypto.seal("$before", {"msgtype": "m.text", "body": "before"})],
+            "events_after": [crypto.seal("$after", {"msgtype": "m.text", "body": "after"})],
+        },
+    )
+
+    context = await events.context(ROOM, "$target", limit=2)
+
+    assert context.event.body == "target"
+    assert [event.body for event in context.events_before] == ["before"]
+    assert [event.body for event in context.events_after] == ["after"]
+    assert all(
+        event.encrypted for event in [context.event, *context.events_before, *context.events_after]
+    )
+
+
+async def test_encrypted_events_without_crypto_say_encryption_is_unavailable(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    sealed = FakeCrypto().seal("$secret", {"msgtype": "m.text", "body": "secret"})
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [sealed]})
+
+    page = await events.history(ROOM)
+
+    assert page.events[0].type == "m.room.encrypted"
+    assert page.events[0].body is None
+    assert page.events[0].decryption_error == E2EE_UNSUPPORTED
+
+
+@pytest.mark.parametrize("action", ["reply", "react", "edit"])
+async def test_actions_in_encrypted_rooms_send_only_ciphertext(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto], action: str
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/event/$target",
+        crypto.seal("$target", {"msgtype": "m.text", "body": "mine"}),
+    )
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.encrypted/txn", {"event_id": "$sent"})
+
+    if action == "reply":
+        event_id = await events.reply(ROOM, "$target", "answer", transaction_id="txn")
+    elif action == "react":
+        event_id = await events.react(ROOM, "$target", "👍", transaction_id="txn")
+    else:
+        event_id = await events.edit(ROOM, "$target", "fixed", transaction_id="txn")
+
+    assert event_id == "$sent"
+    [(room_id, event_type, content)] = crypto.encrypted
+    assert room_id == ROOM
+    expected_type = "m.reaction" if action == "react" else "m.room.message"
+    assert event_type == expected_type
+    if action == "edit":
+        assert content["m.new_content"] == {"msgtype": "m.text", "body": "fixed"}
+    put = endpoint.requests[-1]
+    assert put["path"] == f"{ROOM_PATH}/send/m.room.encrypted/txn"
+    assert put["body"]["ciphertext"] == "sealed"
+    assert "answer" not in str(put["body"])
+    assert "fixed" not in str(put["body"])
+
+
+async def test_send_encrypts_arbitrary_events_for_encrypted_rooms(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.encrypted/txn", {"event_id": "$sent"})
+
+    event_id = await events.send(
+        ROOM, "m.room.message", {"msgtype": "m.text", "body": "hi"}, transaction_id="txn"
+    )
+
+    assert event_id == "$sent"
+    assert crypto.encrypted == [(ROOM, "m.room.message", {"msgtype": "m.text", "body": "hi"})]
+
+
+async def test_send_to_plaintext_room_does_not_encrypt(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.message/txn", {"event_id": "$sent"})
+
+    await events.send(ROOM, "m.room.message", {"body": "hi"}, transaction_id="txn")
+
+    assert crypto.encrypted == []
+    assert endpoint.requests[-1]["body"] == {"body": "hi"}
+
+
+async def test_edit_refuses_an_undecryptable_target(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/event/$target",
+        crypto.seal("$target", {"msgtype": "m.text", "body": "mine"}, readable=False),
+    )
+
+    with pytest.raises(ValueError, match=MISSING_ROOM_KEY):
+        await events.edit(ROOM, "$target", "fixed")
+
+    assert crypto.encrypted == []
+    assert all(request["method"] == "GET" for request in endpoint.requests)
+
+
+ENCRYPTED_FILE = {
+    "url": "mxc://example.com/sealed",
+    "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": "secret-key", "key_ops": []},
+    "iv": "iv",
+    "hashes": {"sha256": "hash"},
+    "v": "v2",
+}
+ENCRYPTED_IMAGE = {
+    "msgtype": "m.image",
+    "body": "photo.png",
+    "file": ENCRYPTED_FILE,
+    "info": {"mimetype": "image/png", "size": 3},
+}
+
+
+async def test_history_reports_encrypted_attachments_without_keys(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond(
+        "GET", f"{ROOM_PATH}/messages", {"chunk": [crypto.seal("$photo", ENCRYPTED_IMAGE)]}
+    )
+
+    page = await events.history(ROOM)
+
+    media = page.events[0].media
+    assert media is not None
+    assert media.url == "mxc://example.com/sealed"
+    assert media.encrypted is True
+    assert "secret-key" not in page.model_dump_json()
+
+
+async def test_attachment_returns_decryption_info_for_encrypted_media(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$photo", crypto.seal("$photo", ENCRYPTED_IMAGE))
+
+    attachment = await events.attachment(ROOM, "$photo")
+
+    assert attachment.url == "mxc://example.com/sealed"
+    assert attachment.mimetype == "image/png"
+    assert attachment.encryption == ENCRYPTED_FILE
+
+
+async def test_attachment_reads_plaintext_media(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    photo = message("$photo", msgtype="m.image", body="photo.png")
+    photo["content"].update({"url": "mxc://example.com/photo", "info": {"mimetype": "image/png"}})
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$photo", photo)
+
+    attachment = await events.attachment(ROOM, "$photo")
+
+    assert attachment.url == "mxc://example.com/photo"
+    assert attachment.encryption is None
+
+
+async def test_attachment_rejects_events_without_media(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$text", message("$text"))
+
+    with pytest.raises(ValueError, match="no attachment"):
+        await events.attachment(ROOM, "$text")
+
+
+async def test_plaintext_replacements_cannot_edit_encrypted_messages(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    in_page = crypto.seal("$in-page", {"msgtype": "m.text", "body": "kept"})
+    recovered = crypto.seal(
+        "$recovered",
+        {"msgtype": "m.text", "body": "also kept"},
+        unsigned={"m.relations": {"m.replace": {"event_id": "$forged-2"}}},
+    )
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/messages",
+        {
+            "chunk": [
+                replacement("$forged-1", target="$in-page", body="forged", timestamp=300),
+                in_page,
+                recovered,
+            ]
+        },
+    )
+    endpoint.respond(
+        "GET",
+        f"{RELATIONS_PATH}/$recovered/m.replace",
+        {"chunk": [replacement("$forged-2", target="$recovered", body="forged", timestamp=300)]},
+    )
+
+    page = await events.history(ROOM, limit=3)
+
+    assert [(event.body, event.edited) for event in page.events] == [
+        ("kept", False),
+        ("also kept", False),
+    ]
+
+
+async def test_undecryptable_messages_skip_the_edit_lookup(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    sealed = crypto.seal(
+        "$sealed",
+        {"msgtype": "m.text", "body": "hidden"},
+        readable=False,
+        unsigned={"m.relations": {"m.replace": {"event_id": "$edit"}}},
+    )
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [sealed]})
+
+    page = await events.history(ROOM)
+
+    assert page.events[0].decryption_error == MISSING_ROOM_KEY
+    assert page.edit_resolution_truncated is False
+    assert not any("/relations/" in request["path"] for request in endpoint.requests)
+
+
+async def test_replacement_trust_follows_decryption_not_event_ids(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    original = crypto.seal("$original", {"msgtype": "m.text", "body": "draft"})
+    real_edit = crypto.seal(
+        "$edit",
+        {
+            "msgtype": "m.text",
+            "body": "* real",
+            "m.new_content": {"msgtype": "m.text", "body": "real"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+        },
+        timestamp=200,
+    )
+    forged = replacement("$edit", target="$original", body="forged", timestamp=300)
+    forged["matrix_mcp.decrypted"] = True
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [forged, real_edit, original]})
+
+    page = await events.history(ROOM, limit=3)
+
+    assert [event.body for event in page.events] == ["real"]
+
+
+async def test_undecryptable_reactions_are_recognizable_without_their_content(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    reaction = crypto.seal(
+        "$reaction",
+        {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$message", "key": "👍"}},
+        event_type="m.reaction",
+        readable=False,
+    )
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [reaction]})
+
+    page = await events.history(ROOM)
+
+    assert page.events[0].relation_type == "m.annotation"
+    assert "relation_type" not in page.events[0].model_dump()

@@ -12,11 +12,17 @@ from urllib.parse import urlsplit
 import typer
 
 if TYPE_CHECKING:
+    from matrix_mcp.config import MatrixMCPConfig
+    from matrix_mcp.e2ee import E2EEStatus
     from matrix_mcp.http_headers import HTTPHeaderConfig
+
+_E2EE_LOCK_TIMEOUT_SECONDS = 60.0
 
 app = typer.Typer(no_args_is_help=True)
 auth_app = typer.Typer(no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
+e2ee_app = typer.Typer(no_args_is_help=True, help="Manage end-to-end encryption for this device.")
+app.add_typer(e2ee_app, name="e2ee")
 
 
 @app.command()
@@ -94,15 +100,17 @@ def auth_token(
 
     config_path = _resolve_config_path(config)
     header_config = _http_header_config(header, header_command)
-    MatrixMCPConfig(
+    saved = MatrixMCPConfig(
         homeserver=homeserver.rstrip("/"),
         user_id=user_id,
         device_id=device_id,
         access_token=access_token,
         http_headers=header_config.headers,
         http_header_commands=header_config.commands,
-    ).save(config_path)
+    )
+    saved.save(config_path)
     typer.echo(f"Saved Matrix MCP credentials to {config_path}")
+    _setup_e2ee(saved)
 
 
 @auth_app.command("password")
@@ -133,8 +141,10 @@ def auth_password(
             header_config=header_config,
         ),
     )
-    result.to_config().save(config_path)
+    saved = result.to_config()
+    saved.save(config_path)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
+    _setup_e2ee(saved)
 
 
 @auth_app.command("sso-url")
@@ -237,8 +247,10 @@ def auth_sso(
         )
     finally:
         callback.close()
-    result.to_config().save(config_path)
+    saved = result.to_config()
+    saved.save(config_path)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
+    _setup_e2ee(saved)
 
 
 @auth_app.command("login-token")
@@ -267,8 +279,10 @@ def auth_login_token(
             header_config=header_config,
         ),
     )
-    result.to_config().save(config_path)
+    saved = result.to_config()
+    saved.save(config_path)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
+    _setup_e2ee(saved)
 
 
 @auth_app.command("logout")
@@ -276,12 +290,133 @@ def auth_logout(
     config: Path | None = typer.Option(None, "--config", help="Config file to remove"),
 ) -> None:
     """Remove stored Matrix MCP credentials."""
+    from filelock import FileLock, Timeout
+
+    from matrix_mcp.e2ee import e2ee_lock_path
+
     config_path = _resolve_config_path(config)
-    if config_path.exists():
+    if not config_path.exists():
+        typer.echo(f"No Matrix MCP credentials found at {config_path}")
+        return
+    store = _e2ee_store_for(config_path)
+    if store is None:
         config_path.unlink()
         typer.echo(f"Removed Matrix MCP credentials from {config_path}")
         return
-    typer.echo(f"No Matrix MCP credentials found at {config_path}")
+    # Take the store lock so no tool call is using the keys while they are deleted.
+    try:
+        with FileLock(e2ee_lock_path(store), timeout=_E2EE_LOCK_TIMEOUT_SECONDS):
+            config_path.unlink()
+            typer.echo(f"Removed Matrix MCP credentials from {config_path}")
+            if store.exists():
+                shutil.rmtree(store)
+                typer.echo(f"Removed end-to-end encryption keys from {store}")
+                typer.echo(
+                    "The device is still registered on the homeserver but can no longer use "
+                    "end-to-end encryption; log in again to get a new device."
+                )
+    except Timeout as exc:
+        typer.echo(
+            "The end-to-end encryption store is in use by a matrix-mcp tool call; "
+            "nothing was removed. Retry the logout.",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
+
+
+@e2ee_app.command("setup")
+def e2ee_setup(
+    config: Path | None = typer.Option(None, "--config", help="Config file to read"),
+) -> None:
+    """Publish this device's encryption keys and show its fingerprint."""
+    from matrix_mcp.e2ee import MatrixE2EE
+
+    settings = _load_credentials(config)
+    try:
+        status = asyncio.run(MatrixE2EE(settings).setup())
+    except RuntimeError as exc:
+        typer.echo(f"End-to-end encryption is unavailable: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_e2ee_status(status)
+
+
+@e2ee_app.command("import-keys")
+def e2ee_import_keys(
+    file: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Room key export file from another Matrix client",
+    ),
+    passphrase: str = typer.Option(
+        ..., prompt=True, hide_input=True, help="Passphrase that protects the export"
+    ),
+    config: Path | None = typer.Option(None, "--config", help="Config file to read"),
+) -> None:
+    """Import exported room keys so older encrypted messages can be read."""
+    from matrix_mcp.e2ee import MatrixE2EE
+
+    settings = _load_credentials(config)
+    try:
+        asyncio.run(MatrixE2EE(settings).import_keys(file, passphrase))
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Imported room keys from {file}")
+
+
+def _setup_e2ee(config: MatrixMCPConfig) -> None:
+    """Publish device keys right after login so senders start sharing room keys."""
+    from matrix_mcp.e2ee import MatrixE2EE
+
+    if not config.device_id:
+        typer.echo(
+            "Skipped end-to-end encryption setup: the credentials have no device ID.",
+            err=True,
+        )
+        return
+    try:
+        status = asyncio.run(MatrixE2EE(config).setup())
+    except RuntimeError as exc:
+        typer.echo(f"Warning: end-to-end encryption is unavailable: {exc}", err=True)
+        typer.echo(
+            "Unencrypted rooms still work. Retry with `matrix-mcp e2ee setup`.",
+            err=True,
+        )
+        return
+    _echo_e2ee_status(status)
+
+
+def _echo_e2ee_status(status: E2EEStatus) -> None:
+    typer.echo(f"End-to-end encryption ready for device {status.device_id}")
+    typer.echo(f"Device fingerprint (ed25519): {status.fingerprint}")
+
+
+def _load_credentials(config: Path | None) -> MatrixMCPConfig:
+    from pydantic import ValidationError
+
+    from matrix_mcp.config import MatrixMCPConfig
+
+    config_path = _resolve_config_path(config)
+    try:
+        return MatrixMCPConfig.load(config_path)
+    except (OSError, ValueError, ValidationError) as exc:
+        typer.echo(f"Cannot read Matrix MCP credentials from {config_path}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def _e2ee_store_for(config_path: Path) -> Path | None:
+    from pydantic import ValidationError
+
+    from matrix_mcp.config import MatrixMCPConfig
+    from matrix_mcp.e2ee import e2ee_store_path
+
+    try:
+        config = MatrixMCPConfig.load(config_path)
+    except (OSError, ValueError, ValidationError):
+        return None
+    return e2ee_store_path(config) if config.user_id and config.device_id else None
 
 
 def _resolve_config_path(config: Path | None) -> Path:

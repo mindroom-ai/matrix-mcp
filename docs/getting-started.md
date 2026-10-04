@@ -110,6 +110,9 @@ If that machine is remote — an SSH session, a VM, a container — a browser on
 
     Then copy the file printed by `config-path` to the path that `matrix-mcp config-path` prints on the remote machine, creating the directory if needed.
 
+    Encrypted rooms do not work with copied credentials: the device's encryption keys stay on the machine that logged in, and the remote machine refuses to publish new ones for the same device.
+    Use one of the other methods when you need encrypted rooms on the remote machine.
+
 ### Existing Matrix Access Token
 
 ```bash
@@ -121,6 +124,18 @@ matrix-mcp auth token https://mindroom.chat @alice:mindroom.chat "$MATRIX_ACCESS
 ```bash
 matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
 ```
+
+### End-to-End Encryption
+
+SSO, password, and login-token logins create a new Matrix device for Matrix MCP and publish its encryption keys, so encrypted rooms work from the start.
+`auth token` reuses the device that the access token belongs to; encryption then works only if no other client has published keys for that device.
+Messages sent before the login cannot be decrypted unless you import room keys exported from another client:
+
+```bash
+matrix-mcp e2ee import-keys element-keys.txt
+```
+
+See [End-to-End Encryption](usage.md#end-to-end-encryption) for details.
 
 ## Configure an MCP Client
 

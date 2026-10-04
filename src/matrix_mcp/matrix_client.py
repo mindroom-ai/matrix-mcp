@@ -26,25 +26,31 @@ from nio import (
     RoomInviteResponse,
     RoomMessagesResponse,
     RoomPutStateResponse,
-    RoomSendResponse,
     UploadResponse,
 )
 from nio.api import RelationshipType
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.e2ee import MatrixE2EE
 from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.id_state import MatrixIdStore
 from matrix_mcp.matrix_events import (
     MatrixEvents,
     MediaMetadata,
     TimelineEvent,
+    is_decrypted,
+    mark_encryption,
     normalize_timeline_event,
+    trusted_replacements,
 )
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_media import MatrixMedia
 from matrix_mcp.matrix_rooms import MatrixRooms
 from matrix_mcp.tls import default_ssl_context
+
+# Thread and recent reads keep undecryptable messages so agents know they exist.
+_THREAD_MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted"})
 
 
 class MatrixRoom(BaseModel):
@@ -101,6 +107,16 @@ class MatrixEvent(BaseModel):
     media: MediaMetadata | None = None
     edited: bool = False
     redacted: bool = False
+    encrypted: bool = Field(
+        default=False, description="Whether the event was end-to-end encrypted."
+    )
+    decryption_error: str | None = Field(
+        default=None,
+        description=(
+            "Why an encrypted event could not be decrypted; its body is then null. "
+            "'missing room key': this device never received the message's key."
+        ),
+    )
 
 
 class MatrixDriver(Protocol):
@@ -157,15 +173,17 @@ class MatrixDriver(Protocol):
 
 
 class NioMatrixDriver:
-    def __init__(self, config: MatrixMCPConfig) -> None:
+    def __init__(self, config: MatrixMCPConfig, *, e2ee: bool = True) -> None:
         token = config.access_token_value()
         if not token or not config.user_id or not config.device_id:
             msg = "Matrix credentials are incomplete. Run `matrix-mcp auth` first."
             raise RuntimeError(msg)
         self._config = config
+        # The crypto session opens lazily, only when an encrypted room needs it.
+        self.crypto = MatrixE2EE(config) if e2ee else None
         self.http = MatrixHTTP(config)
-        self.events = MatrixEvents(self.http)
-        self.rooms = MatrixRooms(self.http)
+        self.events = MatrixEvents(self.http, crypto=self.crypto)
+        self.rooms = MatrixRooms(self.http, crypto=self.crypto)
         self.media = MatrixMedia(self.http)
         self._client = AsyncClient(
             config.normalized_homeserver,
@@ -188,7 +206,11 @@ class NioMatrixDriver:
         )
 
     async def close(self) -> None:
-        await self._client.close()
+        try:
+            await self._client.close()
+        finally:
+            if self.crypto is not None:
+                await self.crypto.aclose()
 
     async def whoami(self) -> dict[str, str | None]:
         return {"user_id": self._config.user_id, "device_id": self._config.device_id}
@@ -385,11 +407,11 @@ class NioMatrixDriver:
                 raw_events.append((root, False))
 
         reply_count = 0
+        # No event type filter: encrypted replies have type m.room.encrypted.
         async for raw in self._client.room_get_event_relations(
             room_id,
             thread_id,
             rel_type=RelationshipType.thread,
-            event_type="m.room.message",
             direction=MessageDirection.back,
             limit=max_replies,
         ):
@@ -400,20 +422,31 @@ class NioMatrixDriver:
             if reply_count >= max_replies:
                 break
 
+        decrypted, encryption = await self.events.decrypt_raw(
+            room_id, [raw for raw, _ in raw_events]
+        )
         events: list[MatrixEvent] = []
-        for raw, is_reply in raw_events:
-            event = await self._event_with_latest_edit(room_id, raw, page_size=max_replies)
+        for raw, (_, is_reply) in zip(decrypted, raw_events, strict=True):
+            if is_reply and raw.get("type") not in _THREAD_MESSAGE_TYPES:
+                continue
+            timeline = await self._event_with_latest_edit(
+                room_id,
+                raw,
+                page_size=max_replies,
+                encrypted=is_decrypted(raw),
+            )
+            event = _event_from_timeline(mark_encryption(timeline, encryption))
             if is_reply and event.thread_id is None:
                 event = event.model_copy(update={"thread_id": thread_id})
             events.append(event)
         return sorted(events, key=_event_sort_key)
 
     async def _event_with_latest_edit(
-        self, room_id: str, raw: dict[str, Any], *, page_size: int
-    ) -> MatrixEvent:
+        self, room_id: str, raw: dict[str, Any], *, page_size: int, encrypted: bool
+    ) -> TimelineEvent:
         event = normalize_timeline_event(room_id, raw)
-        if event.edited or event.redacted:
-            return _event_from_timeline(event)
+        if event.edited or event.redacted or event.type == "m.room.encrypted":
+            return event
 
         latest: tuple[tuple[int, str], TimelineEvent] | None = None
         scanned = 0
@@ -421,11 +454,16 @@ class NioMatrixDriver:
             room_id,
             event.event_id,
             rel_type=RelationshipType.replacement,
-            event_type="m.room.message",
             direction=MessageDirection.back,
             limit=page_size,
         ):
             replacement_source = _source_from_nio(replacement)
+            if replacement_source is not None:
+                [replacement_source], _ = await self.events.decrypt_raw(
+                    room_id, [replacement_source]
+                )
+                if not trusted_replacements([replacement_source], original_encrypted=encrypted):
+                    replacement_source = None
             if replacement_source is not None:
                 updated = normalize_timeline_event(
                     room_id,
@@ -443,7 +481,7 @@ class NioMatrixDriver:
             if scanned >= page_size:
                 break
 
-        return _event_from_timeline(event if latest is None else latest[1])
+        return event if latest is None else latest[1]
 
     async def send_message(
         self,
@@ -470,11 +508,7 @@ class NioMatrixDriver:
                 "is_falling_back": False,
                 "rel_type": "m.thread",
             }
-        response = await self._client.room_send(room_id, "m.room.message", content)
-        if isinstance(response, RoomSendResponse):
-            return cast("str", response.event_id)
-        msg = f"Matrix room_send failed: {response}"
-        raise RuntimeError(msg)
+        return await self.events.send(room_id, "m.room.message", content)
 
     async def send_file(
         self,
@@ -490,15 +524,18 @@ class NioMatrixDriver:
         resolved_content_type = content_type or mimetypes.guess_type(display_name)[0]
         resolved_content_type = resolved_content_type or "application/octet-stream"
         size = (await path.stat()).st_size
+        encrypted = await self.http.room_is_encrypted(room_id)
 
         def upload_path(_got_429: int, _got_timeouts: int) -> str:
             return str(path)
 
-        upload_response, _decryption_info = await self._client.upload(
+        # Encrypted uploads hide the file name (nio also hides the type) from the homeserver.
+        upload_response, encryption = await self._client.upload(
             upload_path,
             content_type=resolved_content_type,
-            filename=display_name,
+            filename=None if encrypted else display_name,
             filesize=size,
+            encrypt=encrypted,
         )
         if isinstance(upload_response, UploadResponse):
             content = _file_message_content(
@@ -507,17 +544,14 @@ class NioMatrixDriver:
                 content_type=resolved_content_type,
                 size=size,
                 thread_id=thread_id,
+                encryption=encryption,
             )
-            response = await self._client.room_send(room_id, "m.room.message", content)
-            if isinstance(response, RoomSendResponse):
-                return cast("str", response.event_id)
-            msg = f"Matrix room_send failed: {response}"
-            raise RuntimeError(msg)
+            return await self.events.send(room_id, "m.room.message", content)
         msg = f"Matrix media upload failed: {upload_response}"
         raise RuntimeError(msg)
 
     async def aclose(self) -> None:
-        await self._client.close()
+        await self.close()
 
 
 class MatrixAPIClient:
@@ -605,7 +639,7 @@ class MatrixAPIClient:
             events = [
                 _event_from_timeline(event)
                 for event in page.events
-                if event.type == "m.room.message"
+                if event.type in _THREAD_MESSAGE_TYPES and not _is_sealed_reaction(event)
             ]
         else:
             events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
@@ -750,20 +784,27 @@ def _event_from_timeline(event: TimelineEvent) -> MatrixEvent:
         media=event.media,
         edited=event.edited,
         redacted=event.redacted,
+        encrypted=event.encrypted,
+        decryption_error=event.decryption_error,
     )
+
+
+def _is_sealed_reaction(event: TimelineEvent) -> bool:
+    return event.type == "m.room.encrypted" and event.relation_type == "m.annotation"
 
 
 def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:
     return (event.timestamp_ms if event.timestamp_ms is not None else -1, event.event_id)
 
 
-def _file_message_content(
+def _file_message_content(  # noqa: PLR0913 - Matrix attachment metadata.
     *,
     content_uri: str,
     filename: str,
     content_type: str,
     size: int,
     thread_id: str | None,
+    encryption: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     content: dict[str, object] = {
         "body": filename,
@@ -773,8 +814,11 @@ def _file_message_content(
             "size": size,
         },
         "msgtype": "m.file",
-        "url": content_uri,
     }
+    if encryption is None:
+        content["url"] = content_uri
+    else:
+        content["file"] = {"url": content_uri, **encryption}
     if thread_id:
         content["m.relates_to"] = {
             "event_id": thread_id,

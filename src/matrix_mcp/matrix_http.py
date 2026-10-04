@@ -137,17 +137,17 @@ class MatrixHTTP:
         msg = "Matrix API request exhausted its retry budget"
         raise RuntimeError(msg)
 
-    async def require_unencrypted(self, room_id: str) -> None:
+    async def room_is_encrypted(self, room_id: str) -> bool:
+        """Report room encryption; only a definitive missing state event means plaintext."""
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         path = f"/_matrix/client/v3/rooms/{room}/state/m.room.encryption"
         try:
             await self.json("GET", path)
         except MatrixHTTPError as exc:
             if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
-                return
+                return False
             raise
-        msg = "Plaintext sends are not supported in encrypted Matrix rooms"
-        raise RuntimeError(msg)
+        return True
 
 
 def quote_matrix_id(value: str, *, sigil: str, label: str) -> str:

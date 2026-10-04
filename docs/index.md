@@ -37,6 +37,7 @@ Continue with [Getting Started](getting-started.md), or see the [usage guide](us
 - Access-gateway support with static headers or command-generated headers.
 - MCP tools for room listing, recent messages, thread reads, thread replies, and file attachments.
 - Stable numeric refs for rooms and events so agents do not need to copy raw Matrix IDs between tool calls.
+- End-to-end encryption in stdio mode: encrypted rooms are read and written like any other room; older history needs imported room keys.
 - Local credential storage in the user config directory.
 
 ## Tool Surface

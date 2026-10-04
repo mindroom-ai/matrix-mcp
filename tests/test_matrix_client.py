@@ -19,6 +19,7 @@ from nio import (
 from nio.api import RelationshipType
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.e2ee import DecryptedEvent
 from matrix_mcp.id_state import MatrixIdStore
 from matrix_mcp.matrix_client import MatrixAPIClient, MatrixEvent, MatrixRoom, NioMatrixDriver
 from matrix_mcp.matrix_events import HistoryPage, MatrixEvents, MediaMetadata, TimelineEvent
@@ -154,6 +155,77 @@ def edit_event(
     )
 
 
+def record_sends(
+    driver: NioMatrixDriver,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    encrypted: bool = False,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Capture the driver's room sends instead of performing HTTP requests."""
+    sends: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def room_is_encrypted(room_id: str) -> bool:
+        del room_id
+        return encrypted
+
+    async def send(
+        room_id: str,
+        event_type: str,
+        content: dict[str, Any],
+        *,
+        transaction_id: str | None = None,
+    ) -> str:
+        del transaction_id
+        sends.append((room_id, event_type, content))
+        return f"$sent{len(sends)}"
+
+    monkeypatch.setattr(driver.http, "room_is_encrypted", room_is_encrypted)
+    monkeypatch.setattr(driver.events, "send", send)
+    return sends
+
+
+class FakeCrypto:
+    instances: ClassVar[list[FakeCrypto]] = []
+
+    def __init__(self, config: MatrixMCPConfig) -> None:
+        self.config = config
+        self.closed = False
+        FakeCrypto.instances.append(self)
+
+    async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
+        del room_id
+        plaintext = raw["content"].get("ciphertext")
+        if plaintext is None:
+            return DecryptedEvent(raw, "missing room key")
+        content = {"msgtype": "m.text", "body": plaintext, **raw["content"]}
+        del content["ciphertext"]
+        return DecryptedEvent({**raw, "type": "m.room.message", "content": content})
+
+    async def encrypt(
+        self, room_id: str, event_type: str, content: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        raise AssertionError((room_id, event_type, content))
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def sealed_reply(event_id: str, body: str | None, *, timestamp_ms: int) -> dict[str, Any]:
+    content: dict[str, Any] = {
+        "algorithm": "m.megolm.v1.aes-sha2",
+        "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+    }
+    if body is not None:
+        content["ciphertext"] = body
+    return {
+        "event_id": event_id,
+        "sender": "@bob:example.com",
+        "origin_server_ts": timestamp_ms,
+        "type": "m.room.encrypted",
+        "content": content,
+    }
+
+
 class FakeNioClient:
     instances: ClassVar[list[FakeNioClient]] = []
 
@@ -271,9 +343,10 @@ class FakeNioClient:
         file: object,
         *,
         content_type: str,
-        filename: str,
+        filename: str | None,
         filesize: int,
-    ) -> tuple[UploadResponse, None]:
+        encrypt: bool = False,
+    ) -> tuple[UploadResponse, dict[str, Any] | None]:
         if callable(file):
             provider = cast("Callable[[int, int], str]", file)
             content = await AsyncPath(provider(0, 0)).read_bytes()
@@ -284,8 +357,10 @@ class FakeNioClient:
             "content_type": content_type,
             "filename": filename,
             "filesize": filesize,
+            "encrypt": encrypt,
         }
-        return UploadResponse("mxc://example.com/report"), None
+        keys = {"v": "v2", "key": {"k": "secret-key"}, "iv": "iv", "hashes": {"sha256": "hash"}}
+        return UploadResponse("mxc://example.com/report"), keys if encrypt else None
 
     async def close(self) -> None:
         self.closed = True
@@ -311,6 +386,7 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         )
     )
     nio_client = FakeNioClient.instances[0]
+    sends = record_sends(driver, monkeypatch)
 
     assert nio_client.homeserver == "https://matrix.example.com"
     assert nio_client.user_id == "@alice:example.com"
@@ -366,14 +442,13 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         "room_id": "!room:example.com",
         "event_id": "$root",
         "rel_type": RelationshipType.thread,
-        "event_type": "m.room.message",
         "direction": MessageDirection.back,
         "limit": 100,
     }
 
     sent_id = await driver.send_message("!room:example.com", "hi", thread_id="$root")
     assert sent_id == "$sent1"
-    assert nio_client.room_send_calls[-1] == (
+    assert sends[-1] == (
         "!room:example.com",
         "m.room.message",
         {
@@ -394,10 +469,10 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         mentions=["@alice:example.com", "@helper:example.com"],
     )
     assert mentioned_id == "$sent2"
-    content = cast("dict[str, Any]", nio_client.room_send_calls[-1][2])
-    assert content["m.mentions"] == {"user_ids": ["@alice:example.com", "@helper:example.com"]}
-    assert content["m.relates_to"]["rel_type"] == "m.thread"
-    assert content["m.relates_to"]["event_id"] == "$root"
+    mentioned: dict[str, Any] = sends[-1][2]
+    assert mentioned["m.mentions"] == {"user_ids": ["@alice:example.com", "@helper:example.com"]}
+    assert mentioned["m.relates_to"]["rel_type"] == "m.thread"
+    assert mentioned["m.relates_to"]["event_id"] == "$root"
 
     file_event_id = await driver.send_file("!room:example.com", str(path), thread_id="$root")
     assert file_event_id == "$sent3"
@@ -406,8 +481,9 @@ async def test_nio_driver_uses_matrix_client_for_room_and_message_operations(
         "content_type": "text/plain",
         "filename": "report.txt",
         "filesize": 5,
+        "encrypt": False,
     }
-    assert nio_client.room_send_calls[-1] == (
+    assert sends[-1] == (
         "!room:example.com",
         "m.room.message",
         {
@@ -487,7 +563,6 @@ async def test_nio_driver_applies_latest_thread_message_edits(
             "room_id": "!room:example.com",
             "event_id": "$root",
             "rel_type": RelationshipType.replacement,
-            "event_type": "m.room.message",
             "direction": MessageDirection.back,
             "limit": 25,
         },
@@ -495,7 +570,6 @@ async def test_nio_driver_applies_latest_thread_message_edits(
             "room_id": "!room:example.com",
             "event_id": "$reply",
             "rel_type": RelationshipType.replacement,
-            "event_type": "m.room.message",
             "direction": MessageDirection.back,
             "limit": 25,
         },
@@ -1118,3 +1192,167 @@ async def test_send_file_accepts_optional_thread_and_metadata(tmp_path: Path) ->
     assert driver.files == [
         ("!room:example.com", str(path), "$root", "summary.txt", "text/plain"),
     ]
+
+
+def nio_driver(monkeypatch: pytest.MonkeyPatch, *, e2ee: bool = True) -> NioMatrixDriver:
+    FakeNioClient.instances.clear()
+    FakeCrypto.instances.clear()
+    monkeypatch.setattr("matrix_mcp.matrix_client.AsyncClient", FakeNioClient)
+    monkeypatch.setattr("matrix_mcp.matrix_client.MatrixE2EE", FakeCrypto)
+    return NioMatrixDriver(
+        MatrixMCPConfig(
+            homeserver="https://matrix.example.com",
+            user_id="@alice:example.com",
+            device_id="TESTDEVICE",
+            access_token="test-token",
+        ),
+        e2ee=e2ee,
+    )
+
+
+async def test_nio_driver_shares_its_crypto_session_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    [crypto] = FakeCrypto.instances
+
+    assert cast("object", driver.crypto) is crypto
+    assert cast("object", driver.events.crypto) is crypto
+    assert cast("object", driver.rooms.crypto) is crypto
+    await driver.close()
+    assert crypto.closed is True
+    assert FakeNioClient.instances[0].closed is True
+
+
+async def test_nio_driver_without_e2ee_has_no_crypto(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = nio_driver(monkeypatch, e2ee=False)
+
+    assert driver.crypto is None
+    assert driver.events.crypto is None
+    assert FakeCrypto.instances == []
+
+
+async def test_send_message_goes_through_the_encrypting_send_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    sends = record_sends(driver, monkeypatch, encrypted=True)
+
+    event_id = await driver.send_message("!room:example.com", "secret")
+
+    assert event_id == "$sent1"
+    assert sends == [
+        ("!room:example.com", "m.room.message", {"body": "secret", "msgtype": "m.text"})
+    ]
+    assert FakeNioClient.instances[0].room_send_calls == []
+
+
+async def test_send_file_encrypts_attachment_for_encrypted_rooms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    driver = nio_driver(monkeypatch)
+    sends = record_sends(driver, monkeypatch, encrypted=True)
+    path = tmp_path / "plan.txt"
+    path.write_text("secret plan", encoding="utf-8")
+
+    await driver.send_file("!room:example.com", str(path))
+
+    upload = FakeNioClient.instances[0].upload_call
+    assert upload is not None
+    assert upload["encrypt"] is True
+    assert upload["filename"] is None
+    [(_, event_type, content)] = sends
+    assert event_type == "m.room.message"
+    assert "url" not in content
+    assert content["file"] == {
+        "url": "mxc://example.com/report",
+        "v": "v2",
+        "key": {"k": "secret-key"},
+        "iv": "iv",
+        "hashes": {"sha256": "hash"},
+    }
+    assert content["info"] == {"mimetype": "text/plain", "size": 11}
+
+
+async def test_read_thread_decrypts_encrypted_replies_and_keeps_unreadable_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [
+        sealed_reply("$readable", "decrypted reply", timestamp_ms=200),
+        sealed_reply("$unreadable", None, timestamp_ms=300),
+    ]
+
+    thread = await driver.read_thread("!room:example.com", "$root")
+
+    root, readable, unreadable = thread
+    assert root.event_id == "$root"
+    assert (readable.body, readable.encrypted, readable.decryption_error) == (
+        "decrypted reply",
+        True,
+        None,
+    )
+    assert readable.thread_id == "$root"
+    assert (unreadable.type, unreadable.body, unreadable.decryption_error) == (
+        "m.room.encrypted",
+        None,
+        "missing room key",
+    )
+
+
+async def test_recent_messages_include_undecryptable_events() -> None:
+    class SealedEvents(MatrixEvents):
+        def __init__(self) -> None:
+            pass
+
+        async def history(
+            self, room_id: str, *, limit: int = 20, before: str | None = None
+        ) -> HistoryPage:
+            del room_id, limit, before
+            return HistoryPage(
+                events=[
+                    TimelineEvent(
+                        event_id="$sealed",
+                        sender="@bob:example.com",
+                        type="m.room.encrypted",
+                        encrypted=True,
+                        decryption_error="missing room key",
+                    ),
+                    TimelineEvent(event_id="$state", sender="@bob:example.com", type="m.room.name"),
+                    TimelineEvent(
+                        event_id="$sealed-reaction",
+                        sender="@bob:example.com",
+                        type="m.room.encrypted",
+                        encrypted=True,
+                        decryption_error="missing room key",
+                        relation_type="m.annotation",
+                    ),
+                ]
+            )
+
+    driver = FakeDriver()
+    setattr(driver, "events", SealedEvents())  # noqa: B010 - Add the grouped surface.
+    client = MatrixAPIClient(driver=cast("MatrixDriver", driver))
+
+    events = await client.read_room_recent("!room:example.com")
+
+    assert [(event.event_id, event.decryption_error) for event in events] == [
+        ("$sealed", "missing room key")
+    ]
+
+
+async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [sealed_reply("$reply", "original reply", timestamp_ms=200)]
+    nio_client.replacement_events["$reply"] = [
+        edit_event("$forged", replaces="$reply", sender="@bob:example.com", timestamp_ms=300)
+    ]
+
+    thread = await driver.read_thread("!room:example.com", "$root")
+
+    reply = thread[-1]
+    assert (reply.body, reply.edited) == ("original reply", False)

@@ -360,7 +360,7 @@ async def test_json_rejects_extreme_integer_rate_limit_without_overflow(
     assert len(endpoint.requests) == 1
 
 
-async def test_require_unencrypted_treats_missing_state_as_plaintext(
+async def test_room_is_encrypted_treats_missing_state_as_plaintext(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
 ) -> None:
     http, endpoint = matrix_http
@@ -371,22 +371,22 @@ async def test_require_unencrypted_treats_missing_state_as_plaintext(
         status=404,
     )
 
-    await http.require_unencrypted(ROOM)
+    assert await http.room_is_encrypted(ROOM) is False
 
 
-async def test_require_unencrypted_accepts_domainless_room_id(
+async def test_room_is_encrypted_accepts_domainless_room_id(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
 ) -> None:
     http, endpoint = matrix_http
 
-    await http.require_unencrypted(ROOM_V12)
+    assert await http.room_is_encrypted(ROOM_V12) is False
 
     assert endpoint.requests[0]["path"] == (
         f"/prefix/_matrix/client/v3/rooms/{ROOM_V12}/state/m.room.encryption"
     )
 
 
-async def test_require_unencrypted_refuses_encrypted_room(
+async def test_room_is_encrypted_reports_encryption_state(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
 ) -> None:
     http, endpoint = matrix_http
@@ -396,11 +396,10 @@ async def test_require_unencrypted_refuses_encrypted_room(
         {"algorithm": "m.megolm.v1.aes-sha2"},
     )
 
-    with pytest.raises(RuntimeError, match="encrypted"):
-        await http.require_unencrypted(ROOM)
+    assert await http.room_is_encrypted(ROOM) is True
 
 
-async def test_require_unencrypted_fails_closed_on_forbidden_state(
+async def test_room_is_encrypted_fails_closed_on_forbidden_state(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
 ) -> None:
     http, endpoint = matrix_http
@@ -412,7 +411,7 @@ async def test_require_unencrypted_fails_closed_on_forbidden_state(
     )
 
     with pytest.raises(MatrixHTTPError) as caught:
-        await http.require_unencrypted(ROOM)
+        await http.room_is_encrypted(ROOM)
 
     assert caught.value.status_code == 403
 
@@ -421,13 +420,13 @@ async def test_require_unencrypted_fails_closed_on_forbidden_state(
     "room_id",
     ["", "room:example.com", "!", "!room:example.com\n", "!bad room:example.com"],
 )
-async def test_require_unencrypted_rejects_malformed_room_id_before_http(
+async def test_room_is_encrypted_rejects_malformed_room_id_before_http(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint], room_id: str
 ) -> None:
     http, endpoint = matrix_http
 
     with pytest.raises(ValueError, match="room ID"):
-        await http.require_unencrypted(room_id)
+        await http.room_is_encrypted(room_id)
 
     assert endpoint.requests == []
 

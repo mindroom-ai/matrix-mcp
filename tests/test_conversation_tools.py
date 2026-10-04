@@ -7,7 +7,7 @@ from fastmcp import Client, FastMCP
 
 from matrix_mcp.matrix_client import MatrixAPIClient
 from matrix_mcp.matrix_events import EventContext, HistoryPage, TimelineEvent
-from matrix_mcp.matrix_media import DownloadedMedia, UploadedMedia
+from matrix_mcp.matrix_media import DownloadedMedia, EventAttachment, UploadedMedia
 from matrix_mcp.matrix_rooms import InvitationPage, UnreadPage
 from matrix_mcp.mcp_server import create_mcp_server
 
@@ -79,6 +79,10 @@ class FakeEvents:
         self.calls.append(("redact", {"room_id": room_id, "event_id": event_id, **kwargs}))
         return "$redaction"
 
+    async def attachment(self, room_id: str, event_id: str) -> EventAttachment:
+        self.calls.append(("attachment", {"room_id": room_id, "event_id": event_id}))
+        return EventAttachment(url="mxc://example.com/media", mimetype="text/plain")
+
 
 class FakeRooms:
     def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
@@ -120,8 +124,10 @@ class FakeMedia:
             size=1,
         )
 
-    async def download(self, media_url: str) -> DownloadedMedia:
-        self.calls.append(("download", {"media_url": media_url}))
+    async def download(
+        self, media_url: str, *, attachment: EventAttachment | None = None
+    ) -> DownloadedMedia:
+        self.calls.append(("download", {"media_url": media_url, "attachment": attachment}))
         return DownloadedMedia(
             media_url=media_url,
             content_type="text/plain",
@@ -230,7 +236,7 @@ async def test_media_url_schema_accepts_case_insensitive_scheme(media_url: str) 
         result = await client.call_tool("matrix_download_media", {"media_url": media_url})
 
     assert not result.is_error
-    assert driver.calls == [("download", {"media_url": media_url})]
+    assert driver.calls == [("download", {"media_url": media_url, "attachment": None})]
 
 
 async def test_history_dispatch_accepts_domainless_room_id_without_marking_read() -> None:
@@ -365,7 +371,7 @@ async def test_history_dispatch_accepts_domainless_room_id_without_marking_read(
         (
             "matrix_download_media",
             {"media_url": "mxc://example.com/media"},
-            ("download", {"media_url": "mxc://example.com/media"}),
+            ("download", {"media_url": "mxc://example.com/media", "attachment": None}),
         ),
         (
             "matrix_send_media",
@@ -445,3 +451,54 @@ async def test_conversation_tool_closes_matrix_api_client(
     async with Client(grouped_server(driver)) as client:
         await client.call_tool("matrix_read_history", {"room_id": "!v12hash"})
     assert len(closed) == 1
+
+
+async def test_download_media_resolves_the_event_attachment_first() -> None:
+    driver = GroupedDriver()
+    async with Client(grouped_server(driver)) as client:
+        result = await client.call_tool(
+            "matrix_download_media",
+            {
+                "media_url": "mxc://example.com/media",
+                "room_id": "!room:example.com",
+                "event_id": "$file",
+            },
+        )
+    assert not result.is_error
+    assert driver.calls == [
+        ("attachment", {"room_id": "!room:example.com", "event_id": "$file"}),
+        (
+            "download",
+            {
+                "media_url": "mxc://example.com/media",
+                "attachment": EventAttachment(url="mxc://example.com/media", mimetype="text/plain"),
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize("missing", ["room_id", "event_id"])
+async def test_download_media_needs_room_and_event_together(missing: str) -> None:
+    driver = GroupedDriver()
+    arguments = {
+        "media_url": "mxc://example.com/media",
+        "room_id": "!room:example.com",
+        "event_id": "$file",
+    }
+    del arguments[missing]
+    async with Client(grouped_server(driver)) as client:
+        result = await client.call_tool("matrix_download_media", arguments, raise_on_error=False)
+    assert result.is_error
+    assert driver.calls == []
+
+
+async def test_tool_guidance_steers_encrypted_file_sharing() -> None:
+    async with Client(create_mcp_server()) as client:
+        tools = {tool.name: tool.description or "" for tool in await client.list_tools()}
+        instructions = client.initialize_result.instructions or ""
+
+    assert "unencrypted" in tools["matrix_upload_media"]
+    assert "file_path" in tools["matrix_upload_media"]
+    assert "encrypted" in tools["matrix_send_message"]
+    assert "file_path" in instructions
+    assert "missing room key" in instructions
