@@ -479,7 +479,12 @@ class MatrixEvents:
         encryption: dict[str, str | None],
     ) -> tuple[TimelineEvent, bool]:
         original = _timeline_event(raw)
-        if original.redacted or _is_replacement(raw) or "state_key" in raw:
+        if (
+            original.redacted
+            or original.type == "m.room.encrypted"
+            or _is_replacement(raw)
+            or "state_key" in raw
+        ):
             return original, False
         bundle, bundle_present = _bundled_replacement(raw)
         # The crypto layer already reduced an untrusted bundle to a bare reference.

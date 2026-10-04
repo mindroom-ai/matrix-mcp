@@ -88,6 +88,10 @@ Encryption needs a device created by a `matrix-mcp auth` login; a token borrowed
 Keys are stored next to the config file and are readable only by your user.
 Several `matrix-mcp serve` processes can share one device; each tool call that needs encryption waits for its turn on the store.
 
+Matrix MCP verifies no devices, so it trusts the homeserver to name the sender of each message, as an unverified client would.
+Edits of encrypted messages count only when the edit itself was encrypted.
+Before sending, it checks that every reachable device received the room key, and it refuses to send otherwise.
+
 ## MCP Tools
 
 ### Identify the Session

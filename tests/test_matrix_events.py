@@ -1113,3 +1113,22 @@ async def test_send_can_refuse_a_room_that_became_encrypted(
 
     assert crypto.encrypted == []
     assert all(request["method"] == "GET" for request in endpoint.requests)
+
+
+async def test_undecryptable_messages_skip_the_edit_lookup(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    sealed = crypto.seal(
+        "$sealed",
+        {"msgtype": "m.text", "body": "hidden"},
+        readable=False,
+        unsigned={"m.relations": {"m.replace": {"event_id": "$edit"}}},
+    )
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [sealed]})
+
+    page = await events.history(ROOM)
+
+    assert page.events[0].decryption_error == MISSING_ROOM_KEY
+    assert page.edit_resolution_truncated is False
+    assert not any("/relations/" in request["path"] for request in endpoint.requests)

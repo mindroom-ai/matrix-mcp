@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from aiohttp import ClientError
@@ -19,7 +20,6 @@ from filelock import AsyncFileLock, Timeout
 from nio import (
     AsyncClient,
     AsyncClientConfig,
-    BadEvent,
     JoinedMembersResponse,
     KeysClaimResponse,
     KeysQueryResponse,
@@ -27,7 +27,8 @@ from nio import (
     MegolmEvent,
     ShareGroupSessionResponse,
     SyncResponse,
-    UnknownBadEvent,
+    ToDeviceEvent,
+    WhoamiResponse,
 )
 from nio.exceptions import EncryptionError
 from nio.rooms import MatrixRoom
@@ -44,6 +45,11 @@ if TYPE_CHECKING:
 
     from matrix_mcp.config import MatrixMCPConfig
 
+# nio's validation warnings embed whole events, including decrypted text and
+# attachment keys; keep them out of the MCP client's stderr log.
+logging.getLogger("nio").setLevel(logging.CRITICAL)
+_LOGGER = logging.getLogger(__name__)
+
 MISSING_ROOM_KEY = "missing room key"
 E2EE_UNSUPPORTED = "end-to-end encryption is not available in this mode"
 _UNDECRYPTABLE = "unable to decrypt"
@@ -53,10 +59,10 @@ _MAX_CATCH_UP_SYNCS = 10
 _LOCK_TIMEOUT_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_RETRIES = 3
-# Only to-device messages (room keys) and key counts are needed from /sync.
 _DEDICATED_DEVICE_HINT = (
     "log in with `matrix-mcp auth sso` or `matrix-mcp auth password` to create a dedicated device"
 )
+# Only to-device messages (room keys) and key counts are needed from /sync.
 _CATCH_UP_FILTER: dict[str, Any] = {
     "presence": {"types": []},
     "account_data": {"types": []},
@@ -83,7 +89,7 @@ class E2EEUnavailableError(RuntimeError):
 class DecryptedEvent:
     """A decrypted raw event, or the original event and why it stayed encrypted."""
 
-    event: dict[str, Any]
+    event: dict[str, Any] = field(repr=False)
     error: str | None = None
 
 
@@ -252,6 +258,10 @@ class MatrixE2EE:
             await _upload_keys(client)
             await _catch_up(client)
             await _upload_keys(client)
+            await _send_queued_to_device(client)
+        except E2EEUnavailableError:
+            await _release(client, file_lock)
+            raise
         except (ClientError, TimeoutError) as exc:
             await _release(client, file_lock)
             msg = "Matrix end-to-end encryption setup failed to reach the homeserver"
@@ -259,6 +269,11 @@ class MatrixE2EE:
         except OSError as exc:
             await _release(client, file_lock)
             msg = f"Cannot use the end-to-end encryption store at {path}: {exc}"
+            raise E2EEUnavailableError(msg) from exc
+        except Exception as exc:
+            # Degrade reads to decryption errors instead of failing the whole tool call.
+            await _release(client, file_lock)
+            msg = f"End-to-end encryption setup failed ({type(exc).__name__})"
             raise E2EEUnavailableError(msg) from exc
         except BaseException:
             await _release(client, file_lock)
@@ -275,6 +290,17 @@ class MatrixE2EE:
         olm = _olm(client)
         if olm.account.shared:
             return
+        # The keys are published for the token's device, whatever the config claims.
+        identity = await client.whoami()
+        if not isinstance(identity, WhoamiResponse):
+            msg = "Matrix whoami failed; cannot confirm which device the access token belongs to"
+            raise E2EEUnavailableError(msg)
+        if identity.user_id != self._user_id or identity.device_id != self._device_id:
+            msg = (
+                f"The access token belongs to device {identity.device_id}, not "
+                f"{self._device_id}; {_DEDICATED_DEVICE_HINT}"
+            )
+            raise E2EEUnavailableError(msg)
         olm.users_for_key_query.add(self._user_id)
         response = await client.keys_query()
         if not isinstance(response, KeysQueryResponse):
@@ -298,7 +324,7 @@ class MatrixE2EE:
         except (RuntimeError, ValueError):
             msg = "Matrix custom HTTP header resolution failed"
             raise E2EEUnavailableError(msg) from None
-        client = AsyncClient(
+        client = _CryptoClient(
             config.normalized_homeserver,
             self._user_id,
             device_id=self._device_id,
@@ -348,9 +374,10 @@ async def _catch_up(client: AsyncClient) -> None:
         msg = "End-to-end encryption store is not loaded"
         raise E2EEUnavailableError(msg)
     since = store.load_sync_token()
+    olm = _olm(client)
     for _ in range(_MAX_CATCH_UP_SYNCS):
-        # Homeservers may hold an incremental /sync for a minimum long-poll even with
-        # timeout=0, but answer full_state requests at once. The filter excludes all
+        # nio drops timeout=0 from the request, so the homeserver applies its default
+        # long-poll; full_state requests are answered at once. The filter excludes all
         # rooms, so full state adds nothing to the response.
         async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
             response = await client.sync(
@@ -365,8 +392,37 @@ async def _catch_up(client: AsyncClient) -> None:
             raise E2EEUnavailableError(msg)
         since = response.next_batch
         store.save_sync_token(since)
+        # nio ignores a count of zero, which would stop one-time key uploads for good
+        # once other devices claim them all; an absent count also means zero.
+        olm.uploaded_key_count = response.device_key_count.signed_curve25519 or 0
         if not response.to_device_events:
             return
+    # Later tool calls continue from the saved token.
+    _LOGGER.info("End-to-end encryption catch-up stopped after %s syncs", _MAX_CATCH_UP_SYNCS)
+
+
+async def _send_queued_to_device(client: AsyncClient) -> None:
+    """Send the Olm session repairs nio queues for broken sessions with other devices."""
+    if client.should_claim_keys:
+        await client.keys_claim(client.get_users_for_key_claiming())
+    await client.send_to_device_messages()
+
+
+class _CryptoClient(AsyncClient):  # type: ignore[misc]  # nio ships no type stubs.
+    """An AsyncClient that skips to-device messages it cannot process.
+
+    nio raises on some malformed encrypted to-device messages, which any Matrix user can
+    send. Without this, one such message would block every later catch-up.
+    """
+
+    def _handle_decrypt_to_device(self, to_device_event: ToDeviceEvent) -> ToDeviceEvent | None:
+        try:
+            return super()._handle_decrypt_to_device(to_device_event)
+        except Exception:  # noqa: BLE001 - Skip one bad message, keep the rest of the batch.
+            _LOGGER.warning(
+                "Skipped an unreadable to-device message from %s", to_device_event.sender
+            )
+            return None
 
 
 def undelivered_devices(
@@ -426,10 +482,10 @@ def _decrypt_with(  # noqa: PLR0911 - One exit per reason an event stays encrypt
         decrypted = olm.decrypt_megolm_event(event, room_id)
     except EncryptionError:
         return DecryptedEvent(raw, _UNDECRYPTABLE)
+    # nio reports payloads its own event schemas reject as BadEvent, but they did decrypt.
     source = getattr(decrypted, "source", None)
     if (
-        isinstance(decrypted, BadEvent | UnknownBadEvent)
-        or not isinstance(source, dict)
+        not isinstance(source, dict)
         or not isinstance(source.get("type"), str)
         or source["type"] == "m.room.encrypted"
         or not isinstance(source.get("content"), dict)
@@ -437,7 +493,12 @@ def _decrypt_with(  # noqa: PLR0911 - One exit per reason an event stays encrypt
         return DecryptedEvent(raw, _UNDECRYPTABLE)
     if source.get("room_id") != room_id:
         return DecryptedEvent(raw, _OTHER_ROOM)
-    merged = {**raw, "type": source["type"], "content": source["content"]}
+    content = source["content"]
+    relation = raw["content"].get("m.relates_to")
+    if "m.relates_to" not in content and relation is not None:
+        # Relations travel in the cleartext part of encrypted events.
+        content = {**content, "m.relates_to": relation}
+    merged = {**raw, "type": source["type"], "content": content}
     bundled = _bundled_replacement(raw)
     if bundled is not None:
         # Only an encrypted replacement may edit an encrypted message. Any other

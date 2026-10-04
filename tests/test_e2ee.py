@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import stat
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ class CryptoEndpoint:
     upload_status: int = 200
     to_device_batches: list[list[dict[str, Any]]] = field(default_factory=list)
     batch: int = 0
+    whoami_device: str = DEVICE
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -56,6 +58,8 @@ class CryptoEndpoint:
             }
         )
         path = request.path
+        if path == "/_matrix/client/v3/account/whoami":
+            return web.json_response({"user_id": USER, "device_id": self.whoami_device})
         if path == "/_matrix/client/v3/keys/upload":
             if self.upload_status != 200:
                 return web.json_response(
@@ -305,7 +309,7 @@ async def test_rejected_key_upload_makes_encryption_unavailable(
 async def test_imported_room_keys_decrypt_older_history(
     homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
 ) -> None:
-    config, _endpoint = homeserver
+    config, endpoint = homeserver
     writer_store = tmp_path / "writer"
     writer = MatrixE2EE(config, store_path=writer_store)
     try:
@@ -329,6 +333,7 @@ async def test_imported_room_keys_decrypt_older_history(
 
     # The export is imported on a different device of the same account.
     reader_config = config.model_copy(update={"device_id": "READERDEVICE"})
+    endpoint.whoami_device = "READERDEVICE"
     reader_store = tmp_path / "reader"
     reader = MatrixE2EE(reader_config, store_path=reader_store)
     try:
@@ -419,7 +424,7 @@ async def export_room_keys(
 async def test_decrypted_payload_must_belong_to_the_requested_room(
     homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
 ) -> None:
-    config, _endpoint = homeserver
+    config, endpoint = homeserver
     writer = MatrixE2EE(config, store_path=tmp_path / "writer")
     try:
         _, encrypted = await writer.encrypt(
@@ -431,6 +436,7 @@ async def test_decrypted_payload_must_belong_to_the_requested_room(
     other_room = "!other:example.com"
     await export_room_keys(config, tmp_path / "writer", export, room_id=other_room)
     reader_config = config.model_copy(update={"device_id": "READERDEVICE"})
+    endpoint.whoami_device = "READERDEVICE"
     await MatrixE2EE(reader_config, store_path=tmp_path / "reader").import_keys(export, "pass")
 
     reader = MatrixE2EE(reader_config, store_path=tmp_path / "reader")
@@ -492,7 +498,7 @@ async def test_sync_token_advances_only_after_room_keys_are_processed(
 
     with monkeypatch.context() as patch:
         patch.setattr(AsyncClient, "_handle_to_device", crash)
-        with pytest.raises(RuntimeError, match="interrupted"):
+        with pytest.raises(E2EEUnavailableError, match="setup failed"):
             await MatrixE2EE(config, store_path=tmp_path).setup()
     await MatrixE2EE(config, store_path=tmp_path).setup()
 
@@ -534,3 +540,102 @@ def test_undelivered_devices_lists_reachable_devices_missing_the_room_key() -> N
     )
 
     assert missing == {("@bob:example.com", "LAPTOP")}
+
+
+def uploads(endpoint: CryptoEndpoint) -> list[dict[str, Any]]:
+    return [request for request in endpoint.requests if request["path"].endswith("/keys/upload")]
+
+
+async def test_first_open_refuses_credentials_for_a_different_device(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.whoami_device = "TOKENDEVICE"
+
+    with pytest.raises(E2EEUnavailableError, match="device"):
+        await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    assert uploads(endpoint) == []
+
+
+async def test_drained_one_time_keys_are_replenished(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+    endpoint.one_time_keys = 0
+
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    replenished = uploads(endpoint)[-1]["body"]
+    assert "device_keys" not in replenished
+    assert replenished["one_time_keys"]
+
+
+async def test_malformed_to_device_message_is_skipped_without_losing_progress(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+    assert endpoint.device_keys is not None
+    our_key = endpoint.device_keys["keys"][f"curve25519:{DEVICE}"]
+    endpoint.to_device_batches = [
+        [
+            {
+                "type": "m.room.encrypted",
+                "sender": "@mallory:example.com",
+                "content": {
+                    "algorithm": "m.olm.v1.curve25519-aes-sha2",
+                    "sender_key": "x",
+                    "ciphertext": {our_key: {"type": 0, "body": "!!!"}},
+                },
+            }
+        ]
+    ]
+
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    since = [sync["query"].get("since") for sync in endpoint.syncs()]
+    assert since == [None, "batch-1", "batch-2", "batch-3"]
+
+
+async def test_schema_invalid_payload_is_read_without_logging_its_content(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config, _endpoint = homeserver
+    caplog.set_level(logging.DEBUG)
+    crypto = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        _, encrypted = await crypto.encrypt(
+            ROOM, "m.room.message", {"msgtype": "m.text", "note": "classified"}
+        )
+        result = await crypto.decrypt(ROOM, megolm_event("$odd", encrypted))
+    finally:
+        await crypto.aclose()
+
+    assert result.error is None
+    assert result.event["content"] == {"msgtype": "m.text", "note": "classified"}
+    assert "classified" not in caplog.text
+    assert "classified" not in repr(result)
+
+
+async def test_queued_to_device_messages_are_sent_after_catch_up(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _endpoint = homeserver
+    sent: list[bool] = []
+
+    async def send_to_device_messages(_client: object) -> list[object]:
+        sent.append(True)
+        return []
+
+    monkeypatch.setattr(AsyncClient, "send_to_device_messages", send_to_device_messages)
+
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    assert sent == [True]

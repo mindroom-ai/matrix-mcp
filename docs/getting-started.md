@@ -110,6 +110,9 @@ If that machine is remote — an SSH session, a VM, a container — a browser on
 
     Then copy the file printed by `config-path` to the path that `matrix-mcp config-path` prints on the remote machine, creating the directory if needed.
 
+    Encrypted rooms do not work with copied credentials: the device's encryption keys stay on the machine that logged in, and the remote machine refuses to publish new ones for the same device.
+    Use one of the other methods when you need encrypted rooms on the remote machine.
+
 ### Existing Matrix Access Token
 
 ```bash
