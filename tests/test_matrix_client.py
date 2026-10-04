@@ -1340,6 +1340,14 @@ async def test_recent_messages_include_undecryptable_events() -> None:
                         decryption_error="missing room key",
                     ),
                     TimelineEvent(event_id="$state", sender="@bob:example.com", type="m.room.name"),
+                    TimelineEvent(
+                        event_id="$sealed-reaction",
+                        sender="@bob:example.com",
+                        type="m.room.encrypted",
+                        encrypted=True,
+                        decryption_error="missing room key",
+                        relation_type="m.annotation",
+                    ),
                 ]
             )
 
@@ -1385,3 +1393,24 @@ async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
 
     reply = thread[-1]
     assert (reply.body, reply.edited) == ("original reply", False)
+
+
+async def test_thread_limit_counts_only_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = nio_driver(monkeypatch)
+    nio_client = FakeNioClient.instances[0]
+    poll = {
+        "event_id": "$poll",
+        "sender": "@bob:example.com",
+        "origin_server_ts": 400,
+        "type": "org.matrix.msc3381.poll.start",
+        "content": {"m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}},
+    }
+    nio_client.thread_events = [
+        text_event("$reply-1", timestamp_ms=200, body="one", thread_id="$root"),
+        text_event("$reply-2", timestamp_ms=300, body="two", thread_id="$root"),
+        poll,
+    ]
+
+    thread = await driver.read_thread("!room:example.com", "$root", limit=2)
+
+    assert [event.event_id for event in thread] == ["$root", "$reply-1", "$reply-2"]

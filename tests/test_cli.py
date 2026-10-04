@@ -773,6 +773,7 @@ def test_auth_logout_removes_the_device_encryption_store(tmp_path: Path) -> None
     assert not config.exists()
     assert not store.exists()
     assert "Removed end-to-end encryption keys" in result.output
+    assert "still registered" in result.output
 
 
 def test_auth_logout_waits_for_the_encryption_store_lock(
@@ -789,4 +790,67 @@ def test_auth_logout_waits_for_the_encryption_store_lock(
     assert result.exit_code == 1
     assert "in use" in result.output
     assert config.exists()
+    assert store.exists()
+
+
+@pytest.mark.parametrize("command", ["setup", "import-keys"])
+def test_e2ee_commands_explain_missing_credentials(tmp_path: Path, command: str) -> None:
+    export = tmp_path / "keys.txt"
+    export.write_text("export", encoding="utf-8")
+    arguments = ["e2ee", command, "--config", str(tmp_path / "missing.json")]
+    if command == "import-keys":
+        arguments.insert(2, str(export))
+
+    result = CliRunner().invoke(app, arguments, input="pass\n")
+
+    assert result.exit_code == 1
+    assert "Cannot read Matrix MCP credentials" in result.output
+
+
+def test_login_with_a_new_device_removes_the_previous_device_keys(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    old_store = e2ee_store_path(write_config(config, device_id="OLDDEVICE"))
+    old_store.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--device-id",
+            "NEWDEVICE",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert not old_store.exists()
+    assert "Removed end-to-end encryption keys" in result.output
+
+
+def test_login_with_the_same_device_keeps_its_keys(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    store = e2ee_store_path(write_config(config))
+    store.mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "auth",
+            "token",
+            "https://matrix.example.com",
+            "@alice:example.com",
+            "test-token",
+            "--device-id",
+            "TESTDEVICE",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0
     assert store.exists()

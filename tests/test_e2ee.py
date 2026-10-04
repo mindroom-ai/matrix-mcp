@@ -428,9 +428,11 @@ async def test_reopened_store_checks_the_device_identity_every_time(
     else:
         endpoint.device_keys = None
 
-    with pytest.raises(E2EEUnavailableError, match="device"):
+    with pytest.raises(E2EEUnavailableError, match="device") as caught:
         await MatrixE2EE(config, store_path=tmp_path).setup()
 
+    if change == "published keys":
+        assert "auth logout" in str(caught.value)
     assert len(endpoint.syncs()) == syncs_before
     assert await AsyncPath(tmp_path).exists()
 
@@ -771,3 +773,10 @@ async def test_store_is_kept_when_its_keys_may_have_been_published(
 
     assert endpoint.device_keys is not None
     assert status.fingerprint == endpoint.device_keys["keys"][f"ed25519:{DEVICE}"]
+
+
+def test_only_loggers_that_embed_event_content_are_silenced() -> None:
+    assert logging.getLogger("nio.events.misc").getEffectiveLevel() == logging.CRITICAL
+    assert logging.getLogger("nio.crypto.log").getEffectiveLevel() == logging.CRITICAL
+    assert logging.getLogger("nio.http").getEffectiveLevel() < logging.CRITICAL
+    assert logging.getLogger("nio.responses").getEffectiveLevel() < logging.CRITICAL

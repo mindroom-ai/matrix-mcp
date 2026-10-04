@@ -51,6 +51,7 @@ from matrix_mcp.tls import default_ssl_context
 
 # Thread and recent reads keep undecryptable messages so agents know they exist.
 _THREAD_MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted"})
+_THREAD_SCAN_FACTOR = 3
 
 
 class MatrixRoom(BaseModel):
@@ -404,7 +405,9 @@ class NioMatrixDriver:
                 raw_events.append((root, False))
 
         reply_count = 0
-        # No event type filter: encrypted replies have type m.room.encrypted.
+        scanned = 0
+        # No event type filter: encrypted replies have type m.room.encrypted. Only
+        # message-like events count toward the limit; the scan itself stays bounded.
         async for raw in self._client.room_get_event_relations(
             room_id,
             thread_id,
@@ -413,10 +416,11 @@ class NioMatrixDriver:
             limit=max_replies,
         ):
             source = _source_from_nio(raw)
-            if source is not None:
+            if source is not None and source.get("type") in _THREAD_MESSAGE_TYPES:
                 raw_events.append((source, True))
-            reply_count += 1
-            if reply_count >= max_replies:
+                reply_count += 1
+            scanned += 1
+            if reply_count >= max_replies or scanned >= max_replies * _THREAD_SCAN_FACTOR:
                 break
 
         decrypted, encryption = await self.events.decrypt_raw(
@@ -641,7 +645,7 @@ class MatrixAPIClient:
             events = [
                 _event_from_timeline(event)
                 for event in page.events
-                if event.type in _THREAD_MESSAGE_TYPES
+                if event.type in _THREAD_MESSAGE_TYPES and not _is_sealed_reaction(event)
             ]
         else:
             events = await self._driver.read_room_recent(resolved_room_id, limit=limit)
@@ -789,6 +793,10 @@ def _event_from_timeline(event: TimelineEvent) -> MatrixEvent:
         encrypted=event.encrypted,
         decryption_error=event.decryption_error,
     )
+
+
+def _is_sealed_reaction(event: TimelineEvent) -> bool:
+    return event.type == "m.room.encrypted" and event.relation_type == "m.annotation"
 
 
 def _event_sort_key(event: MatrixEvent) -> tuple[int, str]:

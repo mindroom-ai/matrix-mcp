@@ -99,7 +99,7 @@ Limitations:
 - Edits of encrypted messages count only when the edit itself was encrypted.
 - Before sending, Matrix MCP checks that every device with an encryption session received the room key, and refuses to send otherwise. Devices that have run out of one-time keys are skipped, as in other clients. Sends also stop while the homeserver cannot fetch device keys from another server in the room.
 - The encryption check and the send are separate requests, so a room that enables encryption between them can still receive one plaintext message.
-- Thread reads count other thread events, such as reactions to the thread, toward `limit`, so fewer messages than `limit` may be returned.
+- Thread reads scan at most three times `limit` thread events, so a thread with many non-message events, such as polls, may return fewer messages than `limit`.
 - Repairing a broken encryption session with another device is best effort and only works for devices this store already knows.
 - `auth logout` deletes the local keys but does not sign the device out on the homeserver; remove it from another client's session list if needed.
 

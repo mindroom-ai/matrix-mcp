@@ -62,6 +62,8 @@ class TimelineEvent(BaseModel):
         default=None,
         description="Why an encrypted event could not be decrypted; its body is then null.",
     )
+    # Relations stay readable on undecryptable events; used to tell reactions apart.
+    relation_type: str | None = Field(default=None, exclude=True)
 
 
 class HistoryPage(BaseModel):
@@ -213,6 +215,8 @@ class MatrixEvents:
         transaction = _transaction_path(transaction_id)
         _validate_body(body)
         target = await self._fetch_event(room_id, event_id)
+        # An undecryptable target keeps its cleartext relation, which is enough here.
+        [target], _ = await self.decrypt_raw(room_id, [target])
         relation: dict[str, object] = {"m.in_reply_to": {"event_id": event_id}}
         thread_id = _relationship_id(target, "m.thread")
         if thread_id is not None:
@@ -621,6 +625,7 @@ def _timeline_event(raw: dict[str, Any]) -> TimelineEvent:
         body=body,
         thread_id=_relation_value(relation, "m.thread"),
         reply_to=_nested_event_id(relation, "m.in_reply_to"),
+        relation_type=_optional_string(relation.get("rel_type")),
         media=None if redacted else _media_metadata(content, msgtype),
         redacted=redacted,
     )

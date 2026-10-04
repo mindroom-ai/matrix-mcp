@@ -127,7 +127,8 @@ matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
 
 ### End-to-End Encryption
 
-Each login creates a Matrix device for Matrix MCP and publishes its encryption keys, so encrypted rooms work from the start.
+SSO, password, and login-token logins create a new Matrix device for Matrix MCP and publish its encryption keys, so encrypted rooms work from the start.
+`auth token` reuses the device that the access token belongs to; encryption then works only if no other client has published keys for that device.
 Messages sent before the login cannot be decrypted unless you import room keys exported from another client:
 
 ```bash

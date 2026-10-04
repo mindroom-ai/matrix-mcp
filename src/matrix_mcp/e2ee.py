@@ -48,9 +48,11 @@ if TYPE_CHECKING:
 
     from matrix_mcp.config import MatrixMCPConfig
 
-# nio's validation warnings embed whole events, including decrypted text and
-# attachment keys; keep them out of the MCP client's stderr log.
-logging.getLogger("nio").setLevel(logging.CRITICAL)
+# nio's event validation and crypto logs embed whole events, including decrypted text
+# and attachment keys; keep them out of the MCP client's stderr log. Other nio
+# loggers, such as HTTP errors, stay as configured.
+for _sensitive_logger in ("nio.events", "nio.crypto"):
+    logging.getLogger(_sensitive_logger).setLevel(logging.CRITICAL)
 _LOGGER = logging.getLogger(__name__)
 
 MISSING_ROOM_KEY = "missing room key"
@@ -321,8 +323,9 @@ class MatrixE2EE:
             or keys.get(f"curve25519:{self._device_id}") != ours["curve25519"]
         ):
             msg = (
-                "This device's published encryption keys belong to another Matrix client, "
-                f"and matrix-mcp will not use or replace them; {_DEDICATED_DEVICE_HINT}"
+                "This device's published encryption keys belong to another Matrix client or "
+                "to a store removed by `matrix-mcp auth logout`, and matrix-mcp will not use "
+                f"or replace them; {_DEDICATED_DEVICE_HINT}"
             )
             raise E2EEUnavailableError(msg)
 

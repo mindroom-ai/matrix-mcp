@@ -108,7 +108,7 @@ def auth_token(
         http_headers=header_config.headers,
         http_header_commands=header_config.commands,
     )
-    saved.save(config_path)
+    _replace_credentials(config_path, saved)
     typer.echo(f"Saved Matrix MCP credentials to {config_path}")
     _setup_e2ee(saved)
 
@@ -142,7 +142,7 @@ def auth_password(
         ),
     )
     saved = result.to_config()
-    saved.save(config_path)
+    _replace_credentials(config_path, saved)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
     _setup_e2ee(saved)
 
@@ -248,7 +248,7 @@ def auth_sso(
     finally:
         callback.close()
     saved = result.to_config()
-    saved.save(config_path)
+    _replace_credentials(config_path, saved)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
     _setup_e2ee(saved)
 
@@ -280,7 +280,7 @@ def auth_login_token(
         ),
     )
     saved = result.to_config()
-    saved.save(config_path)
+    _replace_credentials(config_path, saved)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
     _setup_e2ee(saved)
 
@@ -311,6 +311,10 @@ def auth_logout(
             if store.exists():
                 shutil.rmtree(store)
                 typer.echo(f"Removed end-to-end encryption keys from {store}")
+                typer.echo(
+                    "The device is still registered on the homeserver but can no longer use "
+                    "end-to-end encryption; log in again to get a new device."
+                )
     except Timeout as exc:
         typer.echo(
             "The end-to-end encryption store is in use by a matrix-mcp tool call; "
@@ -325,10 +329,9 @@ def e2ee_setup(
     config: Path | None = typer.Option(None, "--config", help="Config file to read"),
 ) -> None:
     """Publish this device's encryption keys and show its fingerprint."""
-    from matrix_mcp.config import MatrixMCPConfig
     from matrix_mcp.e2ee import MatrixE2EE
 
-    settings = MatrixMCPConfig.load(_resolve_config_path(config))
+    settings = _load_credentials(config)
     try:
         status = asyncio.run(MatrixE2EE(settings).setup())
     except RuntimeError as exc:
@@ -352,10 +355,9 @@ def e2ee_import_keys(
     config: Path | None = typer.Option(None, "--config", help="Config file to read"),
 ) -> None:
     """Import exported room keys so older encrypted messages can be read."""
-    from matrix_mcp.config import MatrixMCPConfig
     from matrix_mcp.e2ee import MatrixE2EE
 
-    settings = MatrixMCPConfig.load(_resolve_config_path(config))
+    settings = _load_credentials(config)
     try:
         asyncio.run(MatrixE2EE(settings).import_keys(file, passphrase))
     except (RuntimeError, ValueError) as exc:
@@ -389,6 +391,43 @@ def _setup_e2ee(config: MatrixMCPConfig) -> None:
 def _echo_e2ee_status(status: E2EEStatus) -> None:
     typer.echo(f"End-to-end encryption ready for device {status.device_id}")
     typer.echo(f"Device fingerprint (ed25519): {status.fingerprint}")
+
+
+def _load_credentials(config: Path | None) -> MatrixMCPConfig:
+    from pydantic import ValidationError
+
+    from matrix_mcp.config import MatrixMCPConfig
+
+    config_path = _resolve_config_path(config)
+    try:
+        return MatrixMCPConfig.load(config_path)
+    except (OSError, ValueError, ValidationError) as exc:
+        typer.echo(f"Cannot read Matrix MCP credentials from {config_path}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def _replace_credentials(config_path: Path, config: MatrixMCPConfig) -> None:
+    """Save new credentials and drop the keys of a device they replace.
+
+    Without its access token, the replaced device's store can never be used again.
+    """
+    from filelock import FileLock, Timeout
+
+    from matrix_mcp.e2ee import e2ee_lock_path, e2ee_store_path
+
+    previous = _e2ee_store_for(config_path) if config_path.exists() else None
+    config.save(config_path)
+    if previous is None or not config.user_id or not config.device_id:
+        return
+    if previous == e2ee_store_path(config) or not previous.exists():
+        return
+    try:
+        with FileLock(e2ee_lock_path(previous), timeout=_E2EE_LOCK_TIMEOUT_SECONDS):
+            shutil.rmtree(previous)
+    except Timeout:
+        typer.echo(f"Could not remove the previous device's keys at {previous}; in use", err=True)
+        return
+    typer.echo(f"Removed end-to-end encryption keys of the previous device from {previous}")
 
 
 def _e2ee_store_for(config_path: Path) -> Path | None:
