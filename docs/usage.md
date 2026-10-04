@@ -77,31 +77,7 @@ matrix-mcp e2ee setup
 matrix-mcp e2ee import-keys element-keys.txt
 ```
 
-In stdio mode, Matrix MCP acts as its own encrypted Matrix device.
-Every login command publishes the device's keys and prints its fingerprint; `e2ee setup` repeats that step if it failed.
-Encrypted rooms then work with the same tools as unencrypted ones: reads are decrypted and sends are encrypted.
-Messages sent before the device existed are returned with `type: "m.room.encrypted"`, a null `body`, and `decryption_error: "missing room key"`.
-`e2ee import-keys` imports a passphrase-protected room key export from another Matrix client so that older history becomes readable.
-
-The device is not cross-signed and appears as an unverified session in other clients.
-Encryption needs a device created by a `matrix-mcp auth` login; a token borrowed from another client's device already has keys of its own.
-Keys are stored per device in the default config directory (the one `matrix-mcp config-path` reports), even with `--config`, and are readable only by your user.
-Several `matrix-mcp serve` processes can share one device; each tool call that needs encryption waits for its turn on the store.
-
-Each tool call checks that the access token and the homeserver's published keys still belong to this store before it syncs or uploads keys.
-Run Matrix MCP for a device on one machine only: a copied config directory would make two machines consume the same device's room keys.
-
-Limitations:
-
-- Matrix MCP verifies no devices, so it trusts the homeserver to name the sender of each message, as an unverified client would.
-- Megolm replay detection only covers a single tool call, because it is not stored between calls.
-- Room keys go to joined members; invited users cannot read messages sent before they join.
-- Edits of encrypted messages count only when the edit itself was encrypted.
-- Before sending, Matrix MCP checks that every device with an encryption session received the room key, and refuses to send otherwise. Devices it cannot reach, such as devices out of one-time keys or on an unreachable server, are skipped, as in other clients.
-- The encryption check and the send are separate requests, so a room that enables encryption between them can still receive one plaintext message.
-- Thread reads count every thread event toward `limit`, so a thread with non-message events, such as polls, may return fewer messages than `limit`.
-- Repairing a broken encryption session with another device is best effort and only works for devices this store already knows.
-- `auth logout` deletes the local keys but does not sign the device out on the homeserver; remove it from another client's session list if needed.
+See [End-to-End Encryption](encryption.md) for setup, reading older messages, and limitations.
 
 ## MCP Tools
 
@@ -149,6 +125,7 @@ matrix_read_thread(room_id=1, thread_id=42, limit=50)
 ```
 
 `thread_id` accepts either a numeric event ref or a raw Matrix event ID.
+`limit` counts every thread event, so non-message events such as polls can reduce the number of messages returned.
 
 ### Send Text or Files
 
@@ -279,10 +256,7 @@ Media downloads use the configured homeserver's authenticated media API and requ
 HTTP URLs, redirects, and server filesystem paths are not accepted.
 Transfers request identity HTTP encoding; servers that force HTTP compression are rejected to preserve the byte limit.
 `matrix_send_media` accepts an optional `thread_id` and `transaction_id`.
-Attachments in encrypted rooms report `media.encrypted: true`.
-To download one, pass the `room_id` and `event_id` of its message as well; Matrix MCP decrypts the file and verifies its hash.
-Uploaded media is stored unencrypted, so do not use `matrix_upload_media` for files meant for an encrypted room; `matrix_send_media` refuses encrypted rooms.
-Use `matrix_send_message` with `file_path` there, which uploads an encrypted copy.
+For encrypted rooms, see [Files](encryption.md#files): uploaded media is stored unencrypted.
 
 ### Unread Catch-Up
 

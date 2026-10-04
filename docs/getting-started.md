@@ -135,7 +135,7 @@ Messages sent before the login cannot be decrypted unless you import room keys e
 matrix-mcp e2ee import-keys element-keys.txt
 ```
 
-See [End-to-End Encryption](usage.md#end-to-end-encryption) for details.
+See [End-to-End Encryption](encryption.md) for details.
 
 ## Configure an MCP Client
 
