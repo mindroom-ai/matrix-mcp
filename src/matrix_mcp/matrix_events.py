@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from matrix_mcp.e2ee import E2EE_UNSUPPORTED, DecryptedEvent
 from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, quote_transaction_id
+
+if TYPE_CHECKING:
+    from matrix_mcp.e2ee import RoomCrypto
 
 _MAX_HISTORY_LIMIT = 100
 _MAX_CONTEXT_LIMIT = 50
@@ -42,6 +46,13 @@ class TimelineEvent(BaseModel):
     media: MediaMetadata | None = None
     edited: bool = False
     redacted: bool = False
+    encrypted: bool = Field(
+        default=False, description="Whether the event was end-to-end encrypted."
+    )
+    decryption_error: str | None = Field(
+        default=None,
+        description="Why an encrypted event could not be decrypted; its body is then null.",
+    )
 
 
 class HistoryPage(BaseModel):
@@ -82,8 +93,9 @@ class EventContext(BaseModel):
 
 
 class MatrixEvents:
-    def __init__(self, http: MatrixHTTP) -> None:
+    def __init__(self, http: MatrixHTTP, crypto: RoomCrypto | None = None) -> None:
         self.http = http
+        self.crypto = crypto
 
     async def history(
         self,
@@ -107,6 +119,7 @@ class MatrixEvents:
         )
         raw_events = _event_list(payload, "chunk", required=True)
         _require_page_bound(raw_events, page_limit)
+        raw_events, encryption = await self.decrypt_raw(room_id, raw_events)
         replacements = _replacement_map(raw_events)
         visible = [raw for raw in raw_events if not _is_replacement(raw)]
         relation_budget = _RelationFetchBudget()
@@ -117,7 +130,7 @@ class MatrixEvents:
             relation_budget=relation_budget,
         )
         return HistoryPage(
-            events=expanded,
+            events=[mark_encryption(event, encryption) for event in expanded],
             next_batch=_optional_string_field(payload, "end"),
             edit_resolution_truncated=truncated,
         )
@@ -141,7 +154,13 @@ class MatrixEvents:
         raw_before = _event_list(payload, "events_before")
         raw_after = _event_list(payload, "events_after")
         _require_page_bound(raw_before + raw_after, context_limit)
-        replacements = _replacement_map([raw_event, *raw_before, *raw_after])
+        decrypted, encryption = await self.decrypt_raw(
+            room_id, [raw_event, *raw_before, *raw_after]
+        )
+        raw_event = decrypted[0]
+        raw_before = decrypted[1 : 1 + len(raw_before)]
+        raw_after = decrypted[1 + len(raw_before) :]
+        replacements = _replacement_map(decrypted)
         before = [raw for raw in raw_before if not _is_replacement(raw)]
         after = [raw for raw in raw_after if not _is_replacement(raw)]
         relation_budget = _RelationFetchBudget()
@@ -164,9 +183,9 @@ class MatrixEvents:
             relation_budget=relation_budget,
         )
         return EventContext(
-            event=center,
-            events_before=events_before,
-            events_after=events_after,
+            event=mark_encryption(center, encryption),
+            events_before=[mark_encryption(event, encryption) for event in events_before],
+            events_after=[mark_encryption(event, encryption) for event in events_after],
             start=_optional_string_field(payload, "start"),
             end=_optional_string_field(payload, "end"),
             edit_resolution_truncated=center_truncated or before_truncated or after_truncated,
@@ -185,7 +204,6 @@ class MatrixEvents:
         transaction = _transaction_path(transaction_id)
         _validate_body(body)
         target = await self._fetch_event(room_id, event_id)
-        await self.http.require_unencrypted(room_id)
         relation: dict[str, object] = {"m.in_reply_to": {"event_id": event_id}}
         thread_id = _relationship_id(target, "m.thread")
         if thread_id is not None:
@@ -217,7 +235,6 @@ class MatrixEvents:
         if not key or not key.strip():
             msg = "Reaction key must not be empty"
             raise ValueError(msg)
-        await self.http.require_unencrypted(room_id)
         return await self._send(
             room_id,
             "m.reaction",
@@ -248,6 +265,7 @@ class MatrixEvents:
         if _is_redacted(target):
             msg = "Cannot edit a redacted Matrix event"
             raise ValueError(msg)
+        target = await self._decrypted_target(room_id, target)
         if "state_key" in target or _is_replacement(target):
             msg = "Matrix event is not a valid replacement target"
             raise ValueError(msg)
@@ -259,7 +277,6 @@ class MatrixEvents:
         if msgtype not in _EDITABLE_MSGTYPES:
             msg = "Only Matrix text, notice, or emote messages can be edited"
             raise ValueError(msg)
-        await self.http.require_unencrypted(room_id)
         return await self._send(
             room_id,
             "m.room.message",
@@ -313,14 +330,61 @@ class MatrixEvents:
         _mapping_field(payload, "content", required=True)
         return payload
 
+    async def send(
+        self,
+        room_id: str,
+        event_type: str,
+        content: dict[str, Any],
+        *,
+        transaction_id: str | None = None,
+    ) -> str:
+        """Send one room event, encrypting it when the room is end-to-end encrypted."""
+        quote_matrix_id(room_id, sigil="!", label="room ID")
+        return await self._send(room_id, event_type, content, _transaction_path(transaction_id))
+
+    async def decrypt_raw(
+        self, room_id: str, raw_events: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, str | None]]:
+        """Decrypt encrypted events; map each encrypted event ID to its decryption error."""
+        events: list[dict[str, Any]] = []
+        encryption: dict[str, str | None] = {}
+        for raw in raw_events:
+            if raw.get("type") != "m.room.encrypted":
+                events.append(raw)
+                continue
+            if _is_redacted(raw):
+                result = DecryptedEvent(raw)
+            elif self.crypto is None:
+                result = DecryptedEvent(raw, E2EE_UNSUPPORTED)
+            else:
+                result = await self.crypto.decrypt(room_id, raw)
+            events.append(result.event)
+            event_id = _optional_string(raw.get("event_id"))
+            if event_id is not None:
+                encryption[event_id] = result.error
+        return events, encryption
+
+    async def _decrypted_target(self, room_id: str, target: dict[str, Any]) -> dict[str, Any]:
+        [decrypted], encryption = await self.decrypt_raw(room_id, [target])
+        error = encryption.get(cast("str", target["event_id"]))
+        if error is not None:
+            msg = f"Cannot change an encrypted Matrix event that could not be decrypted: {error}"
+            raise ValueError(msg)
+        return decrypted
+
     async def _send(
         self,
         room_id: str,
         event_type: str,
-        content: dict[str, object],
+        content: dict[str, Any],
         transaction: str,
     ) -> str:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
+        if await self.http.room_is_encrypted(room_id):
+            if self.crypto is None:
+                msg = "Sending to end-to-end encrypted Matrix rooms is not supported in this mode"
+                raise RuntimeError(msg)
+            event_type, content = await self.crypto.encrypt(room_id, event_type, content)
         payload = await self.http.json(
             "PUT",
             f"/_matrix/client/v3/rooms/{room}/send/{event_type}/{transaction}",
@@ -398,7 +462,8 @@ class MatrixEvents:
     ) -> tuple[list[dict[str, Any]], bool]:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         event = quote_matrix_id(event_id, sigil="$", label="event ID")
-        path = f"/_matrix/client/v1/rooms/{room}/relations/{event}/m.replace/m.room.message"
+        # No event type filter: replacements in encrypted rooms are m.room.encrypted.
+        path = f"/_matrix/client/v1/rooms/{room}/relations/{event}/m.replace"
         replacements: list[dict[str, Any]] = []
         cursor: str | None = None
         for page_number in range(_MAX_RELATION_PAGES):
@@ -410,7 +475,8 @@ class MatrixEvents:
             payload = await self.http.json("GET", path, params=params)
             chunk = _event_list(payload, "chunk", required=True)
             _require_page_bound(chunk, _RELATION_PAGE_LIMIT)
-            replacements.extend(chunk)
+            decrypted, _ = await self.decrypt_raw(room_id, chunk)
+            replacements.extend(decrypted)
             cursor = _optional_string_field(payload, "next_batch")
             if cursor is None:
                 return replacements, False
@@ -428,6 +494,15 @@ class _RelationFetchBudget:
             return False
         self.remaining -= 1
         return True
+
+
+def mark_encryption(event: TimelineEvent, encryption: dict[str, str | None]) -> TimelineEvent:
+    """Record whether an event was encrypted and why it could not be decrypted."""
+    if event.event_id not in encryption:
+        return event
+    return event.model_copy(
+        update={"encrypted": True, "decryption_error": encryption[event.event_id]}
+    )
 
 
 def normalize_timeline_event(

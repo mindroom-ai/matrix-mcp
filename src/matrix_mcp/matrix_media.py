@@ -185,7 +185,13 @@ class MatrixMedia:
                 "event_id": thread_id,
                 "is_falling_back": False,
             }
-        await self.http.require_unencrypted(room_id)
+        if await self.http.room_is_encrypted(room_id):
+            msg = (
+                "Media sends to end-to-end encrypted rooms are not supported because uploaded "
+                "media is stored unencrypted on the homeserver; in local mode, use "
+                "matrix_send_message with file_path instead"
+            )
+            raise RuntimeError(msg)
         result = await self.http.json(
             "PUT",
             f"/_matrix/client/v3/rooms/{room}/send/m.room.message/{transaction}",
