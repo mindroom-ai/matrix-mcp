@@ -19,7 +19,7 @@ dependencies = [
   "filelock>=3.18",
   "py-key-value-aio[filetree]>=0.4.4",
   "httpx>=0.28",
-  "mindroom-nio>=0.25",
+  "mindroom-nio[e2e]>=0.25.3",
   "platformdirs>=4.3",
   "pydantic>=2.11",
   "pydantic-settings>=2.9",
@@ -107,7 +107,7 @@ warn_unused_configs = true
 packages = ["matrix_mcp"]
 
 [[tool.mypy.overrides]]
-module = ["nio", "nio.api"]
+module = ["nio", "nio.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
