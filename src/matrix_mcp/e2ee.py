@@ -288,11 +288,16 @@ async def _upload_keys(client: AsyncClient) -> None:
 async def _catch_up(client: AsyncClient) -> None:
     """Receive queued room keys; the homeserver delivers to-device messages in batches."""
     for _ in range(_MAX_CATCH_UP_SYNCS):
-        response = await client.sync(
-            timeout=0,
-            sync_filter=_CATCH_UP_FILTER,
-            set_presence="offline",
-        )
+        # Homeservers may hold an incremental /sync for a minimum long-poll even with
+        # timeout=0, but answer full_state requests at once. The filter excludes all
+        # rooms, so full state adds nothing to the response.
+        async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
+            response = await client.sync(
+                timeout=0,
+                sync_filter=_CATCH_UP_FILTER,
+                full_state=True,
+                set_presence="offline",
+            )
         if not isinstance(response, SyncResponse):
             msg = "Matrix sync for end-to-end encryption keys failed"
             raise E2EEUnavailableError(msg)

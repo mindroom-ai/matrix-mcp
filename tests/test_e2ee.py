@@ -159,6 +159,8 @@ async def test_catch_up_drains_to_device_and_resumes_from_stored_token(
     assert first_syncs[1]["query"]["since"] == "batch-1"
     assert endpoint.syncs()[2]["query"]["since"] == "batch-2"
     assert json.loads(first_syncs[0]["query"]["filter"])["room"] == {"rooms": []}
+    # Homeservers answer full_state syncs without a minimum long-poll.
+    assert all(sync["query"]["full_state"] == "true" for sync in endpoint.syncs())
 
 
 async def test_encrypted_message_decrypts_in_a_later_session(
