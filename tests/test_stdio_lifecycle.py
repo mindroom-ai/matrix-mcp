@@ -53,6 +53,8 @@ class LifecycleServer:
                     "content": {"body": "Hello", "msgtype": "m.text"},
                 }
             )
+        if path.endswith("/state/m.room.encryption"):
+            return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
         if "/state/" in path or "/send/" in path:
             return web.json_response({"event_id": "$updated"})
         return web.json_response(responses.get(path.rsplit("/", 1)[-1], {}))

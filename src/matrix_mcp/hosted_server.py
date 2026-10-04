@@ -53,7 +53,8 @@ class HostedMatrixTools:
             user_id=token.claims["user_id"],
             device_id=token.claims["device_id"],
         )
-        driver = NioMatrixDriver(config)
+        # Hosted mode holds no device keys; encrypted rooms stay unreadable here.
+        driver = NioMatrixDriver(config, e2ee=False)
         try:
             # Inject the driver explicitly: no config fallback or numeric ID store.
             yield MatrixAPIClient(driver=driver)
