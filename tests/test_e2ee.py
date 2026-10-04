@@ -48,6 +48,7 @@ class CryptoEndpoint:
     whoami_device: str = DEVICE
     failures: dict[str, dict[str, Any]] = field(default_factory=dict)
     other_devices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    lose_upload_response: bool = False
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -63,21 +64,8 @@ class CryptoEndpoint:
         if path == "/_matrix/client/v3/account/whoami":
             return web.json_response({"user_id": USER, "device_id": self.whoami_device})
         if path == "/_matrix/client/v3/keys/upload":
-            if self.upload_status != 200:
-                return web.json_response(
-                    {"errcode": "M_INVALID_PARAM", "error": "Device keys already exist"},
-                    status=self.upload_status,
-                )
             assert isinstance(body, dict)
-            if "device_keys" in body:
-                if body["device_keys"]["device_id"] == DEVICE:
-                    self.device_keys = body["device_keys"]
-                else:
-                    self.other_devices[body["device_keys"]["device_id"]] = body["device_keys"]
-            self.one_time_keys += len(body.get("one_time_keys", {}))
-            return web.json_response(
-                {"one_time_key_counts": {"signed_curve25519": self.one_time_keys}}
-            )
+            return self.upload(body)
         if path == "/_matrix/client/v3/sync":
             self.batch += 1
             events = self.to_device_batches.pop(0) if self.to_device_batches else []
@@ -101,6 +89,22 @@ class CryptoEndpoint:
                 {"one_time_keys": {}, "failures": self.failures.get("claim", {})}
             )
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
+
+    def upload(self, body: dict[str, Any]) -> web.Response:
+        if self.upload_status != 200:
+            return web.json_response(
+                {"errcode": "M_INVALID_PARAM", "error": "Device keys already exist"},
+                status=self.upload_status,
+            )
+        if "device_keys" in body:
+            if body["device_keys"]["device_id"] == DEVICE:
+                self.device_keys = body["device_keys"]
+            else:
+                self.other_devices[body["device_keys"]["device_id"]] = body["device_keys"]
+        self.one_time_keys += len(body.get("one_time_keys", {}))
+        if self.lose_upload_response:
+            return web.json_response({"errcode": "M_UNKNOWN"}, status=502)
+        return web.json_response({"one_time_key_counts": {"signed_curve25519": self.one_time_keys}})
 
     def syncs(self) -> list[dict[str, Any]]:
         return [request for request in self.requests if request["path"].endswith("/sync")]
@@ -751,3 +755,19 @@ async def test_failed_key_delivery_is_retried_on_the_next_send(
         await crypto.aclose()
 
     assert undelivered == []
+
+
+async def test_store_is_kept_when_its_keys_may_have_been_published(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.lose_upload_response = True
+    store = tmp_path / "store"
+
+    with pytest.raises(E2EEUnavailableError):
+        await MatrixE2EE(config, store_path=store).setup()
+    endpoint.lose_upload_response = False
+    status = await MatrixE2EE(config, store_path=store).setup()
+
+    assert endpoint.device_keys is not None
+    assert status.fingerprint == endpoint.device_keys["keys"][f"ed25519:{DEVICE}"]

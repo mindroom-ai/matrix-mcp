@@ -257,21 +257,23 @@ class MatrixE2EE:
         except Timeout as exc:
             msg = "The end-to-end encryption store is in use by another matrix-mcp call; retry"
             raise E2EEUnavailableError(msg) from exc
-        # A store created here and refused before publishing anything is removed again,
-        # so a call that waited out a logout does not leave fresh keys behind.
-        created = not path.exists()
+        # A store created here and refused before its first key upload is removed again,
+        # so a call that waited out a logout does not leave fresh keys behind. Once an
+        # upload was attempted the server may hold the keys even without a response, so
+        # the store is kept.
+        removable = not path.exists()
         client: AsyncClient | None = None
         try:
             _private_directory(path)
             client = self._new_client(path)
             await self._check_device_identity(client)
+            removable = False
             await _upload_keys(client)
             await _catch_up(client)
             await _upload_keys(client)
             await _send_queued_to_device(client)
         except BaseException as exc:
-            unpublished = client is None or not _olm(client).account.shared
-            await _release(client, file_lock, remove=path if created and unpublished else None)
+            await _release(client, file_lock, remove=path if removable else None)
             if isinstance(exc, E2EEUnavailableError) or not isinstance(exc, Exception):
                 raise
             raise _unavailable(exc, path) from exc
