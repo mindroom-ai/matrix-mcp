@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ValidationError
 from matrix_mcp.matrix_http import quote_matrix_id
 
 if TYPE_CHECKING:
+    from matrix_mcp.e2ee import RoomCrypto
     from matrix_mcp.matrix_http import MatrixHTTP
 
 
@@ -25,6 +26,14 @@ _SYNC_EVENT_FIELDS = [
     "content.m\\.mentions",
     "content.name",
     "content.unread",
+]
+# Unread timelines keep Megolm fields so encrypted mentions can be decrypted.
+_MEGOLM_EVENT_FIELDS = [
+    "content.algorithm",
+    "content.ciphertext",
+    "content.sender_key",
+    "content.session_id",
+    "content.device_id",
 ]
 
 
@@ -108,8 +117,9 @@ class _Sync(BaseModel):
 
 
 class MatrixRooms:
-    def __init__(self, http: MatrixHTTP) -> None:
+    def __init__(self, http: MatrixHTTP, crypto: RoomCrypto | None = None) -> None:
         self.http = http
+        self.crypto = crypto
 
     async def invitations(self, *, limit: int = 50, offset: int = 0) -> InvitationPage:
         _validate_page(limit, offset)
@@ -202,7 +212,10 @@ class MatrixRooms:
                     notification_count=counts.notification_count,
                     highlight_count=counts.highlight_count,
                     marked_unread=marked,
-                    mentions=_mentions(room.timeline.events[:timeline_limit], self.http.user_id),
+                    mentions=_mentions(
+                        await self._readable(room_id, room.timeline.events[:timeline_limit]),
+                        self.http.user_id,
+                    ),
                     limited=room.timeline.limited or len(room.timeline.events) > timeline_limit,
                     prev_batch=room.timeline.prev_batch,
                 )
@@ -249,6 +262,16 @@ class MatrixRooms:
             )
             raise RuntimeError(msg) from None
 
+    async def _readable(self, room_id: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self.crypto is None:
+            return events
+        readable = []
+        for event in events:
+            if event.get("type") == "m.room.encrypted":
+                event = (await self.crypto.decrypt(room_id, event)).event  # noqa: PLW2901
+            readable.append(event)
+        return readable
+
     async def _sync(
         self,
         *,
@@ -256,7 +279,9 @@ class MatrixRooms:
         include_invites: bool = False,
     ) -> _Sync:
         sync_filter = {
-            "event_fields": _SYNC_EVENT_FIELDS,
+            "event_fields": _SYNC_EVENT_FIELDS
+            if include_invites
+            else [*_SYNC_EVENT_FIELDS, *_MEGOLM_EVENT_FIELDS],
             "presence": {"types": []},
             "account_data": {"types": []},
             "room": {
@@ -268,7 +293,7 @@ class MatrixRooms:
                 },
                 "timeline": {
                     "limit": timeline_limit,
-                    "types": [] if include_invites else ["m.room.message"],
+                    "types": [] if include_invites else ["m.room.message", "m.room.encrypted"],
                 },
                 "ephemeral": {"types": []},
                 "account_data": {"types": ["m.marked_unread"]},

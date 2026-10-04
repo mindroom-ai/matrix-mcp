@@ -9,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.e2ee import DecryptedEvent
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_rooms import MatrixRooms
 
@@ -326,9 +327,14 @@ async def test_unread_returns_counts_mentions_and_server_cursors_without_marking
         "content.m\\.mentions",
         "content.name",
         "content.unread",
+        "content.algorithm",
+        "content.ciphertext",
+        "content.sender_key",
+        "content.session_id",
+        "content.device_id",
     ]
     assert sync_filter["room"]["timeline"]["limit"] == 7
-    assert sync_filter["room"]["timeline"]["types"] == ["m.room.message"]
+    assert sync_filter["room"]["timeline"]["types"] == ["m.room.message", "m.room.encrypted"]
     assert request["query"]["set_presence"] == "offline"
     assert [request["method"] for request in endpoint.requests] == ["GET"]
 
@@ -358,3 +364,67 @@ async def test_too_many_invitees_does_not_create_room(
     with pytest.raises(ValueError, match="100 invitees"):
         await rooms.create(invite=[f"@user{number}:example.com" for number in range(101)])
     assert not endpoint.requests
+
+
+class MentionCrypto:
+    def __init__(self) -> None:
+        self.decrypted: list[str] = []
+
+    async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
+        assert room_id == ROOM
+        self.decrypted.append(raw["event_id"])
+        content = {
+            "msgtype": "m.text",
+            "body": "Encrypted question",
+            "m.mentions": {"user_ids": ["@alice:example.com"]},
+        }
+        return DecryptedEvent({**raw, "type": "m.room.message", "content": content})
+
+    async def encrypt(
+        self, room_id: str, event_type: str, content: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        del room_id, event_type, content
+        raise AssertionError
+
+
+@pytest.mark.parametrize("mode", ["local", "hosted"])
+async def test_unread_reads_mentions_inside_encrypted_messages(
+    matrix: tuple[MatrixRooms, RoomEndpoint], mode: str
+) -> None:
+    rooms, endpoint = matrix
+    crypto = MentionCrypto()
+    if mode == "local":
+        rooms.crypto = crypto
+    sealed = {
+        "event_id": "$sealed",
+        "sender": "@bob:example.com",
+        "origin_server_ts": 123,
+        "type": "m.room.encrypted",
+        "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
+    }
+    endpoint.responses[("GET", "/_matrix/client/v3/sync")] = (
+        {
+            "next_batch": "next",
+            "rooms": {
+                "join": {
+                    ROOM: {
+                        "timeline": {"events": [sealed]},
+                        "unread_notifications": {"notification_count": 1},
+                    },
+                    "!read:example.com": {"timeline": {"events": [sealed]}},
+                }
+            },
+        },
+        200,
+    )
+
+    page = await rooms.unread()
+
+    mentions = page.rooms[0].mentions
+    if mode == "local":
+        assert [(event.event_id, event.body) for event in mentions] == [
+            ("$sealed", "Encrypted question")
+        ]
+        assert crypto.decrypted == ["$sealed"]
+    else:
+        assert mentions == []
