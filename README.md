@@ -17,9 +17,9 @@ Local-first Matrix access for MCP clients.
 Matrix MCP lets Claude Code and other MCP clients read and write Matrix rooms.
 It is intended to make MindRoom conversations available to local coding agents without giving hosted agents access to the local filesystem.
 
-For remote clients, opt into [authenticated HTTP](docs/hosted.md).
-Each caller connects its own Matrix account through browser SSO.
-Hosted tools use raw Matrix IDs and support conversations, room membership, and room/profile updates, with no local-file access.
+For remote clients, opt into [authenticated HTTP](https://matrix-mcp.mindroom.chat/hosted/), where each caller connects their own Matrix account through browser SSO.
+
+**Documentation:** [matrix-mcp.mindroom.chat](https://matrix-mcp.mindroom.chat/)
 
 ## Install
 
@@ -27,144 +27,30 @@ Hosted tools use raw Matrix IDs and support conversations, room membership, and 
 uv tool install matrix-mcp
 ```
 
-For local development:
-
-```bash
-uv sync --extra dev
-```
-
 ## Login
-
-Matrix SSO:
 
 ```bash
 matrix-mcp auth sso https://mindroom.chat
 ```
 
-If the homeserver advertises multiple SSO providers, list their provider IDs:
+[Getting Started](https://matrix-mcp.mindroom.chat/getting-started/) covers choosing an SSO provider, logging in over SSH or on a headless machine, access tokens, and passwords.
+For homeservers behind access gateways such as Cloudflare Access, see [Access Gateways](https://matrix-mcp.mindroom.chat/usage/#access-gateways).
+`matrix-mcp auth logout` removes the stored credentials.
+
+## Connect an MCP Client
 
 ```bash
-matrix-mcp auth providers https://mindroom.chat
+claude mcp add matrix -- matrix-mcp serve   # Claude Code
+codex mcp add matrix -- matrix-mcp serve    # Codex
 ```
 
-Then pass the provider ID explicitly:
+The server runs over stdio and does not open a local HTTP port.
 
-```bash
-matrix-mcp auth sso https://mindroom.chat --idp-id github
-```
+## Encrypted Rooms
 
-The SSO flow starts a temporary callback server on the machine running `matrix-mcp` and waits for the browser to be redirected to it.
-If that machine is remote (for example over SSH), a browser on your local machine cannot reach the callback.
-Pin the callback port and forward it from the machine with your browser:
-
-```bash
-# on the remote machine
-matrix-mcp auth sso https://mindroom.chat --callback-port 8765
-```
-
-```bash
-# on your local machine, in a second terminal
-ssh -N -L 8765:127.0.0.1:8765 remote-host
-```
-
-Then open the printed SSO URL in your local browser.
-After login, the homeserver redirects to `http://127.0.0.1:8765/callback`, which SSH forwards to the waiting command on the remote machine.
-If port forwarding is not an option, use the manual flow described in the [getting started guide](https://matrix-mcp.mindroom.chat/getting-started/) with `matrix-mcp auth sso-url` and `matrix-mcp auth login-token`.
-
-If your homeserver is behind an access gateway that requires extra request headers, pass them during login.
-They are stored with the Matrix credentials and reused by MCP tools:
-
-```bash
-matrix-mcp auth sso https://mindroom.chat \
-  --header "X-Access-Client-Id: ..." \
-  --header "X-Access-Client-Secret: ..."
-```
-
-If the gateway header is short-lived, store a command that prints the current header value instead.
-The command is re-run when Matrix MCP creates a client for tool calls:
-
-```bash
-matrix-mcp auth sso https://mindroom.chat \
-  --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
-```
-
-For homeservers behind Cloudflare Access, `matrix-mcp` can configure the dynamic `cf-access-token` header for you.
-This uses the local `cloudflared` CLI to log in when needed during setup, then stores a command that reads the current token:
-
-```bash
-brew install cloudflared
-matrix-mcp auth sso https://mindroom.chat --cloudflare-access
-```
-
-For other platforms, install `cloudflared` from Cloudflare's downloads page.
-
-Existing Matrix access token:
-
-```bash
-matrix-mcp auth token https://mindroom.chat @alice:mindroom.chat "$MATRIX_ACCESS_TOKEN" --device-id DEVICEID
-```
-
-Password auth, when enabled by the homeserver:
-
-```bash
-matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
-```
-
-Credentials are stored in the user config directory reported by:
-
-```bash
-matrix-mcp config-path
-```
-
-Remove stored credentials:
-
-```bash
-matrix-mcp auth logout
-```
-
-## End-to-End Encryption
-
-In stdio mode, Matrix MCP is its own Matrix device with end-to-end encryption.
-It decrypts messages, edits, mentions, and attachments in encrypted rooms, and encrypts everything it sends there, including files.
-It checks the room's encryption state right before each send and never sends plaintext to a room known to be encrypted.
-Edits of encrypted messages count only when the edit itself was encrypted.
-
-Login commands publish the device's encryption keys and print its fingerprint.
-Other clients share a room key only with devices that exist when they send, so messages from before the login stay unreadable and report `decryption_error: "missing room key"`.
-To read older history, export room keys from another Matrix client and import them:
-
-```bash
-matrix-mcp e2ee import-keys element-keys.txt
-```
-
-The device is not cross-signed, so other clients list it as an unverified session.
-Clients configured to withhold keys from unverified devices will not share room keys with it.
-Use a device created by a `matrix-mcp auth` login: an access token borrowed from another client's device cannot be used for encryption, because that device already has its own keys.
-If setup fails at login, plaintext rooms still work; retry with `matrix-mcp e2ee setup`.
-
-The keys live in a private per-device store in the default config directory, and `matrix-mcp auth logout` deletes them.
-Several MCP clients on one machine can run `matrix-mcp serve` for the same device; they take turns using the store.
-See [End-to-End Encryption](docs/usage.md#end-to-end-encryption) for limitations.
-Authenticated HTTP mode does not support end-to-end encryption.
-
-## Claude Code
-
-Add the local MCP server:
-
-```bash
-claude mcp add matrix -- matrix-mcp serve
-```
-
-## Codex
-
-Add the local MCP server:
-
-```bash
-codex mcp add matrix -- matrix-mcp serve
-```
-
-The server runs over stdio.
-It does not expose a local HTTP port during normal MCP operation.
+In local mode, Matrix MCP is its own encrypted Matrix device: encrypted rooms work like any other room.
+Each login publishes the device's keys; messages from before the login need keys imported with `matrix-mcp e2ee import-keys`.
+See [End-to-End Encryption](https://matrix-mcp.mindroom.chat/encryption/) for details and limitations.
 
 ## Tools
 
@@ -188,43 +74,13 @@ It does not expose a local HTTP port during normal MCP operation.
 - `matrix_get_unread`, `matrix_mark_read`: inspect unread activity and explicitly update read markers.
 
 All actions use the connected account's Matrix permissions.
-See [room and profile examples](docs/usage.md#room-members-and-invitations) for arguments, pagination, and avatar media URIs.
-
-The original stdio read/list tools include stable numeric `id` fields.
-The new history, message-action, membership, media, and catch-up tools use raw Matrix IDs on both transports.
-Thread replies also include `thread_ref`, which is the numeric event ref of the thread root.
-Use these integers in later tool calls instead of copying raw Matrix IDs:
-
-```text
-matrix_read_room_recent(room_id=1)
-matrix_read_thread(room_id=1, thread_id=42)
-matrix_send_message(room_id=1, body="reply", thread_id=42)
-```
-
-To address a specific agent or user, send their full Matrix user ID in `mentions`, then read replies from the same thread:
-
-```text
-matrix_send_message(
-    room_id=1,
-    body="Could you check this?",
-    thread_id=42,
-    mentions=["@helper:example.com"],
-)
-matrix_read_thread(room_id=1, thread_id=42)
-```
-
-Mentions apply to text messages.
-File sends do not accept `mentions`.
-
-The tool instructions tell clients to prefer read tools first and only send messages when the user explicitly asks.
+See the [usage guide](https://matrix-mcp.mindroom.chat/usage/) for arguments, examples, and numeric room and event refs.
 
 ## Development
 
 ```bash
-uv run --extra dev pytest
-uv run --extra dev ruff check .
-uv run --extra dev ruff format --check .
-uv run --extra dev mypy src tests
-uv run --extra dev ty check
-uv build
+uv sync --extra dev
+uv run pytest
 ```
+
+See [Contributing](https://matrix-mcp.mindroom.chat/contributing/) for linting, type checks, and releases.

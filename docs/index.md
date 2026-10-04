@@ -33,30 +33,36 @@ Continue with [Getting Started](getting-started.md), or see the [usage guide](us
 
 ## Features
 
-- Matrix SSO, password auth, or existing access-token setup.
-- Access-gateway support with static headers or command-generated headers.
-- MCP tools for room listing, recent messages, thread reads, thread replies, and file attachments.
-- Stable numeric refs for rooms and events so agents do not need to copy raw Matrix IDs between tool calls.
-- End-to-end encryption in stdio mode: encrypted rooms are read and written like any other room; older history needs imported room keys.
-- Local credential storage in the user config directory.
+- Matrix SSO, password, login-token, or existing access-token setup, including access gateways that need extra headers.
+- Read rooms, threads, history, and unread mentions; reply, react, edit, and send files.
+- Manage room membership, room details, and your profile.
+- [End-to-end encryption](encryption.md) in local mode: encrypted rooms work like any other room.
+- [Authenticated HTTP](hosted.md) for remote clients, where each caller connects their own Matrix account.
 
-## Tool Surface
+## Tools
 
-| Tool | Purpose |
+| Area | Tools |
 | --- | --- |
-| `matrix_whoami` | Show the configured Matrix user and device. |
-| `matrix_list_rooms` | List joined Matrix rooms visible to the authenticated user. |
-| `matrix_read_room_recent` | Read recent text events from a room. |
-| `matrix_read_thread` | Read a Matrix thread root and recent replies. |
-| `matrix_send_message` | Send a text message or local file, optionally as a thread reply. |
+| Session and rooms | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar` |
+| Reading | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_read_history`, `matrix_get_event_context` |
+| Writing | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event` |
+| Membership | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room` |
+| Profile | `matrix_get_profile`, `matrix_set_display_name`, `matrix_set_avatar` |
+| Media | `matrix_upload_media`, `matrix_download_media`, `matrix_send_media` |
+| Catch-up | `matrix_get_unread`, `matrix_mark_read` |
+
+See the [usage guide](usage.md) for arguments and examples.
 
 ## Numeric Refs
 
-Read and list tools return stable numeric refs.
-Use those refs in later tool calls instead of copying raw Matrix IDs:
+In local mode, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_read_room_recent`, and `matrix_read_thread` also return stable numeric refs.
+Use them in later calls instead of copying raw Matrix IDs:
 
 ```text
 matrix_read_room_recent(room_id=1)
 matrix_read_thread(room_id=1, thread_id=42)
 matrix_send_message(room_id=1, body="reply", thread_id=42)
 ```
+
+Room refs also work for the room member and room detail tools.
+History, message action, media, invitation, join and leave, and catch-up tools take raw Matrix IDs.
