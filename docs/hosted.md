@@ -172,7 +172,8 @@ matrix_send_message(
 matrix_read_thread(room_id="!room:example.com", thread_id="$root")
 ```
 
-End-to-end encryption is unsupported; hosted sends transmit plaintext.
+End-to-end encryption is unsupported in authenticated HTTP mode, which holds no device keys; use stdio mode for encrypted rooms.
+Encrypted messages are returned with `decryption_error` instead of content, and hosted sends transmit plaintext.
 Before each send, a best effort preflight checks `m.room.encryption` and refuses known encrypted rooms or any lookup result other than a definitive missing encryption state event.
 The check and send are separate, non-atomic operations: a room can enable encryption between them and still receive the plaintext message.
 Hosted sends provide no E2EE guarantee.

@@ -122,6 +122,29 @@ Remove stored credentials:
 matrix-mcp auth logout
 ```
 
+## End-to-End Encryption
+
+In stdio mode, Matrix MCP is its own Matrix device with end-to-end encryption.
+It decrypts messages, edits, mentions, and attachments in encrypted rooms, and encrypts everything it sends there, including files.
+It never sends plaintext into an encrypted room.
+
+Login commands publish the device's encryption keys and print its fingerprint.
+Other clients share a room key only with devices that exist when they send, so messages from before the login stay unreadable and report `decryption_error: "missing room key"`.
+To read older history, export room keys from another Matrix client and import them:
+
+```bash
+matrix-mcp e2ee import-keys element-keys.txt
+```
+
+The device is not cross-signed, so other clients list it as an unverified session.
+Clients configured to withhold keys from unverified devices will not share room keys with it.
+Use a device created by a `matrix-mcp auth` login: an access token borrowed from another client's device cannot be used for encryption, because that device already has its own keys.
+If setup fails at login, plaintext rooms still work; retry with `matrix-mcp e2ee setup`.
+
+The keys live in a private store next to the config file, and `matrix-mcp auth logout` deletes them.
+Several MCP clients can run `matrix-mcp serve` for the same device; they take turns using the store.
+Authenticated HTTP mode does not support end-to-end encryption.
+
 ## Claude Code
 
 Add the local MCP server:
@@ -159,7 +182,7 @@ It does not expose a local HTTP port during normal MCP operation.
 - `matrix_reply`, `matrix_react`: reply to a specific event or add a reaction.
 - `matrix_edit_message`, `matrix_redact_event`: correct your messages or remove your event content, including reactions.
 - `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room`: manage your room membership and create private rooms.
-- `matrix_upload_media`, `matrix_download_media`, `matrix_send_media`: transfer bounded files and images using Matrix media URIs.
+- `matrix_upload_media`, `matrix_download_media`, `matrix_send_media`: transfer bounded files and images using Matrix media URIs; pass the message's `room_id` and `event_id` to download an encrypted attachment.
 - `matrix_get_unread`, `matrix_mark_read`: inspect unread activity and explicitly update read markers.
 
 All actions use the connected account's Matrix permissions.

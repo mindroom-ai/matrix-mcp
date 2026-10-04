@@ -68,6 +68,26 @@ For other platforms, install `cloudflared` from Cloudflare's downloads page.
 matrix-mcp auth logout
 ```
 
+Logout removes the stored credentials and the device's end-to-end encryption keys.
+
+### End-to-End Encryption
+
+```bash
+matrix-mcp e2ee setup
+matrix-mcp e2ee import-keys element-keys.txt
+```
+
+In stdio mode, Matrix MCP acts as its own encrypted Matrix device.
+Every login command publishes the device's keys and prints its fingerprint; `e2ee setup` repeats that step if it failed.
+Encrypted rooms then work with the same tools as unencrypted ones: reads are decrypted and sends are encrypted.
+Messages sent before the device existed are returned with `type: "m.room.encrypted"`, a null `body`, and `decryption_error: "missing room key"`.
+`e2ee import-keys` imports a passphrase-protected room key export from another Matrix client so that older history becomes readable.
+
+The device is not cross-signed and appears as an unverified session in other clients.
+Encryption needs a device created by a `matrix-mcp auth` login; a token borrowed from another client's device already has keys of its own.
+Keys are stored next to the config file and are readable only by your user.
+Several `matrix-mcp serve` processes can share one device; each tool call that needs encryption waits for its turn on the store.
+
 ## MCP Tools
 
 ### Identify the Session
@@ -104,6 +124,8 @@ Returned events include:
 - `event_id`: raw Matrix event ID
 - `thread_id`: raw thread root event ID when the message is a thread reply
 - `thread_ref`: numeric event ref for the thread root
+- `encrypted`: whether the message was end-to-end encrypted
+- `decryption_error`: why an encrypted message could not be read, if it could not
 
 ### Read a Thread
 
@@ -230,6 +252,7 @@ Other members still need to accept their invitations.
 matrix_upload_media(data_base64="SGVsbG8K", filename="hello.txt", content_type="text/plain")
 matrix_send_media(room_id="!room:example.com", media_url="mxc://example.com/uploaded", filename="hello.txt", content_type="text/plain", size=6)
 matrix_download_media(media_url="mxc://example.com/uploaded")
+matrix_download_media(media_url="mxc://example.com/sealed", room_id="!room:example.com", event_id="$file")
 ```
 
 Uploads return `content_uri`, filename, MIME type, and decoded byte size.
@@ -241,7 +264,9 @@ Media downloads use the configured homeserver's authenticated media API and requ
 HTTP URLs, redirects, and server filesystem paths are not accepted.
 Transfers request identity HTTP encoding; servers that force HTTP compression are rejected to preserve the byte limit.
 `matrix_send_media` accepts an optional `thread_id` and `transaction_id`.
-File and image sends perform the same best-effort encryption check as new text actions.
+Attachments in encrypted rooms report `media.encrypted: true`.
+To download one, pass the `room_id` and `event_id` of its message as well; Matrix MCP decrypts the file and verifies its hash.
+Uploaded media is stored unencrypted, so `matrix_send_media` refuses encrypted rooms; use `matrix_send_message` with `file_path` there, which uploads an encrypted copy.
 
 ### Unread Catch-Up
 

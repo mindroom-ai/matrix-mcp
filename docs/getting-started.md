@@ -122,6 +122,17 @@ matrix-mcp auth token https://mindroom.chat @alice:mindroom.chat "$MATRIX_ACCESS
 matrix-mcp auth password https://mindroom.chat @alice:mindroom.chat
 ```
 
+### End-to-End Encryption
+
+Each login creates a Matrix device for Matrix MCP and publishes its encryption keys, so encrypted rooms work from the start.
+Messages sent before the login cannot be decrypted unless you import room keys exported from another client:
+
+```bash
+matrix-mcp e2ee import-keys element-keys.txt
+```
+
+See [End-to-End Encryption](usage.md#end-to-end-encryption) for details.
+
 ## Configure an MCP Client
 
 === "Claude Code"
