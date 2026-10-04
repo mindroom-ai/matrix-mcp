@@ -113,7 +113,10 @@ class MatrixEvent(BaseModel):
     )
     decryption_error: str | None = Field(
         default=None,
-        description="Why an encrypted event could not be decrypted; its body is then null.",
+        description=(
+            "Why an encrypted event could not be decrypted; its body is then null. "
+            "'missing room key': sent before this device could receive the key."
+        ),
     )
 
 

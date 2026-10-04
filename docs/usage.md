@@ -273,7 +273,7 @@ matrix_download_media(media_url="mxc://example.com/sealed", room_id="!room:examp
 Uploads return `content_uri`, filename, MIME type, and decoded byte size.
 Pass `content_type` as a bare MIME type/subtype, such as `image/png`, without parameters.
 Use that URI to send a file or, after uploading an image, pass it as `avatar_url` to an existing avatar setter.
-Downloads return base64 content and metadata.
+Downloads return metadata plus the content: UTF-8 text files (`text/*`, JSON, XML, YAML) as `text`, other files as `data_base64`.
 Each upload or download is limited to 5 MiB of decoded data.
 Media downloads use the configured homeserver's authenticated media API and require its support for that endpoint.
 HTTP URLs, redirects, and server filesystem paths are not accepted.
@@ -281,7 +281,8 @@ Transfers request identity HTTP encoding; servers that force HTTP compression ar
 `matrix_send_media` accepts an optional `thread_id` and `transaction_id`.
 Attachments in encrypted rooms report `media.encrypted: true`.
 To download one, pass the `room_id` and `event_id` of its message as well; Matrix MCP decrypts the file and verifies its hash.
-Uploaded media is stored unencrypted, so `matrix_send_media` refuses encrypted rooms; use `matrix_send_message` with `file_path` there, which uploads an encrypted copy.
+Uploaded media is stored unencrypted, so do not use `matrix_upload_media` for files meant for an encrypted room; `matrix_send_media` refuses encrypted rooms.
+Use `matrix_send_message` with `file_path` there, which uploads an encrypted copy.
 
 ### Unread Catch-Up
 

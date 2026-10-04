@@ -490,3 +490,15 @@ async def test_download_media_needs_room_and_event_together(missing: str) -> Non
         result = await client.call_tool("matrix_download_media", arguments, raise_on_error=False)
     assert result.is_error
     assert driver.calls == []
+
+
+async def test_tool_guidance_steers_encrypted_file_sharing() -> None:
+    async with Client(create_mcp_server()) as client:
+        tools = {tool.name: tool.description or "" for tool in await client.list_tools()}
+        instructions = client.initialize_result.instructions or ""
+
+    assert "unencrypted" in tools["matrix_upload_media"]
+    assert "file_path" in tools["matrix_upload_media"]
+    assert "encrypted" in tools["matrix_send_message"]
+    assert "file_path" in instructions
+    assert "missing room key" in instructions

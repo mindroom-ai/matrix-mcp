@@ -608,7 +608,7 @@ async def test_two_users_conversation_tools_keep_request_identity(browser: OAuth
             "matrix_download_media",
             {"media_url": media_url},
         )
-        assert base64.b64decode(downloaded["structuredContent"]["data_base64"]).decode() == user
+        assert downloaded["structuredContent"]["text"] == user
         await browser.call(
             access,
             "matrix_send_media",

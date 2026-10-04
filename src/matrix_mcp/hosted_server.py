@@ -197,6 +197,8 @@ def create_hosted_server(settings: HostedSettings) -> FastMCP:
         lifespan=provider.lifespan,
         instructions=(
             "Use raw Matrix room and event IDs. Read tools first. "
+            "End-to-end encrypted rooms are not supported in this mode: their messages "
+            "return a decryption_error, and sends to them are refused. "
             "Send text, invite users, or change room/profile details only when the user "
             "explicitly requests that action."
         ),

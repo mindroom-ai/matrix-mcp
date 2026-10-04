@@ -118,7 +118,8 @@ async def test_download_uses_authenticated_media_endpoint(
 ) -> None:
     media, endpoint = matrix
     result = await media.download("mxc://example.com/file")
-    assert base64.b64decode(result.data_base64) == b"hello\n"
+    assert result.text == "hello\n"
+    assert result.data_base64 is None
     assert result.size == 6
     assert result.content_type.startswith("text/plain")
     assert endpoint.requests[-1]["path"] == DOWNLOAD
@@ -298,7 +299,7 @@ async def test_download_preserves_deep_json_file_bytes(
 
     result = await media.download("mxc://example.com/file")
 
-    assert base64.b64decode(result.data_base64) == deep_json
+    assert result.text == deep_json.decode()
 
 
 async def test_download_sanitizes_recursive_error_json(
@@ -350,7 +351,7 @@ async def test_download_retries_a_rate_limited_response(
 
     result = await media.download("mxc://example.com/file")
 
-    assert base64.b64decode(result.data_base64) == b"retried\n"
+    assert result.text == "retried\n"
     assert [request["path"] for request in endpoint.requests] == [DOWNLOAD, DOWNLOAD]
     assert delays == [0.001]
 
@@ -398,7 +399,7 @@ async def test_download_preserves_configured_homeserver_path_prefix() -> None:
         )
         result = await MatrixMedia(http).download("mxc://example.com/file")
 
-    assert base64.b64decode(result.data_base64) == b"hello\n"
+    assert result.text == "hello\n"
     assert requests == [endpoint_path]
 
 
@@ -419,7 +420,9 @@ async def test_download_decrypts_encrypted_attachment(
 
     result = await media.download("mxc://example.com/file", attachment=attachment)
 
+    assert result.data_base64 is not None
     assert base64.b64decode(result.data_base64) == b"secret image"
+    assert result.text is None
     assert result.content_type == "image/png"
     assert result.size == len(b"secret image")
 
@@ -452,3 +455,31 @@ async def test_attachment_repr_hides_key_material() -> None:
 
     assert "key" not in repr(attachment)
     assert attachment.encryption is not None
+
+
+@pytest.mark.parametrize(
+    ("content_type", "data", "returned_as"),
+    [
+        ("text/markdown; charset=utf-8", "# Plan ✓\n".encode(), "text"),
+        ("application/json", b'{"ok": true}', "text"),
+        ("application/vnd.api+json", b"{}", "text"),
+        ("text/plain", b"\xff\xfe not utf-8", "base64"),
+        ("image/png", b"\x89PNG", "base64"),
+        ("application/octet-stream", b"plain words", "base64"),
+    ],
+)
+async def test_download_returns_text_files_as_text(
+    matrix: tuple[MatrixMedia, MediaEndpoint], content_type: str, data: bytes, returned_as: str
+) -> None:
+    media, endpoint = matrix
+    endpoint.queued_downloads.append((data, 200, {"Content-Type": content_type}))
+
+    result = await media.download("mxc://example.com/file")
+
+    if returned_as == "text":
+        assert (result.text, result.data_base64) == (data.decode(), None)
+    else:
+        assert result.text is None
+        assert result.data_base64 is not None
+        assert base64.b64decode(result.data_base64) == data
+    assert result.size == len(data)

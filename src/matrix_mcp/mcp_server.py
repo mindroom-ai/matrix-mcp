@@ -195,7 +195,10 @@ class MatrixMCPTools:
         content_type: str | None = None,
         mentions: list[str] | None = None,
     ) -> dict[str, str]:
-        """Send text or a local file, with optional thread and explicit text mentions."""
+        """Send text or a local file, with optional thread and explicit text mentions.
+
+        Text and files sent to end-to-end encrypted rooms are encrypted, including the file.
+        """
         if file_path:
             if mentions is not None:
                 msg = "mentions are supported only for text messages"
@@ -230,7 +233,12 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
             "Legacy read and list tools return stable numeric refs for legacy follow-up tools. "
             "Conversation tools require raw Matrix IDs. "
             "Prefer read tools first. Send messages, invite users, or change room/profile details "
-            "only when the user explicitly requests that action."
+            "only when the user explicitly requests that action. "
+            "End-to-end encrypted rooms work like any other room. To share a file in an "
+            "encrypted room, use matrix_send_message with file_path; matrix_upload_media "
+            "stores files unencrypted. A decryption_error of 'missing room key' means the "
+            "message was sent before this device could receive its key; the user can import "
+            "older keys with `matrix-mcp e2ee import-keys`."
         ),
     )
     tools = MatrixMCPTools(client_factory=client_factory)
