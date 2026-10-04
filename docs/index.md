@@ -65,4 +65,4 @@ matrix_send_message(room_id=1, body="reply", thread_id=42)
 ```
 
 Room refs also work for the room member and room detail tools.
-History, message action, media, invitation, join and leave, and catch-up tools take raw Matrix IDs.
+History, reply, reaction, edit, redaction, media, invitation, join and leave, and catch-up tools take raw Matrix IDs.
