@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import TYPE_CHECKING, Any
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import httpx
 import pytest
+from anyio import Path as AsyncPath
 from nio import AsyncClient, AsyncClientConfig, DownloadResponse, SyncResponse, UploadResponse
 from nio.crypto.attachments import decrypt_attachment
 
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
 
 HOMESERVER = os.environ.get("MATRIX_MCP_LIVE_HOMESERVER", "")
 REGISTRATION_TOKEN = os.environ.get("MATRIX_MCP_LIVE_REGISTRATION_TOKEN", "")
+SECRET_FILE = b"encrypted attachment bytes"
 
 pytestmark = pytest.mark.skipif(
     not HOMESERVER or not REGISTRATION_TOKEN,
@@ -54,7 +57,7 @@ async def register(name: str) -> dict[str, str]:
 
 async def other_client(account: dict[str, str], store: Path) -> AsyncClient:
     """A separate E2EE-capable Matrix client, standing in for the user's chat app."""
-    store.mkdir()
+    await AsyncPath(store).mkdir()
     client = AsyncClient(
         HOMESERVER,
         account["user_id"],
@@ -92,14 +95,17 @@ async def accounts(tmp_path: Path) -> AsyncIterator[tuple[AsyncClient, MatrixMCP
         await chat_app.close()
 
 
-async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
-    accounts: tuple[AsyncClient, MatrixMCPConfig], tmp_path: Path
-) -> None:
-    chat_app, config = accounts
-    # Login publishes the matrix-mcp device keys before anyone sends to it.
-    status = await MatrixE2EE(config).setup()
-    assert status.device_id == config.device_id
+@asynccontextmanager
+async def tool_call(config: MatrixMCPConfig) -> AsyncIterator[MatrixAPIClient]:
+    """One MCP tool call: a fresh client and crypto session, closed afterwards."""
+    client = MatrixAPIClient(config=config)
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
+
+async def encrypted_room_with_mcp(chat_app: AsyncClient, config: MatrixMCPConfig) -> str:
     created = await chat_app.room_create(
         invite=[config.user_id],
         initial_state=[
@@ -110,35 +116,31 @@ async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
             }
         ],
     )
-    room_id = created.room_id
+    async with tool_call(config) as client:
+        await client.rooms.join(created.room_id)
+    # Let the chat app see the new member before it shares a room key.
+    await timeline(chat_app, created.room_id)
+    return cast("str", created.room_id)
 
-    async def tool_call() -> MatrixAPIClient:
-        return MatrixAPIClient(config=config)
 
-    client = await tool_call()
-    try:
-        await client.rooms.join(room_id)
-    finally:
-        await client.aclose()
-
-    await timeline(chat_app, room_id)
+async def send_question_and_file(
+    chat_app: AsyncClient, room_id: str, mcp_user_id: str
+) -> tuple[str, str]:
     question = await chat_app.room_send(
         room_id,
         "m.room.message",
         {
             "msgtype": "m.text",
             "body": "Encrypted question",
-            "m.mentions": {"user_ids": [config.user_id]},
+            "m.mentions": {"user_ids": [mcp_user_id]},
         },
         ignore_unverified_devices=True,
     )
-    question_id = question.event_id
-    secret_file = b"encrypted attachment bytes"
     upload, keys = await chat_app.upload(
-        lambda *_: secret_file,
+        lambda *_: SECRET_FILE,
         content_type="application/octet-stream",
         encrypt=True,
-        filesize=len(secret_file),
+        filesize=len(SECRET_FILE),
     )
     assert isinstance(upload, UploadResponse)
     attachment = await chat_app.room_send(
@@ -147,74 +149,53 @@ async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
         {
             "msgtype": "m.file",
             "body": "notes.txt",
-            "info": {"mimetype": "text/plain", "size": len(secret_file)},
+            "info": {"mimetype": "text/plain", "size": len(SECRET_FILE)},
             "file": {"url": upload.content_uri, **keys},
         },
         ignore_unverified_devices=True,
     )
+    return question.event_id, attachment.event_id
 
-    # Each block below is one MCP tool call with a fresh client and crypto session.
-    client = await tool_call()
-    try:
-        recent = await client.read_room_recent(room_id, limit=10)
-        page = await client.events.history(room_id, limit=10)
-    finally:
-        await client.aclose()
-    by_id = {event.event_id: event for event in recent}
-    assert by_id[question_id].body == "Encrypted question"
-    assert by_id[question_id].encrypted is True
-    assert by_id[question_id].decryption_error is None
-    media = next(event.media for event in page.events if event.event_id == attachment.event_id)
+
+async def assert_mcp_reads(
+    config: MatrixMCPConfig, room_id: str, question_id: str, attachment_id: str
+) -> None:
+    async with tool_call(config) as client:
+        recent = {event.event_id: event for event in await client.read_room_recent(room_id)}
+        page = await client.events.history(room_id)
+    assert recent[question_id].body == "Encrypted question"
+    assert recent[question_id].encrypted is True
+    assert recent[question_id].decryption_error is None
+    media = next(event.media for event in page.events if event.event_id == attachment_id)
     assert media is not None
     assert media.encrypted is True
 
-    client = await tool_call()
-    try:
-        downloaded = await client.media.download(
-            media.url,
-            attachment=await client.events.attachment(room_id, attachment.event_id),
-        )
-    finally:
-        await client.aclose()
-    assert base64.b64decode(downloaded.data_base64) == secret_file
+    async with tool_call(config) as client:
+        attachment = await client.events.attachment(room_id, attachment_id)
+        downloaded = await client.media.download(media.url, attachment=attachment)
+    assert base64.b64decode(downloaded.data_base64) == SECRET_FILE
     assert downloaded.content_type == "text/plain"
 
-    client = await tool_call()
-    try:
+    async with tool_call(config) as client:
         unread = await client.rooms.unread()
-    finally:
-        await client.aclose()
-    mentions = [mention for room in unread.rooms for mention in room.mentions]
-    assert [mention.body for mention in mentions] == ["Encrypted question"]
+    mentions = [mention.body for room in unread.rooms for mention in room.mentions]
+    assert mentions == ["Encrypted question"]
 
-    client = await tool_call()
-    try:
-        reply_id = await client.send_message(room_id, "Encrypted answer", thread_id=question_id)
-        await client.events.react(room_id, question_id, "👍")
-        await client.events.edit(room_id, reply_id, "Encrypted answer, edited")
-        report = tmp_path / "report.txt"
-        report.write_text("report contents", encoding="utf-8")
-        file_id = await client.send_file(room_id, str(report))
-    finally:
-        await client.aclose()
 
+async def assert_chat_app_reads(
+    chat_app: AsyncClient, config: MatrixMCPConfig, room_id: str, sent: dict[str, str]
+) -> None:
     received = await timeline(chat_app, room_id)
-    sent_by_mcp = [event for event in received if event.sender == config.user_id]
-    assert sent_by_mcp, "the chat app saw no events from matrix-mcp"
-    assert all(getattr(event, "decrypted", False) for event in sent_by_mcp)
-    contents = {event.event_id: event.source["content"] for event in sent_by_mcp}
-    assert contents[reply_id]["body"] == "Encrypted answer"
-    assert contents[reply_id]["m.relates_to"]["event_id"] == question_id
-    edits = [content for content in contents.values() if "m.new_content" in content]
-    assert edits[0]["m.new_content"]["body"] == "Encrypted answer, edited"
-    reactions = [
-        content
-        for content in contents.values()
-        if content.get("m.relates_to", {}).get("rel_type") == "m.annotation"
-    ]
-    assert reactions[0]["m.relates_to"]["key"] == "👍"
-    sent_file = contents[file_id]["file"]
-    assert "url" not in contents[file_id]
+    from_mcp = [event for event in received if event.sender == config.user_id]
+    assert from_mcp, "the chat app saw no events from matrix-mcp"
+    assert all(getattr(event, "decrypted", False) for event in from_mcp)
+    contents = {event.event_id: event.source["content"] for event in from_mcp}
+    assert contents[sent["reply"]]["body"] == "Encrypted answer"
+    assert contents[sent["reply"]]["m.relates_to"]["event_id"] == sent["question"]
+    assert contents[sent["edit"]]["m.new_content"]["body"] == "Encrypted answer, edited"
+    assert contents[sent["reaction"]]["m.relates_to"]["key"] == "👍"
+    sent_file = contents[sent["file"]]["file"]
+    assert "url" not in contents[sent["file"]]
     download = await chat_app.download(mxc=sent_file["url"])
     assert isinstance(download, DownloadResponse)
     plaintext = decrypt_attachment(
@@ -222,12 +203,33 @@ async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
     )
     assert plaintext == b"report contents"
 
-    client = await tool_call()
-    try:
+
+async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
+    accounts: tuple[AsyncClient, MatrixMCPConfig], tmp_path: Path
+) -> None:
+    chat_app, config = accounts
+    # Login publishes the matrix-mcp device keys before anyone sends to it.
+    status = await MatrixE2EE(config).setup()
+    assert status.device_id == config.device_id
+    room_id = await encrypted_room_with_mcp(chat_app, config)
+    assert config.user_id is not None
+    question_id, attachment_id = await send_question_and_file(chat_app, room_id, config.user_id)
+
+    await assert_mcp_reads(config, room_id, question_id, attachment_id)
+
+    report = tmp_path / "report.txt"
+    report.write_text("report contents", encoding="utf-8")
+    async with tool_call(config) as client:
+        reply_id = await client.send_message(room_id, "Encrypted answer", thread_id=question_id)
+        sent = {
+            "question": question_id,
+            "reply": reply_id,
+            "reaction": await client.events.react(room_id, question_id, "👍"),
+            "edit": await client.events.edit(room_id, reply_id, "Encrypted answer, edited"),
+            "file": await client.send_file(room_id, str(report)),
+        }
+    await assert_chat_app_reads(chat_app, config, room_id, sent)
+
+    async with tool_call(config) as client:
         thread = await client.read_thread(room_id, question_id)
-    finally:
-        await client.aclose()
-    assert [event.body for event in thread] == [
-        "Encrypted question",
-        "Encrypted answer, edited",
-    ]
+    assert [event.body for event in thread] == ["Encrypted question", "Encrypted answer, edited"]
