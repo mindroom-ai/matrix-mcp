@@ -51,6 +51,9 @@ _LOCK_TIMEOUT_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_RETRIES = 3
 # Only to-device messages (room keys) and key counts are needed from /sync.
+_DEDICATED_DEVICE_HINT = (
+    "log in with `matrix-mcp auth sso` or `matrix-mcp auth password` to create a dedicated device"
+)
 _CATCH_UP_FILTER: dict[str, Any] = {
     "presence": {"types": []},
     "account_data": {"types": []},
@@ -223,6 +226,7 @@ class MatrixE2EE:
         client: AsyncClient | None = None
         try:
             client = self._new_client(path)
+            await self._refuse_foreign_device_keys(client)
             await _upload_keys(client)
             await _catch_up(client)
             await _upload_keys(client)
@@ -235,6 +239,31 @@ class MatrixE2EE:
             raise
         self._file_lock = file_lock
         return client
+
+    async def _refuse_foreign_device_keys(self, client: AsyncClient) -> None:
+        """Never replace identity keys another client already published for this device.
+
+        Homeservers may overwrite a device's keys on upload, which would break the client
+        that owns the device, for example when credentials came from `auth token`.
+        """
+        olm = _olm(client)
+        if olm.account.shared:
+            return
+        olm.users_for_key_query.add(self._user_id)
+        response = await client.keys_query()
+        if not isinstance(response, KeysQueryResponse):
+            msg = "Matrix key query failed; cannot check this device's published keys"
+            raise E2EEUnavailableError(msg)
+        published = response.device_keys.get(self._user_id, {}).get(self._device_id)
+        if not published:
+            return
+        ours = olm.account.identity_keys["ed25519"]
+        if published.get("keys", {}).get(f"ed25519:{self._device_id}") != ours:
+            msg = (
+                "This device already has encryption keys from another Matrix client, and "
+                f"matrix-mcp will not replace them; {_DEDICATED_DEVICE_HINT}"
+            )
+            raise E2EEUnavailableError(msg)
 
     def _new_client(self, path: Path) -> AsyncClient:
         config = self._config
@@ -277,11 +306,7 @@ async def _upload_keys(client: AsyncClient) -> None:
         return
     response = await client.keys_upload()
     if not isinstance(response, KeysUploadResponse):
-        msg = (
-            "Matrix rejected this device's encryption keys. The device may already have keys "
-            "from another client; log in with `matrix-mcp auth sso` or `matrix-mcp auth "
-            "password` to create a dedicated device"
-        )
+        msg = f"Matrix rejected this device's encryption keys; {_DEDICATED_DEVICE_HINT}"
         raise E2EEUnavailableError(msg)
 
 

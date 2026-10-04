@@ -76,9 +76,8 @@ class CryptoEndpoint:
         if path.endswith("/joined_members"):
             return web.json_response({"joined": {USER: {}}})
         if path == "/_matrix/client/v3/keys/query":
-            return web.json_response(
-                {"device_keys": {USER: {DEVICE: self.device_keys}}, "failures": {}}
-            )
+            devices = {DEVICE: self.device_keys} if self.device_keys else {}
+            return web.json_response({"device_keys": {USER: devices}, "failures": {}})
         if path == "/_matrix/client/v3/keys/claim":
             return web.json_response({"one_time_keys": {}, "failures": {}})
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
@@ -322,14 +321,16 @@ async def test_imported_room_keys_decrypt_older_history(
     await exporter.close()
     raw = megolm_event("$old", encrypted)
 
+    # The export is imported on a different device of the same account.
+    reader_config = config.model_copy(update={"device_id": "READERDEVICE"})
     reader_store = tmp_path / "reader"
-    reader = MatrixE2EE(config, store_path=reader_store)
+    reader = MatrixE2EE(reader_config, store_path=reader_store)
     try:
         before = await reader.decrypt(ROOM, raw)
     finally:
         await reader.aclose()
-    await MatrixE2EE(config, store_path=reader_store).import_keys(export, "correct horse")
-    reader = MatrixE2EE(config, store_path=reader_store)
+    await MatrixE2EE(reader_config, store_path=reader_store).import_keys(export, "correct horse")
+    reader = MatrixE2EE(reader_config, store_path=reader_store)
     try:
         after = await reader.decrypt(ROOM, raw)
     finally:
@@ -353,3 +354,35 @@ async def test_import_keys_reports_unusable_exports(
 
     with pytest.raises(ValueError, match="passphrase"):
         await MatrixE2EE(config, store_path=tmp_path / "store").import_keys(export, "wrong")
+
+
+async def test_keys_another_client_published_for_the_device_are_never_replaced(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.device_keys = {
+        "user_id": USER,
+        "device_id": DEVICE,
+        "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+        "keys": {f"curve25519:{DEVICE}": "Y3VydmU", f"ed25519:{DEVICE}": "ZWQyNTUxOQ"},
+        "signatures": {USER: {f"ed25519:{DEVICE}": "c2lnbmF0dXJl"}},
+    }
+
+    with pytest.raises(E2EEUnavailableError, match="another Matrix client"):
+        await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    assert not any(request["path"].endswith("/keys/upload") for request in endpoint.requests)
+
+
+async def test_reopened_store_keeps_its_published_keys(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    first = await MatrixE2EE(config, store_path=tmp_path).setup()
+    queries_before = sum(request["path"].endswith("/keys/query") for request in endpoint.requests)
+
+    second = await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    assert second.fingerprint == first.fingerprint
+    queries = sum(request["path"].endswith("/keys/query") for request in endpoint.requests)
+    assert queries == queries_before
