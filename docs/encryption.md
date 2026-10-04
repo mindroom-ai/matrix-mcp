@@ -10,7 +10,7 @@ Authenticated HTTP mode does not support encrypted rooms.
 
 ## Setup
 
-Every `matrix-mcp auth` login publishes the new device's encryption keys and prints its fingerprint.
+Every `matrix-mcp auth` login publishes the device's encryption keys and prints its fingerprint; `auth token` does so only when given `--device-id`.
 If that step fails, unencrypted rooms still work; retry it with:
 
 ```bash
@@ -33,7 +33,7 @@ matrix-mcp e2ee import-keys element-keys.txt
 ## Files
 
 Attachments in encrypted rooms show `media.encrypted: true`.
-To download one, pass the `room_id` and `event_id` of its message to `matrix_download_media`.
+To download one, pass its `media_url` together with the `room_id` and `event_id` of its message to `matrix_download_media`.
 
 To share a file in an encrypted room, use `matrix_send_message` with `file_path`; it uploads an encrypted copy.
 `matrix_upload_media` stores files unencrypted, and `matrix_send_media` refuses encrypted rooms.
