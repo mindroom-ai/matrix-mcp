@@ -4,12 +4,14 @@ import base64
 import binascii
 import json
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
-from pydantic import BaseModel
+from nio.crypto.attachments import decrypt_attachment
+from nio.exceptions import EncryptionError
+from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.matrix_http import (
     RATE_LIMIT_RETRIES,
@@ -32,6 +34,16 @@ MXC_URI_PATTERN = (
 )
 _MAX_ENCODED_LENGTH = 4 * ((MAX_MEDIA_BYTES + 2) // 3)
 _CHUNK_BYTES = 64 * 1024
+
+
+class EventAttachment(BaseModel):
+    """A message's attachment, with decryption info when it is end-to-end encrypted."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str
+    mimetype: str | None = None
+    encryption: dict[str, Any] | None = Field(default=None, repr=False)
 
 
 class UploadedMedia(BaseModel):
@@ -94,8 +106,13 @@ class MatrixMedia:
             size=len(data),
         )
 
-    async def download(self, media_url: str) -> DownloadedMedia:
+    async def download(
+        self, media_url: str, *, attachment: EventAttachment | None = None
+    ) -> DownloadedMedia:
         server, media_id = _mxc_parts(media_url)
+        if attachment is not None and _mxc_parts(attachment.url) != (server, media_id):
+            msg = "media_url does not match the attachment of the given event"
+            raise ValueError(msg)
         route = (
             f"/_matrix/client/v1/media/download/{quote(server, safe='')}/{quote(media_id, safe='')}"
         )
@@ -133,6 +150,9 @@ class MatrixMedia:
         except httpx.HTTPError as exc:
             msg = "Matrix media download failed before receiving complete content"
             raise RuntimeError(msg) from exc
+        if attachment is not None and attachment.encryption is not None:
+            data = _decrypt(data, attachment.encryption)
+            content_type = attachment.mimetype or "application/octet-stream"
         return DownloadedMedia(
             media_url=media_url,
             content_type=content_type,
@@ -203,6 +223,21 @@ class MatrixMedia:
             raise RuntimeError(msg)  # noqa: TRY004 - Invalid upstream response.
         quote_matrix_id(event_id, sigil="$", label="event ID")
         return event_id
+
+
+def _decrypt(ciphertext: bytes, encryption: dict[str, Any]) -> bytes:
+    try:
+        return bytes(
+            decrypt_attachment(
+                ciphertext,
+                encryption["key"]["k"],
+                encryption["hashes"]["sha256"],
+                encryption["iv"],
+            )
+        )
+    except (EncryptionError, KeyError, TypeError, ValueError):
+        msg = "Encrypted Matrix attachment failed its integrity check or has invalid keys"
+        raise RuntimeError(msg) from None
 
 
 def _mxc_parts(uri: str) -> tuple[str, str]:

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.e2ee import E2EE_UNSUPPORTED, DecryptedEvent
 from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, quote_transaction_id
+from matrix_mcp.matrix_media import EventAttachment
 
 if TYPE_CHECKING:
     from matrix_mcp.e2ee import RoomCrypto
@@ -30,6 +31,13 @@ class MediaMetadata(BaseModel):
     width: int | None = None
     height: int | None = None
     duration_ms: int | None = None
+    encrypted: bool = Field(
+        default=False,
+        description=(
+            "End-to-end encrypted attachment; pass room_id and event_id to "
+            "matrix_download_media to decrypt it."
+        ),
+    )
 
 
 class TimelineEvent(BaseModel):
@@ -342,6 +350,28 @@ class MatrixEvents:
         quote_matrix_id(room_id, sigil="!", label="room ID")
         return await self._send(room_id, event_type, content, _transaction_path(transaction_id))
 
+    async def attachment(self, room_id: str, event_id: str) -> EventAttachment:
+        """Read a message's attachment, including decryption info for encrypted media."""
+        target = await self._fetch_event(room_id, event_id)
+        if _is_redacted(target):
+            msg = "Matrix event was redacted"
+            raise ValueError(msg)
+        target = await self._decrypted_target(room_id, target)
+        content = _mapping_field(target, "content", required=True)
+        info = _mapping_field(content, "info")
+        mimetype = _optional_string(info.get("mimetype"))
+        if content.get("msgtype") in _MEDIA_MSGTYPES:
+            url = _optional_string(content.get("url"))
+            if url is not None:
+                return EventAttachment(url=url, mimetype=mimetype)
+            encrypted_file = content.get("file")
+            if isinstance(encrypted_file, dict) and _optional_string(encrypted_file.get("url")):
+                return EventAttachment(
+                    url=encrypted_file["url"], mimetype=mimetype, encryption=encrypted_file
+                )
+        msg = "Matrix event has no attachment"
+        raise ValueError(msg)
+
     async def decrypt_raw(
         self, room_id: str, raw_events: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], dict[str, str | None]]:
@@ -368,7 +398,7 @@ class MatrixEvents:
         [decrypted], encryption = await self.decrypt_raw(room_id, [target])
         error = encryption.get(cast("str", target["event_id"]))
         if error is not None:
-            msg = f"Cannot change an encrypted Matrix event that could not be decrypted: {error}"
+            msg = f"Encrypted Matrix event could not be decrypted: {error}"
             raise ValueError(msg)
         return decrypted
 
@@ -552,8 +582,15 @@ def _timeline_event(raw: dict[str, Any]) -> TimelineEvent:
 
 
 def _media_metadata(content: dict[str, Any], msgtype: str | None) -> MediaMetadata | None:
+    if msgtype not in _MEDIA_MSGTYPES:
+        return None
     url = _optional_string(content.get("url"))
-    if msgtype not in _MEDIA_MSGTYPES or url is None:
+    encrypted = False
+    encrypted_file = content.get("file")
+    if url is None and isinstance(encrypted_file, dict):
+        url = _optional_string(encrypted_file.get("url"))
+        encrypted = True
+    if url is None:
         return None
     info_value = content.get("info")
     info = info_value if isinstance(info_value, dict) else {}
@@ -566,6 +603,7 @@ def _media_metadata(content: dict[str, Any], msgtype: str | None) -> MediaMetada
         width=_optional_integer(info.get("w")),
         height=_optional_integer(info.get("h")),
         duration_ms=_optional_integer(info.get("duration")),
+        encrypted=encrypted,
     )
 
 

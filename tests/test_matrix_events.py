@@ -214,6 +214,7 @@ async def test_history_preserves_cursor_and_attachment(
         "width": None,
         "height": None,
         "duration_ms": None,
+        "encrypted": False,
     }
     assert endpoint.requests[0]["query"] == {
         "dir": "b",
@@ -995,3 +996,72 @@ async def test_edit_refuses_an_undecryptable_target(
 
     assert crypto.encrypted == []
     assert all(request["method"] == "GET" for request in endpoint.requests)
+
+
+ENCRYPTED_FILE = {
+    "url": "mxc://example.com/sealed",
+    "key": {"kty": "oct", "alg": "A256CTR", "ext": True, "k": "secret-key", "key_ops": []},
+    "iv": "iv",
+    "hashes": {"sha256": "hash"},
+    "v": "v2",
+}
+ENCRYPTED_IMAGE = {
+    "msgtype": "m.image",
+    "body": "photo.png",
+    "file": ENCRYPTED_FILE,
+    "info": {"mimetype": "image/png", "size": 3},
+}
+
+
+async def test_history_reports_encrypted_attachments_without_keys(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond(
+        "GET", f"{ROOM_PATH}/messages", {"chunk": [crypto.seal("$photo", ENCRYPTED_IMAGE)]}
+    )
+
+    page = await events.history(ROOM)
+
+    media = page.events[0].media
+    assert media is not None
+    assert media.url == "mxc://example.com/sealed"
+    assert media.encrypted is True
+    assert "secret-key" not in page.model_dump_json()
+
+
+async def test_attachment_returns_decryption_info_for_encrypted_media(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$photo", crypto.seal("$photo", ENCRYPTED_IMAGE))
+
+    attachment = await events.attachment(ROOM, "$photo")
+
+    assert attachment.url == "mxc://example.com/sealed"
+    assert attachment.mimetype == "image/png"
+    assert attachment.encryption == ENCRYPTED_FILE
+
+
+async def test_attachment_reads_plaintext_media(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    photo = message("$photo", msgtype="m.image", body="photo.png")
+    photo["content"].update({"url": "mxc://example.com/photo", "info": {"mimetype": "image/png"}})
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$photo", photo)
+
+    attachment = await events.attachment(ROOM, "$photo")
+
+    assert attachment.url == "mxc://example.com/photo"
+    assert attachment.encryption is None
+
+
+async def test_attachment_rejects_events_without_media(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$text", message("$text"))
+
+    with pytest.raises(ValueError, match="no attachment"):
+        await events.attachment(ROOM, "$text")

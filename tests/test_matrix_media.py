@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from nio.crypto.attachments import encrypt_attachment
 
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.matrix_http import MatrixHTTP
-from matrix_mcp.matrix_media import MatrixMedia
+from matrix_mcp.matrix_media import EventAttachment, MatrixMedia
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -195,7 +196,7 @@ async def test_encrypted_room_never_receives_media_event(
 ) -> None:
     media, endpoint = matrix
     endpoint.encrypted = True
-    with pytest.raises(RuntimeError, match="encrypted"):
+    with pytest.raises(RuntimeError, match="file_path"):
         await media.send(ROOM, "mxc://example.com/file", "hello.txt")
     assert all("/send/" not in request["path"] for request in endpoint.requests)
 
@@ -399,3 +400,55 @@ async def test_download_preserves_configured_homeserver_path_prefix() -> None:
 
     assert base64.b64decode(result.data_base64) == b"hello\n"
     assert requests == [endpoint_path]
+
+
+def encrypted_attachment(plaintext: bytes) -> tuple[bytes, EventAttachment]:
+    ciphertext, keys = encrypt_attachment(plaintext)
+    return ciphertext, EventAttachment(
+        url="mxc://example.com/file",
+        mimetype="image/png",
+        encryption={**keys, "url": "mxc://example.com/file"},
+    )
+
+
+async def test_download_decrypts_encrypted_attachment(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    endpoint.download, attachment = encrypted_attachment(b"secret image")
+
+    result = await media.download("mxc://example.com/file", attachment=attachment)
+
+    assert base64.b64decode(result.data_base64) == b"secret image"
+    assert result.content_type == "image/png"
+    assert result.size == len(b"secret image")
+
+
+async def test_download_rejects_tampered_encrypted_attachment(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    ciphertext, attachment = encrypted_attachment(b"secret image")
+    endpoint.download = bytes([ciphertext[0] ^ 1]) + ciphertext[1:]
+
+    with pytest.raises(RuntimeError, match="integrity"):
+        await media.download("mxc://example.com/file", attachment=attachment)
+
+
+async def test_download_requires_url_to_match_the_event_attachment(
+    matrix: tuple[MatrixMedia, MediaEndpoint],
+) -> None:
+    media, endpoint = matrix
+    attachment = EventAttachment(url="mxc://example.com/other")
+
+    with pytest.raises(ValueError, match="does not match"):
+        await media.download("mxc://example.com/file", attachment=attachment)
+
+    assert endpoint.requests == []
+
+
+async def test_attachment_repr_hides_key_material() -> None:
+    _, attachment = encrypted_attachment(b"secret")
+
+    assert "key" not in repr(attachment)
+    assert attachment.encryption is not None

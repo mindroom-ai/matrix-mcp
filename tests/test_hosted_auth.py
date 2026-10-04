@@ -548,7 +548,10 @@ async def test_two_users_tools_use_request_identity_without_local_files(
         if tool["name"] not in {"matrix_invite_user", "matrix_get_profile"}:
             assert "user_id" not in properties
         if "room_id" in properties:
-            assert properties["room_id"]["type"] == "string"
+            room_id = properties["room_id"]
+            options = room_id.get("anyOf", [room_id])
+            assert {option["type"] for option in options} <= {"string", "null"}
+            assert "string" in {option["type"] for option in options}
     response = await browser.rpc(
         alice["access_token"],
         "tools/call",
