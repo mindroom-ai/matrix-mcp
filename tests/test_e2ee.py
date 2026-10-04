@@ -12,7 +12,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from anyio import Path as AsyncPath
 from nio import AsyncClient, AsyncClientConfig
+from nio.crypto import Olm
 from nio.crypto.key_export import decrypt_and_read, encrypt_and_save
+from peewee import OperationalError
 
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.e2ee import (
@@ -27,8 +29,6 @@ from matrix_mcp.e2ee import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
-
-    from nio.crypto import Olm
 
 USER = "@alice:example.com"
 DEVICE = "ALICEDEVICE"
@@ -46,6 +46,8 @@ class CryptoEndpoint:
     to_device_batches: list[list[dict[str, Any]]] = field(default_factory=list)
     batch: int = 0
     whoami_device: str = DEVICE
+    failures: dict[str, dict[str, Any]] = field(default_factory=dict)
+    other_devices: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -68,7 +70,10 @@ class CryptoEndpoint:
                 )
             assert isinstance(body, dict)
             if "device_keys" in body:
-                self.device_keys = body["device_keys"]
+                if body["device_keys"]["device_id"] == DEVICE:
+                    self.device_keys = body["device_keys"]
+                else:
+                    self.other_devices[body["device_keys"]["device_id"]] = body["device_keys"]
             self.one_time_keys += len(body.get("one_time_keys", {}))
             return web.json_response(
                 {"one_time_key_counts": {"signed_curve25519": self.one_time_keys}}
@@ -87,9 +92,14 @@ class CryptoEndpoint:
             return web.json_response({"joined": {USER: {}}})
         if path == "/_matrix/client/v3/keys/query":
             devices = {DEVICE: self.device_keys} if self.device_keys else {}
-            return web.json_response({"device_keys": {USER: devices}, "failures": {}})
+            devices.update(self.other_devices)
+            return web.json_response(
+                {"device_keys": {USER: devices}, "failures": self.failures.get("query", {})}
+            )
         if path == "/_matrix/client/v3/keys/claim":
-            return web.json_response({"one_time_keys": {}, "failures": {}})
+            return web.json_response(
+                {"one_time_keys": {}, "failures": self.failures.get("claim", {})}
+            )
         return web.json_response({"errcode": "M_NOT_FOUND"}, status=404)
 
     def syncs(self) -> list[dict[str, Any]]:
@@ -390,13 +400,35 @@ async def test_reopened_store_keeps_its_published_keys(
 ) -> None:
     config, endpoint = homeserver
     first = await MatrixE2EE(config, store_path=tmp_path).setup()
-    queries_before = sum(request["path"].endswith("/keys/query") for request in endpoint.requests)
 
     second = await MatrixE2EE(config, store_path=tmp_path).setup()
 
     assert second.fingerprint == first.fingerprint
-    queries = sum(request["path"].endswith("/keys/query") for request in endpoint.requests)
-    assert queries == queries_before
+    assert [request["body"].get("device_keys") is not None for request in uploads(endpoint)] == [
+        True
+    ]
+
+
+@pytest.mark.parametrize("change", ["token device", "published keys", "missing keys"])
+async def test_reopened_store_checks_the_device_identity_every_time(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path, change: str
+) -> None:
+    config, endpoint = homeserver
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+    syncs_before = len(endpoint.syncs())
+    assert endpoint.device_keys is not None
+    if change == "token device":
+        endpoint.whoami_device = "OTHERDEVICE"
+    elif change == "published keys":
+        endpoint.device_keys["keys"][f"ed25519:{DEVICE}"] = "c29tZW9uZSBlbHNl"
+    else:
+        endpoint.device_keys = None
+
+    with pytest.raises(E2EEUnavailableError, match="device"):
+        await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    assert len(endpoint.syncs()) == syncs_before
+    assert await AsyncPath(tmp_path).exists()
 
 
 async def export_room_keys(
@@ -639,3 +671,83 @@ async def test_queued_to_device_messages_are_sent_after_catch_up(
     await MatrixE2EE(config, store_path=tmp_path).setup()
 
     assert sent == [True]
+
+
+async def test_refused_fresh_store_is_removed(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.whoami_device = "TOKENDEVICE"
+    store = tmp_path / "store"
+
+    with pytest.raises(E2EEUnavailableError):
+        await MatrixE2EE(config, store_path=store).setup()
+
+    assert not store.exists()
+
+
+async def test_local_storage_errors_stop_the_catch_up_without_acknowledging_keys(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, endpoint = homeserver
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+    endpoint.to_device_batches = [[{"type": "m.dummy", "sender": USER, "content": {}}]]
+
+    def disk_full(_olm: object, _event: object) -> None:
+        msg = "database or disk is full"
+        raise OperationalError(msg)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Olm, "handle_to_device_event", disk_full)
+        with pytest.raises(E2EEUnavailableError, match="OperationalError"):
+            await MatrixE2EE(config, store_path=tmp_path).setup()
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    since = [sync["query"].get("since") for sync in endpoint.syncs()]
+    # The failed batch was not acknowledged, so the next call fetches it again.
+    assert since == [None, "batch-1", "batch-1"]
+
+
+@pytest.mark.parametrize("step", ["query", "claim"])
+async def test_partial_key_failures_stop_the_send(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step: str,
+) -> None:
+    config, endpoint = homeserver
+    if step == "claim":
+        monkeypatch.setattr(
+            AsyncClient,
+            "get_missing_sessions",
+            lambda _client, _room: {"@bob:remote.example": ["X"]},
+        )
+    crypto = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        await crypto.decrypt(ROOM, megolm_event("$open", {}))
+        endpoint.failures[step] = {"remote.example": {"errcode": "M_UNREACHABLE"}}
+        with pytest.raises(RuntimeError, match=r"remote\.example"):
+            await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
+    finally:
+        await crypto.aclose()
+
+
+async def test_failed_key_delivery_is_retried_on_the_next_send(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _endpoint = homeserver
+    undelivered = [{("@bob:example.com", "PHONE")}, set()]
+    monkeypatch.setattr("matrix_mcp.e2ee.undelivered_devices", lambda *_args: undelivered.pop(0))
+    crypto = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
+        await crypto.encrypt(ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"})
+    finally:
+        await crypto.aclose()
+
+    assert undelivered == []

@@ -39,6 +39,7 @@ from matrix_mcp.matrix_events import (
     MatrixEvents,
     MediaMetadata,
     TimelineEvent,
+    is_decrypted,
     mark_encryption,
     normalize_timeline_event,
     trusted_replacements,
@@ -429,7 +430,7 @@ class NioMatrixDriver:
                 room_id,
                 raw,
                 page_size=max_replies,
-                encrypted=_optional_event_id(raw) in encryption,
+                encrypted=is_decrypted(raw),
             )
             event = _event_from_timeline(mark_encryption(timeline, encryption))
             if is_reply and event.thread_id is None:
@@ -455,12 +456,10 @@ class NioMatrixDriver:
         ):
             replacement_source = _source_from_nio(replacement)
             if replacement_source is not None:
-                [replacement_source], states = await self.events.decrypt_raw(
+                [replacement_source], _ = await self.events.decrypt_raw(
                     room_id, [replacement_source]
                 )
-                if encrypted and not trusted_replacements(
-                    event.event_id, [replacement_source], {event.event_id: None, **states}
-                ):
+                if not trusted_replacements([replacement_source], original_encrypted=encrypted):
                     replacement_source = None
             if replacement_source is not None:
                 updated = normalize_timeline_event(
@@ -548,7 +547,7 @@ class NioMatrixDriver:
                 encryption=encryption,
             )
             return await self.events.send(
-                room_id, "m.room.message", content, allow_encryption=encryption is not None
+                room_id, "m.room.message", content, expect_encrypted=encryption is not None
             )
         msg = f"Matrix media upload failed: {upload_response}"
         raise RuntimeError(msg)
@@ -765,11 +764,6 @@ def _event_from_nio(room_id: str, raw: object) -> MatrixEvent | None:
     if source is None:
         return None
     return _event_from_timeline(normalize_timeline_event(room_id, source))
-
-
-def _optional_event_id(raw: dict[str, Any]) -> str | None:
-    event_id = raw.get("event_id")
-    return event_id if isinstance(event_id, str) else None
 
 
 def _source_from_nio(raw: object) -> dict[str, Any] | None:

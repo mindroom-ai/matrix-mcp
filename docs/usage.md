@@ -88,9 +88,18 @@ Encryption needs a device created by a `matrix-mcp auth` login; a token borrowed
 Keys are stored next to the config file and are readable only by your user.
 Several `matrix-mcp serve` processes can share one device; each tool call that needs encryption waits for its turn on the store.
 
-Matrix MCP verifies no devices, so it trusts the homeserver to name the sender of each message, as an unverified client would.
-Edits of encrypted messages count only when the edit itself was encrypted.
-Before sending, it checks that every reachable device received the room key, and it refuses to send otherwise.
+Each tool call checks that the access token and the homeserver's published keys still belong to this store before it syncs or uploads keys.
+Run Matrix MCP for a device on one machine only: a copied config directory would make two machines consume the same device's room keys.
+
+Limitations:
+
+- Matrix MCP verifies no devices, so it trusts the homeserver to name the sender of each message, as an unverified client would.
+- Megolm replay detection only covers a single tool call, because it is not stored between calls.
+- Room keys go to joined members; invited users cannot read messages sent before they join.
+- Edits of encrypted messages count only when the edit itself was encrypted.
+- Before sending, Matrix MCP checks that every device with an encryption session received the room key, and refuses to send otherwise. Devices that have run out of one-time keys are skipped, as in other clients. Sends also stop while the homeserver cannot fetch device keys from another server in the room.
+- The encryption check and the send are separate requests, so a room that enables encryption between them can still receive one plaintext message.
+- Thread reads count other thread events, such as reactions to the thread, toward `limit`, so fewer messages than `limit` may be returned.
 
 ## MCP Tools
 

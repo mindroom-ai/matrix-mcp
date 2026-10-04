@@ -12,6 +12,8 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
+import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -32,6 +34,7 @@ from nio import (
 )
 from nio.exceptions import EncryptionError
 from nio.rooms import MatrixRoom
+from peewee import PeeweeException
 
 from matrix_mcp.config import default_config_path
 from matrix_mcp.http_headers import resolve_http_headers
@@ -191,6 +194,7 @@ class MatrixE2EE:
         if not isinstance(keys, KeysQueryResponse):
             msg = f"Matrix keys query failed: {keys}"
             raise RuntimeError(msg)  # noqa: TRY004 - Upstream error response.
+        _require_no_failures("fetch device keys", keys.failures)
         # nio ignores failed one-time key claims and to-device sends while sharing a room
         # key, so check both here: a message nobody can decrypt must not be sent.
         missing_sessions = client.get_missing_sessions(room_id)
@@ -199,6 +203,7 @@ class MatrixE2EE:
             if not isinstance(claimed, KeysClaimResponse):
                 msg = f"Matrix one-time key claim failed: {claimed}"
                 raise RuntimeError(msg)
+            _require_no_failures("claim one-time keys", claimed.failures)
         if olm.should_share_group_session(room_id):
             shared = await client.share_group_session(room_id, ignore_unverified_devices=True)
             if not isinstance(shared, ShareGroupSessionResponse):
@@ -206,6 +211,8 @@ class MatrixE2EE:
                 raise RuntimeError(msg)
             undelivered = undelivered_devices(olm, room.users, shared.users_shared_with)
             if undelivered:
+                # nio marked the session shared anyway; start a fresh one next time.
+                olm.outbound_group_sessions.pop(room_id, None)
                 msg = (
                     f"Matrix room key delivery failed for {len(undelivered)} device(s); "
                     "the message was not sent"
@@ -250,47 +257,37 @@ class MatrixE2EE:
         except Timeout as exc:
             msg = "The end-to-end encryption store is in use by another matrix-mcp call; retry"
             raise E2EEUnavailableError(msg) from exc
+        # A store created here and refused before publishing anything is removed again,
+        # so a call that waited out a logout does not leave fresh keys behind.
+        created = not path.exists()
         client: AsyncClient | None = None
         try:
             _private_directory(path)
             client = self._new_client(path)
-            await self._refuse_foreign_device_keys(client)
+            await self._check_device_identity(client)
             await _upload_keys(client)
             await _catch_up(client)
             await _upload_keys(client)
             await _send_queued_to_device(client)
-        except E2EEUnavailableError:
-            await _release(client, file_lock)
-            raise
-        except (ClientError, TimeoutError) as exc:
-            await _release(client, file_lock)
-            msg = "Matrix end-to-end encryption setup failed to reach the homeserver"
-            raise E2EEUnavailableError(msg) from exc
-        except OSError as exc:
-            await _release(client, file_lock)
-            msg = f"Cannot use the end-to-end encryption store at {path}: {exc}"
-            raise E2EEUnavailableError(msg) from exc
-        except Exception as exc:
-            # Degrade reads to decryption errors instead of failing the whole tool call.
-            await _release(client, file_lock)
-            msg = f"End-to-end encryption setup failed ({type(exc).__name__})"
-            raise E2EEUnavailableError(msg) from exc
-        except BaseException:
-            await _release(client, file_lock)
-            raise
+        except BaseException as exc:
+            unpublished = client is None or not _olm(client).account.shared
+            await _release(client, file_lock, remove=path if created and unpublished else None)
+            if isinstance(exc, E2EEUnavailableError) or not isinstance(exc, Exception):
+                raise
+            raise _unavailable(exc, path) from exc
         self._file_lock = file_lock
         return client
 
-    async def _refuse_foreign_device_keys(self, client: AsyncClient) -> None:
-        """Never replace identity keys another client already published for this device.
+    async def _check_device_identity(self, client: AsyncClient) -> None:
+        """Confirm, before every sync or key upload, that this store owns the device.
 
-        Homeservers may overwrite a device's keys on upload, which would break the client
-        that owns the device, for example when credentials came from `auth token`.
+        The access token must belong to the configured device, and the homeserver must
+        list this store's identity keys for it. Homeservers may overwrite a device's keys
+        on upload, and syncing consumes the device's to-device messages, so using another
+        client's device would break that client. A brand-new store may publish its keys
+        only when the device has none yet.
         """
         olm = _olm(client)
-        if olm.account.shared:
-            return
-        # The keys are published for the token's device, whatever the config claims.
         identity = await client.whoami()
         if not isinstance(identity, WhoamiResponse):
             msg = "Matrix whoami failed; cannot confirm which device the access token belongs to"
@@ -303,17 +300,27 @@ class MatrixE2EE:
             raise E2EEUnavailableError(msg)
         olm.users_for_key_query.add(self._user_id)
         response = await client.keys_query()
-        if not isinstance(response, KeysQueryResponse):
+        if not isinstance(response, KeysQueryResponse) or response.failures:
             msg = "Matrix key query failed; cannot check this device's published keys"
             raise E2EEUnavailableError(msg)
         published = response.device_keys.get(self._user_id, {}).get(self._device_id)
         if not published:
+            if olm.account.shared:
+                msg = (
+                    "The homeserver no longer lists this device's encryption keys; "
+                    f"{_DEDICATED_DEVICE_HINT}"
+                )
+                raise E2EEUnavailableError(msg)
             return
-        ours = olm.account.identity_keys["ed25519"]
-        if published.get("keys", {}).get(f"ed25519:{self._device_id}") != ours:
+        keys = published.get("keys", {})
+        ours = olm.account.identity_keys
+        if (
+            keys.get(f"ed25519:{self._device_id}") != ours["ed25519"]
+            or keys.get(f"curve25519:{self._device_id}") != ours["curve25519"]
+        ):
             msg = (
-                "This device already has encryption keys from another Matrix client, and "
-                f"matrix-mcp will not replace them; {_DEDICATED_DEVICE_HINT}"
+                "This device's published encryption keys belong to another Matrix client, "
+                f"and matrix-mcp will not use or replace them; {_DEDICATED_DEVICE_HINT}"
             )
             raise E2EEUnavailableError(msg)
 
@@ -402,10 +409,17 @@ async def _catch_up(client: AsyncClient) -> None:
 
 
 async def _send_queued_to_device(client: AsyncClient) -> None:
-    """Send the Olm session repairs nio queues for broken sessions with other devices."""
-    if client.should_claim_keys:
-        await client.keys_claim(client.get_users_for_key_claiming())
-    await client.send_to_device_messages()
+    """Send the Olm session repairs nio queues for broken sessions, best effort.
+
+    Repairs need the sender's device keys, so only devices this store already knows can
+    be repaired; failures leave the repair for a later tool call to queue again.
+    """
+    try:
+        if client.should_claim_keys:
+            await client.keys_claim(client.get_users_for_key_claiming())
+        await client.send_to_device_messages()
+    except (ClientError, TimeoutError):
+        _LOGGER.info("Could not send queued Olm session repairs")
 
 
 class _CryptoClient(AsyncClient):  # type: ignore[misc]  # nio ships no type stubs.
@@ -418,6 +432,9 @@ class _CryptoClient(AsyncClient):  # type: ignore[misc]  # nio ships no type stu
     def _handle_decrypt_to_device(self, to_device_event: ToDeviceEvent) -> ToDeviceEvent | None:
         try:
             return super()._handle_decrypt_to_device(to_device_event)
+        except (PeeweeException, sqlite3.Error, OSError):
+            # A local storage failure must stop the catch-up before the batch is acknowledged.
+            raise
         except Exception:  # noqa: BLE001 - Skip one bad message, keep the rest of the batch.
             _LOGGER.warning(
                 "Skipped an unreadable to-device message from %s", to_device_event.sender
@@ -450,12 +467,34 @@ def _private_directory(path: Path) -> None:
         path.chmod(0o700)
 
 
-async def _release(client: AsyncClient | None, file_lock: AsyncFileLock) -> None:
+async def _release(
+    client: AsyncClient | None, file_lock: AsyncFileLock, *, remove: Path | None = None
+) -> None:
     try:
         if client is not None:
             await _close_client(client)
+        if remove is not None:
+            shutil.rmtree(remove, ignore_errors=True)
     finally:
         await file_lock.release()
+
+
+def _unavailable(exc: Exception, path: Path) -> E2EEUnavailableError:
+    """Degrade reads to decryption errors instead of failing the whole tool call."""
+    if isinstance(exc, ClientError | TimeoutError):
+        return E2EEUnavailableError(
+            "Matrix end-to-end encryption setup failed to reach the homeserver"
+        )
+    if isinstance(exc, OSError):
+        return E2EEUnavailableError(f"Cannot use the end-to-end encryption store at {path}: {exc}")
+    return E2EEUnavailableError(f"End-to-end encryption setup failed ({type(exc).__name__})")
+
+
+def _require_no_failures(step: str, failures: dict[str, Any]) -> None:
+    if failures:
+        servers = ", ".join(sorted(failures))
+        msg = f"Matrix could not {step} from {servers}; the message was not sent"
+        raise RuntimeError(msg)
 
 
 async def _close_client(client: AsyncClient) -> None:

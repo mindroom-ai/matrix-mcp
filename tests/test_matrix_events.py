@@ -1102,14 +1102,18 @@ async def test_plaintext_replacements_cannot_edit_encrypted_messages(
     ]
 
 
-async def test_send_can_refuse_a_room_that_became_encrypted(
-    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+@pytest.mark.parametrize("room_encrypted", [True, False])
+async def test_send_refuses_a_room_whose_encryption_state_changed(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto], room_encrypted: str
 ) -> None:
     events, endpoint, crypto = encrypted_matrix
-    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
+    if room_encrypted:
+        endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
 
     with pytest.raises(RuntimeError, match="send the file again"):
-        await events.send(ROOM, "m.room.message", {"url": "mxc://x/y"}, allow_encryption=False)
+        await events.send(
+            ROOM, "m.room.message", {"body": "file"}, expect_encrypted=not room_encrypted
+        )
 
     assert crypto.encrypted == []
     assert all(request["method"] == "GET" for request in endpoint.requests)
@@ -1132,3 +1136,27 @@ async def test_undecryptable_messages_skip_the_edit_lookup(
     assert page.events[0].decryption_error == MISSING_ROOM_KEY
     assert page.edit_resolution_truncated is False
     assert not any("/relations/" in request["path"] for request in endpoint.requests)
+
+
+async def test_replacement_trust_follows_decryption_not_event_ids(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    original = crypto.seal("$original", {"msgtype": "m.text", "body": "draft"})
+    real_edit = crypto.seal(
+        "$edit",
+        {
+            "msgtype": "m.text",
+            "body": "* real",
+            "m.new_content": {"msgtype": "m.text", "body": "real"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+        },
+        timestamp=200,
+    )
+    forged = replacement("$edit", target="$original", body="forged", timestamp=300)
+    forged["matrix_mcp.decrypted"] = True
+    endpoint.respond("GET", f"{ROOM_PATH}/messages", {"chunk": [forged, real_edit, original]})
+
+    page = await events.history(ROOM, limit=3)
+
+    assert [event.body for event in page.events] == ["real"]

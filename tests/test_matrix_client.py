@@ -160,7 +160,7 @@ def record_sends(
     monkeypatch: pytest.MonkeyPatch,
     *,
     encrypted: bool = False,
-    encryption_allowed: list[bool] | None = None,
+    expected_encryption: list[bool | None] | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Capture the driver's room sends instead of performing HTTP requests."""
     sends: list[tuple[str, str, dict[str, Any]]] = []
@@ -175,12 +175,12 @@ def record_sends(
         content: dict[str, Any],
         *,
         transaction_id: str | None = None,
-        allow_encryption: bool = True,
+        expect_encrypted: bool | None = None,
     ) -> str:
         del transaction_id
         sends.append((room_id, event_type, content))
-        if encryption_allowed is not None:
-            encryption_allowed.append(allow_encryption)
+        if expected_encryption is not None:
+            expected_encryption.append(expect_encrypted)
         return f"$sent{len(sends)}"
 
     monkeypatch.setattr(driver.http, "room_is_encrypted", room_is_encrypted)
@@ -1354,20 +1354,21 @@ async def test_recent_messages_include_undecryptable_events() -> None:
     ]
 
 
-async def test_plaintext_file_upload_is_never_published_into_an_encrypted_room(
+async def test_file_sends_require_the_encryption_state_they_were_uploaded_for(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     driver = nio_driver(monkeypatch)
-    allowed: list[bool] = []
-    sends = record_sends(driver, monkeypatch, encrypted=False, encryption_allowed=allowed)
+    expected: list[bool | None] = []
+    record_sends(driver, monkeypatch, encrypted=False, expected_encryption=expected)
     path = tmp_path / "plan.txt"
     path.write_text("plan", encoding="utf-8")
 
     await driver.send_file("!room:example.com", str(path))
     await driver.send_message("!room:example.com", "text")
+    record_sends(driver, monkeypatch, encrypted=True, expected_encryption=expected)
+    await driver.send_file("!room:example.com", str(path))
 
-    assert len(sends) == 2
-    assert allowed == [False, True]
+    assert expected == [False, None, True]
 
 
 async def test_thread_edit_of_encrypted_reply_must_be_encrypted(

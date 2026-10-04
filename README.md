@@ -126,7 +126,7 @@ matrix-mcp auth logout
 
 In stdio mode, Matrix MCP is its own Matrix device with end-to-end encryption.
 It decrypts messages, edits, mentions, and attachments in encrypted rooms, and encrypts everything it sends there, including files.
-It checks the room's encryption state right before each send and never sends plaintext to a room with encryption enabled.
+It checks the room's encryption state right before each send and never sends plaintext to a room known to be encrypted.
 Edits of encrypted messages count only when the edit itself was encrypted.
 
 Login commands publish the device's encryption keys and print its fingerprint.
@@ -143,7 +143,8 @@ Use a device created by a `matrix-mcp auth` login: an access token borrowed from
 If setup fails at login, plaintext rooms still work; retry with `matrix-mcp e2ee setup`.
 
 The keys live in a private store next to the config file, and `matrix-mcp auth logout` deletes them.
-Several MCP clients can run `matrix-mcp serve` for the same device; they take turns using the store.
+Several MCP clients on one machine can run `matrix-mcp serve` for the same device; they take turns using the store.
+See [End-to-End Encryption](docs/usage.md#end-to-end-encryption) for limitations.
 Authenticated HTTP mode does not support end-to-end encryption.
 
 ## Claude Code

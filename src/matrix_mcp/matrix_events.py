@@ -17,6 +17,7 @@ _MAX_CONTEXT_LIMIT = 50
 _RELATION_PAGE_LIMIT = 50
 _MAX_RELATION_PAGES = 2
 _MAX_RELATION_REQUESTS = 4
+_DECRYPTED = "matrix_mcp.decrypted"
 _EDITABLE_MSGTYPES = frozenset({"m.text", "m.notice", "m.emote"})
 _MEDIA_MSGTYPES = frozenset({"m.file", "m.image", "m.video", "m.audio"})
 
@@ -136,7 +137,6 @@ class MatrixEvents:
             visible,
             replacements=replacements,
             relation_budget=relation_budget,
-            encryption=encryption,
         )
         return HistoryPage(
             events=[mark_encryption(event, encryption) for event in expanded],
@@ -178,21 +178,18 @@ class MatrixEvents:
             raw_event,
             replacements=replacements.get(_optional_string(raw_event.get("event_id")) or "", []),
             relation_budget=relation_budget,
-            encryption=encryption,
         )
         events_before, before_truncated = await self._expand_many(
             room_id,
             before,
             replacements=replacements,
             relation_budget=relation_budget,
-            encryption=encryption,
         )
         events_after, after_truncated = await self._expand_many(
             room_id,
             after,
             replacements=replacements,
             relation_budget=relation_budget,
-            encryption=encryption,
         )
         return EventContext(
             event=mark_encryption(center, encryption),
@@ -349,12 +346,12 @@ class MatrixEvents:
         content: dict[str, Any],
         *,
         transaction_id: str | None = None,
-        allow_encryption: bool = True,
+        expect_encrypted: bool | None = None,
     ) -> str:
         """Send one room event, encrypting it when the room is end-to-end encrypted.
 
-        Pass allow_encryption=False for content that references unencrypted media, so a
-        room that became encrypted meanwhile is refused instead of receiving it.
+        Content that references media uploaded for a known encryption state passes
+        expect_encrypted, so a room whose state differs at send time is refused.
         """
         quote_matrix_id(room_id, sigil="!", label="room ID")
         return await self._send(
@@ -362,7 +359,7 @@ class MatrixEvents:
             event_type,
             content,
             _transaction_path(transaction_id),
-            allow_encryption=allow_encryption,
+            expect_encrypted=expect_encrypted,
         )
 
     async def attachment(self, room_id: str, event_id: str) -> EventAttachment:
@@ -393,7 +390,9 @@ class MatrixEvents:
         """Decrypt encrypted events; map each encrypted event ID to its decryption error."""
         events: list[dict[str, Any]] = []
         encryption: dict[str, str | None] = {}
-        for raw in raw_events:
+        for received in raw_events:
+            # Decryption provenance lives on the event itself; never accept it from a server.
+            raw = {key: value for key, value in received.items() if key != _DECRYPTED}
             if raw.get("type") != "m.room.encrypted":
                 events.append(raw)
                 continue
@@ -403,7 +402,9 @@ class MatrixEvents:
                 result = DecryptedEvent(raw, E2EE_UNSUPPORTED)
             else:
                 result = await self.crypto.decrypt(room_id, raw)
-            events.append(result.event)
+            events.append(
+                result.event if result.error is not None else {**result.event, _DECRYPTED: True}
+            )
             event_id = _optional_string(raw.get("event_id"))
             if event_id is not None:
                 encryption[event_id] = result.error
@@ -424,16 +425,17 @@ class MatrixEvents:
         content: dict[str, Any],
         transaction: str,
         *,
-        allow_encryption: bool = True,
+        expect_encrypted: bool | None = None,
     ) -> str:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
-        if await self.http.room_is_encrypted(room_id):
-            if not allow_encryption:
-                msg = (
-                    "The room enabled end-to-end encryption after the attachment was uploaded "
-                    "unencrypted; nothing was sent, send the file again"
-                )
-                raise RuntimeError(msg)
+        encrypted = await self.http.room_is_encrypted(room_id)
+        if expect_encrypted is not None and encrypted != expect_encrypted:
+            msg = (
+                "The room's end-to-end encryption state changed after the attachment was "
+                "uploaded; nothing was sent, send the file again"
+            )
+            raise RuntimeError(msg)
+        if encrypted:
             if self.crypto is None:
                 msg = "Sending to end-to-end encrypted Matrix rooms is not supported in this mode"
                 raise RuntimeError(msg)
@@ -452,7 +454,6 @@ class MatrixEvents:
         *,
         replacements: dict[str, list[dict[str, Any]]] | None = None,
         relation_budget: _RelationFetchBudget,
-        encryption: dict[str, str | None],
     ) -> tuple[list[TimelineEvent], bool]:
         events: list[TimelineEvent] = []
         truncated = False
@@ -463,7 +464,6 @@ class MatrixEvents:
                 raw,
                 replacements=[] if replacements is None else replacements.get(event_id, []),
                 relation_budget=relation_budget,
-                encryption=encryption,
             )
             events.append(event)
             truncated = truncated or event_truncated
@@ -476,7 +476,6 @@ class MatrixEvents:
         *,
         replacements: list[dict[str, Any]] | None = None,
         relation_budget: _RelationFetchBudget,
-        encryption: dict[str, str | None],
     ) -> tuple[TimelineEvent, bool]:
         original = _timeline_event(raw)
         if (
@@ -488,7 +487,7 @@ class MatrixEvents:
             return original, False
         bundle, bundle_present = _bundled_replacement(raw)
         # The crypto layer already reduced an untrusted bundle to a bare reference.
-        candidates = trusted_replacements(original.event_id, replacements or [], encryption)
+        candidates = trusted_replacements(replacements or [], original_encrypted=is_decrypted(raw))
         if bundle is not None:
             candidates.append(bundle)
         valid = [
@@ -504,11 +503,10 @@ class MatrixEvents:
             room_id,
             original.event_id,
             relation_budget=relation_budget,
-            encryption=encryption,
         )
         valid = [
             replacement
-            for replacement in trusted_replacements(original.event_id, recovered, encryption)
+            for replacement in trusted_replacements(recovered, original_encrypted=is_decrypted(raw))
             if _valid_replacement(room_id, raw, replacement)
         ]
         if not valid:
@@ -522,7 +520,6 @@ class MatrixEvents:
         event_id: str,
         *,
         relation_budget: _RelationFetchBudget,
-        encryption: dict[str, str | None],
     ) -> tuple[list[dict[str, Any]], bool]:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         event = quote_matrix_id(event_id, sigil="$", label="event ID")
@@ -539,8 +536,7 @@ class MatrixEvents:
             payload = await self.http.json("GET", path, params=params)
             chunk = _event_list(payload, "chunk", required=True)
             _require_page_bound(chunk, _RELATION_PAGE_LIMIT)
-            decrypted, chunk_encryption = await self.decrypt_raw(room_id, chunk)
-            encryption.update(chunk_encryption)
+            decrypted, _ = await self.decrypt_raw(room_id, chunk)
             replacements.extend(decrypted)
             cursor = _optional_string_field(payload, "next_batch")
             if cursor is None:
@@ -561,20 +557,18 @@ class _RelationFetchBudget:
         return True
 
 
+def is_decrypted(raw: dict[str, Any]) -> bool:
+    """Whether decrypt_raw produced this event by decrypting it."""
+    return raw.get(_DECRYPTED) is True
+
+
 def trusted_replacements(
-    original_id: str,
-    candidates: list[dict[str, Any]],
-    encryption: dict[str, str | None],
+    candidates: list[dict[str, Any]], *, original_encrypted: bool
 ) -> list[dict[str, Any]]:
     """Only successfully decrypted replacements may edit an encrypted message."""
-    if original_id not in encryption:
+    if not original_encrypted:
         return candidates
-    trusted = []
-    for candidate in candidates:
-        event_id = _optional_string(candidate.get("event_id"))
-        if event_id is not None and event_id in encryption and encryption[event_id] is None:
-            trusted.append(candidate)
-    return trusted
+    return [candidate for candidate in candidates if is_decrypted(candidate)]
 
 
 def mark_encryption(event: TimelineEvent, encryption: dict[str, str | None]) -> TimelineEvent:
