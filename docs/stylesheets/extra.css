@@ -1,0 +1,6 @@
+/* SVG images do not reliably receive the reduced-motion preference, so swap in the static logo. */
+@media (prefers-reduced-motion: reduce) {
+  img[src$="assets/logo.svg"] {
+    content: url("../assets/logo-static.svg");
+  }
+}
