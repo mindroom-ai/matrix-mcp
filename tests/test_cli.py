@@ -7,13 +7,14 @@ from typing import Any, ClassVar
 
 import pytest
 import typer
+from filelock import FileLock
 from typer.testing import CliRunner
 
 from matrix_mcp import cli
 from matrix_mcp.auth import LoginResult
 from matrix_mcp.cli import _with_cloudflare_access_header_command, app
 from matrix_mcp.config import MatrixMCPConfig
-from matrix_mcp.e2ee import E2EEStatus, E2EEUnavailableError, e2ee_store_path
+from matrix_mcp.e2ee import E2EEStatus, E2EEUnavailableError, e2ee_lock_path, e2ee_store_path
 from matrix_mcp.http_headers import HTTPHeaderConfig
 
 
@@ -772,3 +773,20 @@ def test_auth_logout_removes_the_device_encryption_store(tmp_path: Path) -> None
     assert not config.exists()
     assert not store.exists()
     assert "Removed end-to-end encryption keys" in result.output
+
+
+def test_auth_logout_waits_for_the_encryption_store_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("matrix_mcp.cli._E2EE_LOCK_TIMEOUT_SECONDS", 0.05)
+    config = tmp_path / "config.json"
+    store = e2ee_store_path(write_config(config))
+    store.mkdir()
+
+    with FileLock(e2ee_lock_path(store)):
+        result = CliRunner().invoke(app, ["auth", "logout", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "in use" in result.output
+    assert config.exists()
+    assert store.exists()

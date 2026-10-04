@@ -41,6 +41,7 @@ from matrix_mcp.matrix_events import (
     TimelineEvent,
     mark_encryption,
     normalize_timeline_event,
+    trusted_replacements,
 )
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_media import MatrixMedia
@@ -424,7 +425,12 @@ class NioMatrixDriver:
         for raw, (_, is_reply) in zip(decrypted, raw_events, strict=True):
             if is_reply and raw.get("type") not in _THREAD_MESSAGE_TYPES:
                 continue
-            timeline = await self._event_with_latest_edit(room_id, raw, page_size=max_replies)
+            timeline = await self._event_with_latest_edit(
+                room_id,
+                raw,
+                page_size=max_replies,
+                encrypted=_optional_event_id(raw) in encryption,
+            )
             event = _event_from_timeline(mark_encryption(timeline, encryption))
             if is_reply and event.thread_id is None:
                 event = event.model_copy(update={"thread_id": thread_id})
@@ -432,7 +438,7 @@ class NioMatrixDriver:
         return sorted(events, key=_event_sort_key)
 
     async def _event_with_latest_edit(
-        self, room_id: str, raw: dict[str, Any], *, page_size: int
+        self, room_id: str, raw: dict[str, Any], *, page_size: int, encrypted: bool
     ) -> TimelineEvent:
         event = normalize_timeline_event(room_id, raw)
         if event.edited or event.redacted or event.type == "m.room.encrypted":
@@ -449,9 +455,14 @@ class NioMatrixDriver:
         ):
             replacement_source = _source_from_nio(replacement)
             if replacement_source is not None:
-                [replacement_source], _ = await self.events.decrypt_raw(
+                [replacement_source], states = await self.events.decrypt_raw(
                     room_id, [replacement_source]
                 )
+                if encrypted and not trusted_replacements(
+                    event.event_id, [replacement_source], {event.event_id: None, **states}
+                ):
+                    replacement_source = None
+            if replacement_source is not None:
                 updated = normalize_timeline_event(
                     room_id,
                     raw,
@@ -536,7 +547,9 @@ class NioMatrixDriver:
                 thread_id=thread_id,
                 encryption=encryption,
             )
-            return await self.events.send(room_id, "m.room.message", content)
+            return await self.events.send(
+                room_id, "m.room.message", content, allow_encryption=encryption is not None
+            )
         msg = f"Matrix media upload failed: {upload_response}"
         raise RuntimeError(msg)
 
@@ -752,6 +765,11 @@ def _event_from_nio(room_id: str, raw: object) -> MatrixEvent | None:
     if source is None:
         return None
     return _event_from_timeline(normalize_timeline_event(room_id, source))
+
+
+def _optional_event_id(raw: dict[str, Any]) -> str | None:
+    event_id = raw.get("event_id")
+    return event_id if isinstance(event_id, str) else None
 
 
 def _source_from_nio(raw: object) -> dict[str, Any] | None:

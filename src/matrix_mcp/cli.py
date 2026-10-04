@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from matrix_mcp.e2ee import E2EEStatus
     from matrix_mcp.http_headers import HTTPHeaderConfig
 
+_E2EE_LOCK_TIMEOUT_SECONDS = 60.0
+
 app = typer.Typer(no_args_is_help=True)
 auth_app = typer.Typer(no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
@@ -288,16 +290,34 @@ def auth_logout(
     config: Path | None = typer.Option(None, "--config", help="Config file to remove"),
 ) -> None:
     """Remove stored Matrix MCP credentials."""
+    from filelock import FileLock, Timeout
+
+    from matrix_mcp.e2ee import e2ee_lock_path
+
     config_path = _resolve_config_path(config)
-    if config_path.exists():
-        store = _e2ee_store_for(config_path)
+    if not config_path.exists():
+        typer.echo(f"No Matrix MCP credentials found at {config_path}")
+        return
+    store = _e2ee_store_for(config_path)
+    if store is None:
         config_path.unlink()
         typer.echo(f"Removed Matrix MCP credentials from {config_path}")
-        if store is not None and store.exists():
-            shutil.rmtree(store)
-            typer.echo(f"Removed end-to-end encryption keys from {store}")
         return
-    typer.echo(f"No Matrix MCP credentials found at {config_path}")
+    # Take the store lock so no tool call is using the keys while they are deleted.
+    try:
+        with FileLock(e2ee_lock_path(store), timeout=_E2EE_LOCK_TIMEOUT_SECONDS):
+            config_path.unlink()
+            typer.echo(f"Removed Matrix MCP credentials from {config_path}")
+            if store.exists():
+                shutil.rmtree(store)
+                typer.echo(f"Removed end-to-end encryption keys from {store}")
+    except Timeout as exc:
+        typer.echo(
+            "The end-to-end encryption store is in use by a matrix-mcp tool call; "
+            "nothing was removed. Retry the logout.",
+            err=True,
+        )
+        raise typer.Exit(1) from exc
 
 
 @e2ee_app.command("setup")

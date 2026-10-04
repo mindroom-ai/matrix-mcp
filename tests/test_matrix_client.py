@@ -156,7 +156,11 @@ def edit_event(
 
 
 def record_sends(
-    driver: NioMatrixDriver, monkeypatch: pytest.MonkeyPatch, *, encrypted: bool = False
+    driver: NioMatrixDriver,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    encrypted: bool = False,
+    encryption_allowed: list[bool] | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Capture the driver's room sends instead of performing HTTP requests."""
     sends: list[tuple[str, str, dict[str, Any]]] = []
@@ -171,9 +175,12 @@ def record_sends(
         content: dict[str, Any],
         *,
         transaction_id: str | None = None,
+        allow_encryption: bool = True,
     ) -> str:
         del transaction_id
         sends.append((room_id, event_type, content))
+        if encryption_allowed is not None:
+            encryption_allowed.append(allow_encryption)
         return f"$sent{len(sends)}"
 
     monkeypatch.setattr(driver.http, "room_is_encrypted", room_is_encrypted)
@@ -1345,3 +1352,35 @@ async def test_recent_messages_include_undecryptable_events() -> None:
     assert [(event.event_id, event.decryption_error) for event in events] == [
         ("$sealed", "missing room key")
     ]
+
+
+async def test_plaintext_file_upload_is_never_published_into_an_encrypted_room(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    driver = nio_driver(monkeypatch)
+    allowed: list[bool] = []
+    sends = record_sends(driver, monkeypatch, encrypted=False, encryption_allowed=allowed)
+    path = tmp_path / "plan.txt"
+    path.write_text("plan", encoding="utf-8")
+
+    await driver.send_file("!room:example.com", str(path))
+    await driver.send_message("!room:example.com", "text")
+
+    assert len(sends) == 2
+    assert allowed == [False, True]
+
+
+async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    nio_client = FakeNioClient.instances[0]
+    nio_client.thread_events = [sealed_reply("$reply", "original reply", timestamp_ms=200)]
+    nio_client.replacement_events["$reply"] = [
+        edit_event("$forged", replaces="$reply", sender="@bob:example.com", timestamp_ms=300)
+    ]
+
+    thread = await driver.read_thread("!room:example.com", "$root")
+
+    reply = thread[-1]
+    assert (reply.body, reply.edited) == ("original reply", False)

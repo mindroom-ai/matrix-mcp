@@ -21,6 +21,7 @@ from nio import (
     AsyncClientConfig,
     BadEvent,
     JoinedMembersResponse,
+    KeysClaimResponse,
     KeysQueryResponse,
     KeysUploadResponse,
     MegolmEvent,
@@ -36,6 +37,7 @@ from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
     from nio.crypto import Olm
@@ -46,6 +48,7 @@ MISSING_ROOM_KEY = "missing room key"
 E2EE_UNSUPPORTED = "end-to-end encryption is not available in this mode"
 _UNDECRYPTABLE = "unable to decrypt"
 _UNSUPPORTED_EVENT = "unsupported encrypted event"
+_OTHER_ROOM = "decrypted event belongs to a different room"
 _MAX_CATCH_UP_SYNCS = 10
 _LOCK_TIMEOUT_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 30.0
@@ -65,6 +68,11 @@ def e2ee_store_path(config: MatrixMCPConfig) -> Path:
     key = f"{config.normalized_homeserver}|{config.user_id or ''}|{config.device_id or ''}"
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return default_config_path().with_name(f"e2ee-{digest}")
+
+
+def e2ee_lock_path(store_path: Path) -> Path:
+    """Lock beside the store, so deleting the store cannot race a session using it."""
+    return store_path.with_name(f"{store_path.name}.lock")
 
 
 class E2EEUnavailableError(RuntimeError):
@@ -177,10 +185,25 @@ class MatrixE2EE:
         if not isinstance(keys, KeysQueryResponse):
             msg = f"Matrix keys query failed: {keys}"
             raise RuntimeError(msg)  # noqa: TRY004 - Upstream error response.
+        # nio ignores failed one-time key claims and to-device sends while sharing a room
+        # key, so check both here: a message nobody can decrypt must not be sent.
+        missing_sessions = client.get_missing_sessions(room_id)
+        if missing_sessions:
+            claimed = await client.keys_claim(missing_sessions)
+            if not isinstance(claimed, KeysClaimResponse):
+                msg = f"Matrix one-time key claim failed: {claimed}"
+                raise RuntimeError(msg)
         if olm.should_share_group_session(room_id):
             shared = await client.share_group_session(room_id, ignore_unverified_devices=True)
             if not isinstance(shared, ShareGroupSessionResponse):
                 msg = f"Matrix room key sharing failed: {shared}"
+                raise RuntimeError(msg)
+            undelivered = undelivered_devices(olm, room.users, shared.users_shared_with)
+            if undelivered:
+                msg = (
+                    f"Matrix room key delivery failed for {len(undelivered)} device(s); "
+                    "the message was not sent"
+                )
                 raise RuntimeError(msg)
         encrypted_type, encrypted_content = client.encrypt(room_id, event_type, content)
         return encrypted_type, dict(encrypted_content)
@@ -211,13 +234,11 @@ class MatrixE2EE:
     async def _connect(self) -> AsyncClient:
         path = self.store_path
         try:
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if os.name != "nt":
-                path.chmod(0o700)
+            path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             msg = f"Cannot create the end-to-end encryption store at {path}: {exc}"
             raise E2EEUnavailableError(msg) from exc
-        file_lock = AsyncFileLock(path / "store.lock", timeout=self._lock_timeout)
+        file_lock = AsyncFileLock(e2ee_lock_path(path), timeout=self._lock_timeout)
         try:
             await file_lock.acquire()
         except Timeout as exc:
@@ -225,14 +246,19 @@ class MatrixE2EE:
             raise E2EEUnavailableError(msg) from exc
         client: AsyncClient | None = None
         try:
+            _private_directory(path)
             client = self._new_client(path)
             await self._refuse_foreign_device_keys(client)
             await _upload_keys(client)
             await _catch_up(client)
             await _upload_keys(client)
-        except (ClientError, TimeoutError, OSError) as exc:
+        except (ClientError, TimeoutError) as exc:
             await _release(client, file_lock)
             msg = "Matrix end-to-end encryption setup failed to reach the homeserver"
+            raise E2EEUnavailableError(msg) from exc
+        except OSError as exc:
+            await _release(client, file_lock)
+            msg = f"Cannot use the end-to-end encryption store at {path}: {exc}"
             raise E2EEUnavailableError(msg) from exc
         except BaseException:
             await _release(client, file_lock)
@@ -279,7 +305,8 @@ class MatrixE2EE:
             store_path=str(path),
             config=AsyncClientConfig(
                 encryption_enabled=True,
-                store_sync_tokens=True,
+                # _catch_up saves the token itself, after room keys are stored.
+                store_sync_tokens=False,
                 custom_headers=headers or None,
                 max_timeouts=_MAX_RETRIES,
                 max_limit_exceeded=_MAX_RETRIES,
@@ -311,7 +338,16 @@ async def _upload_keys(client: AsyncClient) -> None:
 
 
 async def _catch_up(client: AsyncClient) -> None:
-    """Receive queued room keys; the homeserver delivers to-device messages in batches."""
+    """Receive queued room keys; the homeserver delivers to-device messages in batches.
+
+    The sync token acknowledges the batch to the homeserver, so it is saved only after
+    nio has processed the batch and stored its room keys.
+    """
+    store = client.store
+    if store is None:
+        msg = "End-to-end encryption store is not loaded"
+        raise E2EEUnavailableError(msg)
+    since = store.load_sync_token()
     for _ in range(_MAX_CATCH_UP_SYNCS):
         # Homeservers may hold an incremental /sync for a minimum long-poll even with
         # timeout=0, but answer full_state requests at once. The filter excludes all
@@ -319,6 +355,7 @@ async def _catch_up(client: AsyncClient) -> None:
         async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
             response = await client.sync(
                 timeout=0,
+                since=since,
                 sync_filter=_CATCH_UP_FILTER,
                 full_state=True,
                 set_presence="offline",
@@ -326,8 +363,35 @@ async def _catch_up(client: AsyncClient) -> None:
         if not isinstance(response, SyncResponse):
             msg = "Matrix sync for end-to-end encryption keys failed"
             raise E2EEUnavailableError(msg)
+        since = response.next_batch
+        store.save_sync_token(since)
         if not response.to_device_events:
             return
+
+
+def undelivered_devices(
+    olm: Olm, users: Iterable[str], shared_with: set[tuple[str, str]]
+) -> set[tuple[str, str]]:
+    """Devices with an Olm session that should have received the room key but did not.
+
+    Mirrors nio's recipient selection; devices without an Olm session (no one-time keys
+    left) cannot receive keys at all, as in other Matrix clients.
+    """
+    expected = {
+        (user_id, device.id)
+        for user_id in users
+        for device in olm.device_store.active_user_devices(user_id)
+        if device.id != olm.device_id
+        and not olm.is_device_blacklisted(device)
+        and olm.session_store.get(device.curve25519)
+    }
+    return expected - shared_with
+
+
+def _private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        path.chmod(0o700)
 
 
 async def _release(client: AsyncClient | None, file_lock: AsyncFileLock) -> None:
@@ -346,7 +410,9 @@ async def _close_client(client: AsyncClient) -> None:
             client.store.database.close()
 
 
-def _decrypt_with(client: AsyncClient, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
+def _decrypt_with(  # noqa: PLR0911 - One exit per reason an event stays encrypted.
+    client: AsyncClient, room_id: str, raw: dict[str, Any]
+) -> DecryptedEvent:
     try:
         event = MegolmEvent.from_dict({**raw, "room_id": room_id})
     except (KeyError, TypeError, ValueError):
@@ -369,14 +435,27 @@ def _decrypt_with(client: AsyncClient, room_id: str, raw: dict[str, Any]) -> Dec
         or not isinstance(source.get("content"), dict)
     ):
         return DecryptedEvent(raw, _UNDECRYPTABLE)
+    if source.get("room_id") != room_id:
+        return DecryptedEvent(raw, _OTHER_ROOM)
     merged = {**raw, "type": source["type"], "content": source["content"]}
-    bundled = _bundled_encrypted_replacement(raw)
+    bundled = _bundled_replacement(raw)
     if bundled is not None:
-        replacement = _decrypt_with(client, room_id, bundled)
-        if replacement.error is None:
-            unsigned = raw["unsigned"]
-            relations = {**unsigned["m.relations"], "m.replace": replacement.event}
-            merged["unsigned"] = {**unsigned, "m.relations": relations}
+        # Only an encrypted replacement may edit an encrypted message. Any other
+        # bundle stays as a bare reference, which makes readers look the edit up.
+        replacement = (
+            _decrypt_with(client, room_id, bundled)
+            if bundled.get("type") == "m.room.encrypted"
+            else None
+        )
+        trusted = replacement is not None and replacement.error is None
+        unsigned = raw["unsigned"]
+        relations = {
+            **unsigned["m.relations"],
+            "m.replace": replacement.event
+            if trusted and replacement is not None
+            else {"event_id": bundled.get("event_id")},
+        }
+        merged["unsigned"] = {**unsigned, "m.relations": relations}
     return DecryptedEvent(merged)
 
 
@@ -387,10 +466,8 @@ def _olm(client: AsyncClient) -> Olm:
     return client.olm
 
 
-def _bundled_encrypted_replacement(raw: dict[str, Any]) -> dict[str, Any] | None:
+def _bundled_replacement(raw: dict[str, Any]) -> dict[str, Any] | None:
     unsigned = raw.get("unsigned")
     relations = unsigned.get("m.relations") if isinstance(unsigned, dict) else None
     replacement = relations.get("m.replace") if isinstance(relations, dict) else None
-    if isinstance(replacement, dict) and replacement.get("type") == "m.room.encrypted":
-        return replacement
-    return None
+    return replacement if isinstance(replacement, dict) else None

@@ -1065,3 +1065,51 @@ async def test_attachment_rejects_events_without_media(
 
     with pytest.raises(ValueError, match="no attachment"):
         await events.attachment(ROOM, "$text")
+
+
+async def test_plaintext_replacements_cannot_edit_encrypted_messages(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    in_page = crypto.seal("$in-page", {"msgtype": "m.text", "body": "kept"})
+    recovered = crypto.seal(
+        "$recovered",
+        {"msgtype": "m.text", "body": "also kept"},
+        unsigned={"m.relations": {"m.replace": {"event_id": "$forged-2"}}},
+    )
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/messages",
+        {
+            "chunk": [
+                replacement("$forged-1", target="$in-page", body="forged", timestamp=300),
+                in_page,
+                recovered,
+            ]
+        },
+    )
+    endpoint.respond(
+        "GET",
+        f"{RELATIONS_PATH}/$recovered/m.replace",
+        {"chunk": [replacement("$forged-2", target="$recovered", body="forged", timestamp=300)]},
+    )
+
+    page = await events.history(ROOM, limit=3)
+
+    assert [(event.body, event.edited) for event in page.events] == [
+        ("kept", False),
+        ("also kept", False),
+    ]
+
+
+async def test_send_can_refuse_a_room_that_became_encrypted(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
+
+    with pytest.raises(RuntimeError, match="send the file again"):
+        await events.send(ROOM, "m.room.message", {"url": "mxc://x/y"}, allow_encryption=False)
+
+    assert crypto.encrypted == []
+    assert all(request["method"] == "GET" for request in endpoint.requests)

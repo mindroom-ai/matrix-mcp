@@ -126,7 +126,8 @@ matrix-mcp auth logout
 
 In stdio mode, Matrix MCP is its own Matrix device with end-to-end encryption.
 It decrypts messages, edits, mentions, and attachments in encrypted rooms, and encrypts everything it sends there, including files.
-It never sends plaintext into an encrypted room.
+It checks the room's encryption state right before each send and never sends plaintext to a room with encryption enabled.
+Edits of encrypted messages count only when the edit itself was encrypted.
 
 Login commands publish the device's encryption keys and print its fingerprint.
 Other clients share a room key only with devices that exist when they send, so messages from before the login stay unreadable and report `decryption_error: "missing room key"`.

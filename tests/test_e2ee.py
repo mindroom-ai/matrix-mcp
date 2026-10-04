@@ -3,25 +3,31 @@ from __future__ import annotations
 import json
 import stat
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from anyio import Path as AsyncPath
 from nio import AsyncClient, AsyncClientConfig
-from nio.crypto.key_export import encrypt_and_save
+from nio.crypto.key_export import decrypt_and_read, encrypt_and_save
 
 from matrix_mcp.config import MatrixMCPConfig
 from matrix_mcp.e2ee import (
     MISSING_ROOM_KEY,
     E2EEUnavailableError,
     MatrixE2EE,
+    e2ee_lock_path,
     e2ee_store_path,
+    undelivered_devices,
 )
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
+
+    from nio.crypto import Olm
 
 USER = "@alice:example.com"
 DEVICE = "ALICEDEVICE"
@@ -386,3 +392,145 @@ async def test_reopened_store_keeps_its_published_keys(
     assert second.fingerprint == first.fingerprint
     queries = sum(request["path"].endswith("/keys/query") for request in endpoint.requests)
     assert queries == queries_before
+
+
+async def export_room_keys(
+    config: MatrixMCPConfig, store: Path, export: Path, *, room_id: str | None = None
+) -> None:
+    """Export a store's room keys, optionally relabeling them for another room."""
+    exporter = AsyncClient(
+        config.normalized_homeserver,
+        USER,
+        device_id=DEVICE,
+        store_path=str(store),
+        config=AsyncClientConfig(encryption_enabled=True),
+    )
+    exporter.restore_login(USER, DEVICE, "test-token")
+    await exporter.export_keys(str(export), "pass", count=1000)
+    await exporter.close()
+    if room_id is not None:
+        sessions = json.loads(decrypt_and_read(str(export), "pass"))
+        for session in sessions:
+            session["room_id"] = room_id
+        await AsyncPath(export).unlink()
+        encrypt_and_save(json.dumps(sessions).encode(), str(export), "pass", count=1000)
+
+
+async def test_decrypted_payload_must_belong_to_the_requested_room(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, _endpoint = homeserver
+    writer = MatrixE2EE(config, store_path=tmp_path / "writer")
+    try:
+        _, encrypted = await writer.encrypt(
+            ROOM, "m.room.message", {"msgtype": "m.text", "body": "x"}
+        )
+    finally:
+        await writer.aclose()
+    export = tmp_path / "keys.txt"
+    other_room = "!other:example.com"
+    await export_room_keys(config, tmp_path / "writer", export, room_id=other_room)
+    reader_config = config.model_copy(update={"device_id": "READERDEVICE"})
+    await MatrixE2EE(reader_config, store_path=tmp_path / "reader").import_keys(export, "pass")
+
+    reader = MatrixE2EE(reader_config, store_path=tmp_path / "reader")
+    try:
+        result = await reader.decrypt(other_room, megolm_event("$moved", encrypted))
+    finally:
+        await reader.aclose()
+
+    assert result.error == "decrypted event belongs to a different room"
+    assert result.event["type"] == "m.room.encrypted"
+
+
+async def test_plaintext_bundle_cannot_edit_an_encrypted_message(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, _endpoint = homeserver
+    crypto = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        _, original = await crypto.encrypt(
+            ROOM, "m.room.message", {"msgtype": "m.text", "body": "a"}
+        )
+        raw = megolm_event("$original", original)
+        raw["unsigned"] = {
+            "m.relations": {
+                "m.replace": {
+                    "event_id": "$forged",
+                    "sender": USER,
+                    "origin_server_ts": 200,
+                    "type": "m.room.message",
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": "* forged",
+                        "m.new_content": {"msgtype": "m.text", "body": "forged"},
+                        "m.relates_to": {"rel_type": "m.replace", "event_id": "$original"},
+                    },
+                }
+            }
+        }
+
+        result = await crypto.decrypt(ROOM, raw)
+    finally:
+        await crypto.aclose()
+
+    assert result.event["content"]["body"] == "a"
+    assert result.event["unsigned"]["m.relations"]["m.replace"] == {"event_id": "$forged"}
+
+
+async def test_sync_token_advances_only_after_room_keys_are_processed(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, endpoint = homeserver
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    async def crash(_client: object, _response: object) -> None:
+        msg = "interrupted while storing room keys"
+        raise RuntimeError(msg)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncClient, "_handle_to_device", crash)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            await MatrixE2EE(config, store_path=tmp_path).setup()
+    await MatrixE2EE(config, store_path=tmp_path).setup()
+
+    since = [sync["query"].get("since") for sync in endpoint.syncs()]
+    assert since == [None, "batch-1", "batch-1"]
+
+
+async def test_store_lock_sits_beside_the_store(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, _endpoint = homeserver
+    store = tmp_path / "store"
+
+    await MatrixE2EE(config, store_path=store).setup()
+
+    assert e2ee_lock_path(store) == tmp_path / "store.lock"
+    assert not (store / "store.lock").exists()
+
+
+def test_undelivered_devices_lists_reachable_devices_missing_the_room_key() -> None:
+    def device(device_id: str, curve: str) -> SimpleNamespace:
+        return SimpleNamespace(id=device_id, curve25519=curve)
+
+    devices = {
+        "@alice:example.com": [device(DEVICE, "own"), device("PHONE", "phone")],
+        "@bob:example.com": [device("LAPTOP", "laptop"), device("OLD", "no-session")],
+    }
+    olm = SimpleNamespace(
+        device_id=DEVICE,
+        device_store=SimpleNamespace(active_user_devices=lambda user: devices[user]),
+        session_store=SimpleNamespace(get=lambda curve: None if curve == "no-session" else curve),
+        is_device_blacklisted=lambda _device: False,
+    )
+
+    missing = undelivered_devices(
+        cast("Olm", olm),
+        ["@alice:example.com", "@bob:example.com"],
+        {("@alice:example.com", "PHONE")},
+    )
+
+    assert missing == {("@bob:example.com", "LAPTOP")}
