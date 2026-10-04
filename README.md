@@ -8,8 +8,8 @@
 [![MCP](https://img.shields.io/badge/MCP-server-blue)](https://modelcontextprotocol.io/)
 
 <picture>
-  <source media="(prefers-reduced-motion: no-preference)" srcset="https://raw.githubusercontent.com/mindroom-ai/mindroom/main/assets/logo/logo-mark-animated.svg" />
-  <img src="https://raw.githubusercontent.com/mindroom-ai/mindroom/main/assets/logo/logo-mark.svg" alt="MindRoom Logo" align="right" width="120" />
+  <source media="(prefers-reduced-motion: no-preference)" srcset="https://raw.githubusercontent.com/mindroom-ai/matrix-mcp/main/docs/assets/logo.svg" />
+  <img src="https://raw.githubusercontent.com/mindroom-ai/matrix-mcp/main/docs/assets/logo-static.svg" alt="Matrix MCP logo" align="right" width="120" />
 </picture>
 
 Local-first Matrix access for MCP clients.
