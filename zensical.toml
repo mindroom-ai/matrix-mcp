@@ -7,6 +7,7 @@ site_description = "A local-first Matrix MCP server for connecting coding agents
 site_author = "MindRoom"
 site_url = "https://matrix-mcp.mindroom.chat/"
 copyright = "Copyright &copy; 2026 MindRoom"
+extra_css = ["stylesheets/extra.css"]
 
 repo_url = "https://github.com/mindroom-ai/matrix-mcp"
 repo_name = "GitHub"
