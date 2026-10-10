@@ -761,8 +761,9 @@ async def test_receipts_keep_each_readers_newest_receipt(
     request = endpoint.requests[0]
     assert request["query"]["timeout"] == "0"
     assert request["query"]["set_presence"] == "offline"
-    assert json.loads(request["query"]["filter"]) == {
-        "presence": {"types": []},
+    sync_filter = json.loads(request["query"]["filter"])
+    assert sync_filter.pop("presence")["types"] == []
+    assert sync_filter == {
         "account_data": {"types": []},
         "room": {
             "rooms": [ROOM],
@@ -983,4 +984,22 @@ async def test_latest_activity_maps_rooms_to_their_newest_message(
     }
     assert sync_filter["room"]["state"] == {"types": []}
     assert sync_filter["room"]["ephemeral"] == {"types": []}
-    assert sync_filter["presence"] == {"types": []}
+    assert sync_filter["presence"]["types"] == []
+
+
+async def test_snapshots_never_repeat_a_sync_request(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", SYNC_PATH)] = ({"next_batch": "next"}, 200)
+
+    await rooms.unread()
+    await rooms.unread()
+
+    # Synapse answers an identical sync request from its response cache for minutes.
+    first, second = (json.loads(request["query"]["filter"]) for request in endpoint.requests)
+    assert first["presence"]["types"] == second["presence"]["types"] == []
+    assert first["presence"]["not_types"] != second["presence"]["not_types"]
+    first.pop("presence")
+    second.pop("presence")
+    assert first == second

@@ -36,7 +36,7 @@ from peewee import PeeweeException
 
 from matrix_mcp.config import default_config_path
 from matrix_mcp.http_headers import resolve_http_headers
-from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id
+from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, uncached_sync_filter
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
@@ -415,7 +415,7 @@ async def _catch_up(client: AsyncClient) -> None:
             response = await client.sync(
                 timeout=0,
                 since=since,
-                sync_filter=_CATCH_UP_FILTER,
+                sync_filter=uncached_sync_filter(_CATCH_UP_FILTER),
                 full_state=True,
                 set_presence="offline",
             )

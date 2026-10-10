@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, Field, ValidationError
 
-from matrix_mcp.matrix_http import MatrixHTTPError, quote_matrix_id
+from matrix_mcp.matrix_http import MatrixHTTPError, quote_matrix_id, uncached_sync_filter
 
 if TYPE_CHECKING:
     from matrix_mcp.e2ee import RoomCrypto
@@ -615,7 +615,7 @@ class MatrixRooms:
         params: dict[str, str | int] = {
             "timeout": 0,
             "set_presence": "offline",
-            "filter": json.dumps(sync_filter),
+            "filter": json.dumps(uncached_sync_filter(sync_filter)),
         }
         result = await self.http.json("GET", "/_matrix/client/v3/sync", params=params)
         try:

@@ -8,6 +8,7 @@ from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 
@@ -155,6 +156,18 @@ class MatrixHTTP:
             if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
                 return None
             raise
+
+
+def uncached_sync_filter(sync_filter: dict[str, Any]) -> dict[str, Any]:
+    """Make a sync filter unique so the homeserver cannot answer from a response cache.
+
+    Synapse reuses the response to an identical sync request for minutes, which would serve
+    stale unread counts, receipts, invitations, or room keys. Excluding a random, nonexistent
+    presence event type changes the request without changing what it returns.
+    """
+    presence = dict(sync_filter.get("presence") or {})
+    presence["not_types"] = [f"matrix_mcp.snapshot.{uuid4().hex}"]
+    return {**sync_filter, "presence": presence}
 
 
 def quote_matrix_id(value: str, *, sigil: str, label: str) -> str:

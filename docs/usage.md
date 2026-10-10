@@ -198,7 +198,7 @@ matrix_get_read_receipts(room_id="!room:example.com", event_id="$my-message")
 
 Shows each member's latest read receipt, newest first: the event they have read up to, when, and in which thread.
 Pass `event_id` to check who has read that message: `read` is `true` when a member's receipt is on that event or a later one, by server timestamps, and `null` when it could not be checked, including receipts from a different thread than the message.
-Members who send private receipts or have receipts turned off do not appear; the connected user's own private receipt is marked `private`.
+Members who send private receipts or have receipts turned off do not appear; the connected user's own private receipt is marked `private`, though some homeservers (Tuwunel) do not report a private receipt on the user's own message.
 
 ??? info "How edits are resolved"
 
