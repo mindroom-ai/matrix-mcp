@@ -143,7 +143,7 @@ matrix_list_threads(room_id="!room:example.com", include="participated", before=
 ```
 
 Lists a room's threads, newest first, up to 50 per page.
-Each thread has its `root` message, `reply_count`, `latest_reply`, and whether the connected user `participated`.
+Each thread has its `root` message, `reply_count`, `latest_reply`, and whether the connected user `participated`, with edits resolved as in [history](#history-and-message-context).
 `include="participated"` keeps only threads the connected user has posted in.
 Pass `next_batch` unchanged as `before` for older threads, then read one with `matrix_read_thread`.
 
@@ -302,7 +302,7 @@ matrix_create_dm(user_id="@bob:example.com", encrypted=true)
 ```
 
 Opens a direct chat with one user and marks it as direct, so chat apps list it under people.
-When the connected user already has a direct chat that the other user is still in or invited to, it is reused and `created` is `false`.
+An existing direct chat is reused, with `created: false`, only when it holds exactly the two of you (joined or invited) and suits the request: `encrypted=true` never reuses an unencrypted chat, and authenticated HTTP mode never reuses an encrypted one.
 `encrypted=true` creates an end-to-end encrypted chat; it needs local mode, because [authenticated HTTP](hosted.md) mode holds no encryption keys.
 Messages sent before the other user accepts the invitation are shared with their devices, so they can read them after joining.
 

@@ -16,7 +16,7 @@ hide:
 
 <p class="mm-lede">
 A full-featured MCP server for Matrix.
-Claude Code, Codex, and any other MCP client can catch up on your rooms, search and read threads, reply, react, share files, and run rooms, including end-to-end encrypted ones.
+Claude Code, Codex, and any other MCP client can catch up on your rooms, search, read threads, reply, react, share files, and run rooms. End-to-end encrypted rooms work too, though the homeserver cannot search them.
 </p>
 
 [:lucide-rocket: Get started](getting-started.md){ .md-button .md-button--primary }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import weakref
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
@@ -27,6 +28,10 @@ RATE_LIMIT_RETRIES = 2
 _CONTROL_CODE_BOUNDARY = 32
 _MAX_TRANSACTION_ID_LENGTH = 255
 _ERRCODE_PATTERN = re.compile(r"M_[A-Z_0-9]{1,80}")
+# Per event loop, since asyncio locks belong to the loop that first waits on them.
+_WRITE_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, ...], asyncio.Lock]
+] = weakref.WeakKeyDictionary()
 
 
 class MatrixHTTPError(RuntimeError):
@@ -137,6 +142,15 @@ class MatrixHTTP:
                 return payload
         msg = "Matrix API request exhausted its retry budget"
         raise RuntimeError(msg)
+
+    def write_lock(self, *scope: str) -> asyncio.Lock:
+        """Serialize read-modify-write updates of one piece of Matrix data in this process.
+
+        Matrix has no compare-and-swap for room state or account data, so two overlapping
+        tool calls would each write back a copy that lacks the other's change.
+        """
+        locks = _WRITE_LOCKS.setdefault(asyncio.get_running_loop(), {})
+        return locks.setdefault((self._homeserver, self.user_id, *scope), asyncio.Lock())
 
     async def room_is_encrypted(self, room_id: str) -> bool:
         """Report room encryption; only a definitive missing state event means plaintext."""

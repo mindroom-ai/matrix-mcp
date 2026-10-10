@@ -176,7 +176,7 @@ Hosted mode exposes the [conversation, room, membership, directory, and profile 
 Use raw Matrix room and event IDs.
 Numeric references and local-file upload remain stdio features.
 Both transports also expose [history, search, thread lists, reactions, read receipts, message actions, pins, membership, direct chats, spaces, moderation, media, and catch-up tools](usage.md#history-and-message-context) using raw Matrix IDs.
-Hosted direct chats are unencrypted; `matrix_create_dm` refuses `encrypted=true` here.
+Hosted direct chats are unencrypted: `matrix_create_dm` refuses `encrypted=true` here and never reuses an existing encrypted direct chat, which hosted mode could not send to.
 Hosted file transfers use base64 payloads with a 5 MiB decoded limit, not server filesystem paths.
 Downloads use authenticated homeserver media routes and refuse redirects.
 Each hosted tool opens its own Matrix client with the request's verified credential and closes it after the call.

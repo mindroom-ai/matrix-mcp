@@ -10,7 +10,7 @@
 **Give your AI agent a seat in every Matrix room.**
 
 A full-featured [MCP](https://modelcontextprotocol.io/) server for [Matrix](https://matrix.org/).
-Claude Code, Codex, and any other MCP client can catch up on your rooms, search and read threads, reply, react, share files, and run rooms, including end-to-end encrypted ones.
+Claude Code, Codex, and any other MCP client can catch up on your rooms, search, read threads, reply, react, share files, and run rooms. End-to-end encrypted rooms work too, though the homeserver cannot search them.
 
 [![PyPI](https://img.shields.io/pypi/v/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
@@ -52,7 +52,7 @@ The server talks to your MCP client over stdio and opens no local port.
 | *"Did anyone 👍 my proposal, and has Bob read it yet?"* | `matrix_get_reactions`, `matrix_get_read_receipts` |
 | *"DM Bob the coverage report from this repo."* | `matrix_create_dm`, `matrix_send_message` |
 | *"Download the screenshot Alice posted and tell me what's broken."* | `matrix_read_room_recent`, `matrix_download_media` |
-| *"Spin up a room for this incident, invite Carol, and pin the runbook link."* | `matrix_create_room`, `matrix_pin_message` |
+| *"Spin up a room for this incident, invite Carol, and pin the runbook link."* | `matrix_create_room`, `matrix_send_message`, `matrix_pin_message` |
 
 ## Highlights
 

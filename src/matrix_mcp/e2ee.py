@@ -222,30 +222,38 @@ class MatrixE2EE:
         Without this, the other person in a new encrypted direct chat could never read
         messages sent before they accepted the invitation.
         """
-        visibility = await self._http.room_state(room.room_id, "m.room.history_visibility")
-        invited: set[str] = set()
-        if (visibility or {}).get("history_visibility", "shared") != "joined":
-            path = quote_matrix_id(room.room_id, sigil="!", label="room ID")
-            response = await self._http.json(
-                "GET",
-                f"/_matrix/client/v3/rooms/{path}/members",
-                params={"membership": "invite"},
-            )
-            chunk = response.get("chunk")
-            invited = {
-                event["state_key"]
-                for event in (chunk if isinstance(chunk, list) else [])
-                if isinstance(event, dict)
-                and event.get("type") == "m.room.member"
-                and isinstance(event.get("state_key"), str)
-                and isinstance(event.get("content"), dict)
-                and event["content"].get("membership") == "invite"
-            }
+        try:
+            invited = await self._invited_members(room.room_id)
+        except RuntimeError:
+            # Best effort: without the lookup, keys still reach every joined member.
+            _LOGGER.warning("Could not look up invited members of %s", room.room_id)
+            invited = set()
         # Forget invitations that were declined or withdrawn since the last send.
         for user_id in set(room.invited_users) - invited - joined:
             room.remove_member(user_id)
         for user_id in invited - joined:
             room.add_member(user_id, None, None, invited=True)
+
+    async def _invited_members(self, room_id: str) -> set[str]:
+        visibility = await self._http.room_state(room_id, "m.room.history_visibility")
+        if (visibility or {}).get("history_visibility", "shared") == "joined":
+            return set()
+        path = quote_matrix_id(room_id, sigil="!", label="room ID")
+        response = await self._http.json(
+            "GET",
+            f"/_matrix/client/v3/rooms/{path}/members",
+            params={"membership": "invite"},
+        )
+        chunk = response.get("chunk")
+        return {
+            event["state_key"]
+            for event in (chunk if isinstance(chunk, list) else [])
+            if isinstance(event, dict)
+            and event.get("type") == "m.room.member"
+            and isinstance(event.get("state_key"), str)
+            and isinstance(event.get("content"), dict)
+            and event["content"].get("membership") == "invite"
+        }
 
     async def aclose(self) -> None:
         client, self._client = self._client, None

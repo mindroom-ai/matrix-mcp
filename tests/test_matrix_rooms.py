@@ -451,43 +451,86 @@ def member_path(room_id: str, user_id: str) -> str:
     return f"/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{user_id}"
 
 
-async def test_create_dm_reuses_the_latest_direct_chat_both_users_are_in(
+def members(*memberships: tuple[str, str]) -> dict[str, Any]:
+    return {
+        "chunk": [
+            {"type": "m.room.member", "state_key": user, "content": {"membership": membership}}
+            for user, membership in memberships
+        ]
+    }
+
+
+async def test_create_dm_reuses_the_latest_two_person_chat(
     matrix: tuple[MatrixRooms, RoomEndpoint],
 ) -> None:
     rooms, endpoint = matrix
-    endpoint.responses[("GET", DIRECT_PATH)] = (
-        {
-            "@bob:example.com": [
-                "!old:example.com",
-                "!invited:example.com",
-                "!bob-left:example.com",
-                "!i-left:example.com",
-            ]
-        },
-        200,
-    )
-    endpoint.responses[("GET", JOINED_PATH)] = (
-        {"joined_rooms": ["!old:example.com", "!invited:example.com", "!bob-left:example.com"]},
-        200,
-    )
-    endpoint.responses[("GET", member_path("!bob-left:example.com", "@bob:example.com"))] = (
-        {"membership": "leave"},
-        200,
-    )
-    endpoint.responses[("GET", member_path("!invited:example.com", "@bob:example.com"))] = (
-        {"membership": "invite"},
-        200,
-    )
-
-    result = await rooms.create_dm("@bob:example.com")
-
-    assert result.model_dump() == {"room_id": "!invited:example.com", "created": False}
-    assert [(request["method"], request["path"]) for request in endpoint.requests] == [
-        ("GET", DIRECT_PATH),
-        ("GET", JOINED_PATH),
-        ("GET", member_path("!bob-left:example.com", "@bob:example.com")),
-        ("GET", member_path("!invited:example.com", "@bob:example.com")),
+    me, bob = "@alice:example.com", "@bob:example.com"
+    listed = [
+        "!old:example.com",
+        "!invited:example.com",
+        "!crowd:example.com",
+        "!bob-left:example.com",
     ]
+    endpoint.responses[("GET", DIRECT_PATH)] = ({bob: [*listed, "!i-left:example.com"]}, 200)
+    endpoint.responses[("GET", JOINED_PATH)] = ({"joined_rooms": listed}, 200)
+    for room_id, chunk in [
+        ("!bob-left:example.com", members((me, "join"), (bob, "leave"))),
+        (
+            "!crowd:example.com",
+            members((me, "join"), (bob, "join"), ("@eve:example.com", "invite")),
+        ),
+        ("!invited:example.com", members((me, "join"), (bob, "invite"))),
+    ]:
+        endpoint.responses[("GET", f"/_matrix/client/v3/rooms/{room_id}/members")] = (chunk, 200)
+
+    result = await rooms.create_dm(bob)
+
+    # A room with a third person in it is not a private chat with Bob.
+    assert result.model_dump() == {"room_id": "!invited:example.com", "created": False}
+    assert endpoint.requests[-2]["query"] == {"not_membership": "leave"}
+    assert endpoint.requests[-1]["path"].endswith("/state/m.room.encryption")
+
+
+@pytest.mark.parametrize(
+    ("encrypted_room", "request_encrypted", "has_crypto", "reused"),
+    [
+        (False, False, False, True),
+        (False, True, True, False),
+        (True, True, True, True),
+        (True, False, True, True),
+        (True, False, False, False),
+    ],
+)
+async def test_create_dm_reuses_only_rooms_this_mode_can_use(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+    *,
+    encrypted_room: bool,
+    request_encrypted: bool,
+    has_crypto: bool,
+    reused: bool,
+) -> None:
+    rooms, endpoint = matrix
+    rooms.crypto = MentionCrypto() if has_crypto else None
+    endpoint.responses[("GET", DIRECT_PATH)] = ({"@bob:example.com": ["!dm:example.com"]}, 200)
+    endpoint.responses[("GET", JOINED_PATH)] = ({"joined_rooms": ["!dm:example.com"]}, 200)
+    endpoint.responses[("GET", "/_matrix/client/v3/rooms/!dm:example.com/members")] = (
+        members(("@alice:example.com", "join"), ("@bob:example.com", "join")),
+        200,
+    )
+    if encrypted_room:
+        endpoint.responses[
+            ("GET", "/_matrix/client/v3/rooms/!dm:example.com/state/m.room.encryption")
+        ] = ({"algorithm": "m.megolm.v1.aes-sha2"}, 200)
+    endpoint.responses[("POST", "/_matrix/client/v3/createRoom")] = (
+        {"room_id": "!new:example.com"},
+        200,
+    )
+    endpoint.responses[("PUT", DIRECT_PATH)] = ({}, 200)
+
+    result = await rooms.create_dm("@bob:example.com", encrypted=request_encrypted)
+
+    assert result.created is not reused
+    assert result.room_id == ("!dm:example.com" if reused else "!new:example.com")
 
 
 async def test_create_dm_creates_a_trusted_private_room_and_records_it(

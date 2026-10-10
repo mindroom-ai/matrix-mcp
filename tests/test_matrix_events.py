@@ -1553,3 +1553,27 @@ async def test_reactions_reject_invalid_input_before_http(
     with pytest.raises(ValueError, match=r"room ID|event ID|limit"):
         await events.reactions(**arguments)
     assert endpoint.requests == []
+
+
+async def test_threads_resolve_edits_the_server_only_references(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    root = message(
+        "$root",
+        body="Deploy on Monday",
+        timestamp=100,
+        unsigned={"m.relations": {"m.replace": {"event_id": "$edit"}, "m.thread": {"count": 1}}},
+    )
+    endpoint.respond("GET", THREADS_PATH, {"chunk": [root]})
+    endpoint.respond(
+        "GET",
+        f"{RELATIONS_PATH}/$root/m.replace",
+        {"chunk": [replacement("$edit", target="$root", body="Deploy on Friday", timestamp=200)]},
+    )
+
+    page = await events.threads(ROOM)
+
+    assert page.threads[0].root.body == "Deploy on Friday"
+    assert page.threads[0].root.edited is True
+    assert page.edit_resolution_truncated is False

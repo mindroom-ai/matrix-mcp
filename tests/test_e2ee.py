@@ -51,6 +51,7 @@ class CryptoEndpoint:
     sync_lists_room: bool = False
     invited: list[str] = field(default_factory=list)
     history_visibility: str | None = None
+    members_status: int = 200
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -84,6 +85,8 @@ class CryptoEndpoint:
             return web.json_response({"joined": {USER: {}}})
         if path.endswith("/members"):
             assert request.query["membership"] == "invite"
+            if self.members_status != 200:
+                return web.json_response({"errcode": "M_UNKNOWN"}, status=self.members_status)
             chunk = [
                 {
                     "type": "m.room.member",
@@ -247,6 +250,23 @@ async def test_room_keys_reach_invited_members_unless_history_is_joined_only(
         assert "@bob:example.com" not in room.users
     finally:
         await writer.aclose()
+
+
+async def test_failed_invitee_lookup_still_encrypts_for_joined_members(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.invited = ["@bob:example.com"]
+    endpoint.members_status = 500
+    writer = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        event_type, _ = await writer.encrypt(ROOM, "m.room.message", {"body": "still sent"})
+        assert writer._client is not None  # noqa: SLF001
+        assert "@bob:example.com" not in writer._client.rooms[ROOM].users  # noqa: SLF001
+    finally:
+        await writer.aclose()
+
+    assert event_type == "m.room.encrypted"
 
 
 async def test_encrypted_message_decrypts_in_a_later_session(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -110,8 +111,20 @@ async def test_missing_power_levels_use_spec_defaults(
     matrix: tuple[MatrixModeration, RoomEndpoint],
 ) -> None:
     moderation, _ = matrix
-    # Without a power levels event, sending state needs level 0 instead of 50.
-    assert await moderation.power_levels(ROOM) == PowerLevels(own_level=0, state_default=0)
+    # Without a power levels event, sending state needs level 0 instead of 50, and with
+    # no readable create event nobody can tell whether the connected user created the room.
+    assert await moderation.power_levels(ROOM) == PowerLevels(own_level=None, state_default=0)
+
+
+async def test_unknown_creator_leaves_own_level_unset_without_power_levels(
+    matrix: tuple[MatrixModeration, RoomEndpoint],
+) -> None:
+    moderation, endpoint = matrix
+    # Room version 11 dropped the creator field, and this server ignores format=event.
+    endpoint.responses[("GET", f"{ROOM_PATH}/state/m.room.create")] = ({"room_version": "11"}, 200)
+    levels = await moderation.power_levels(ROOM)
+    assert levels.own_level is None
+    assert levels.users == {}
 
 
 @pytest.mark.parametrize(
@@ -400,3 +413,52 @@ async def test_pin_writes_propagate_permission_errors(
     endpoint.responses[("PUT", PINNED_PATH)] = ({"errcode": "M_FORBIDDEN"}, 403)
     with pytest.raises(MatrixHTTPError, match="M_FORBIDDEN"):
         await moderation.unpin(ROOM, "$a")
+
+
+@dataclass
+class StatefulRoom:
+    """Room state that serves its latest content after a delay, so calls overlap."""
+
+    state: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    async def handle(self, request: web.Request) -> web.Response:
+        event_type = request.path.rsplit("/", 1)[-1]
+        if request.method == "PUT":
+            self.state[event_type] = await request.json()
+            return web.json_response({"event_id": f"${len(self.state)}"})
+        if "/event/" in request.path:
+            return web.json_response({"event_id": event_type})
+        if event_type == "m.room.create":
+            return web.json_response({"room_version": "11"})
+        await asyncio.sleep(0.05)
+        return web.json_response(self.state.get(event_type, {"errcode": "M_NOT_FOUND"}))
+
+
+async def test_overlapping_writes_keep_every_change() -> None:
+    room = StatefulRoom(state={"m.room.power_levels": {"users": {ME: 100}}})
+    app = web.Application()
+    app.router.add_route("*", "/{path:.*}", room.handle)
+    async with TestServer(app) as server:
+        http = MatrixHTTP(
+            MatrixMCPConfig(
+                homeserver=str(server.make_url("/")),
+                user_id=ME,
+                device_id="TESTDEVICE",
+                access_token="test-token",
+            )
+        )
+        # Separate clients, like separate tool calls, share one lock per room and event type.
+        first, second = MatrixModeration(http), MatrixModeration(http)
+        await asyncio.gather(
+            first.set_power_level(ROOM, "@bob:example.com", 50),
+            second.set_power_level(ROOM, "@carol:example.com", 50),
+            first.pin(ROOM, "$one"),
+            second.pin(ROOM, "$two"),
+        )
+
+    assert room.state["m.room.power_levels"]["users"] == {
+        ME: 100,
+        "@bob:example.com": 50,
+        "@carol:example.com": 50,
+    }
+    assert sorted(room.state["m.room.pinned_events"]["pinned"]) == ["$one", "$two"]

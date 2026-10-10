@@ -753,7 +753,7 @@ async def test_room_profile_tools_use_each_callers_matrix_identity(browser: OAut
         "avatar_url": "mxc://example.com/bob",
         "encrypted": False,
         "joined_member_count": 2,
-        "own_power_level": 0,
+        "own_power_level": None,
         "room_type": None,
         "pinned_event_ids": [],
     }

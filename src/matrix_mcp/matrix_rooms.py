@@ -277,7 +277,9 @@ class MatrixRooms:
         direct = await self._direct_chats()
         joined = set(await self._joined_rooms())
         for listed_room in reversed(_string_list(direct.get(user_id))):
-            if listed_room in joined and await self._in_room(listed_room, user_id):
+            if listed_room in joined and await self._reusable_direct_chat(
+                listed_room, user_id, encrypted=encrypted
+            ):
                 return DirectRoom(room_id=listed_room, created=False)
         body: dict[str, object] = {
             "visibility": "private",
@@ -299,10 +301,11 @@ class MatrixRooms:
         try:
             # Re-read right before writing: room creation can take seconds, and other
             # clients' changes to the map must survive. Only this user's list gains the room.
-            direct = await self._direct_chats()
-            listed = _string_list(direct.get(user_id))
-            updated = {**direct, user_id: [*listed, room_id]}
-            await self.http.json("PUT", self._direct_chats_path(), body=updated)
+            async with self.http.write_lock("m.direct"):
+                direct = await self._direct_chats()
+                listed = _string_list(direct.get(user_id))
+                updated = {**direct, user_id: [*listed, room_id]}
+                await self.http.json("PUT", self._direct_chats_path(), body=updated)
         except RuntimeError:
             msg = (
                 f"Created direct chat {room_id}, but the direct-chat marker was not saved; "
@@ -548,9 +551,31 @@ class MatrixRooms:
         )
         return timestamp, thread if isinstance(thread, str) else "main"
 
-    async def _in_room(self, room_id: str, user_id: str) -> bool:
-        member = await self.http.room_state(room_id, "m.room.member", user_id)
-        return member is not None and member.get("membership") in {"join", "invite"}
+    async def _reusable_direct_chat(self, room_id: str, user_id: str, *, encrypted: bool) -> bool:
+        """Reuse only a private chat of exactly these two people that this mode can use."""
+        room = _identifier(room_id, sigils="!")
+        members = await self.http.json(
+            "GET",
+            f"/_matrix/client/v3/rooms/{room}/members",
+            params={"not_membership": "leave"},
+        )
+        chunk = members.get("chunk")
+        present = {
+            event["state_key"]
+            for event in (chunk if isinstance(chunk, list) else [])
+            if isinstance(event, dict)
+            and isinstance(event.get("state_key"), str)
+            and _content(event).get("membership") in {"join", "invite"}
+        }
+        # Anyone else in the room would read messages meant for this user alone.
+        if present != {self.http.user_id, user_id}:
+            return False
+        room_encrypted = await self.http.room_is_encrypted(room_id)
+        # A request for encryption never gets a plaintext room, and a mode without
+        # encryption keys (authenticated HTTP) never gets a room it cannot send to.
+        return not (encrypted and not room_encrypted) and not (
+            self.crypto is None and room_encrypted
+        )
 
     def _direct_chats_path(self) -> str:
         user = _identifier(self.http.user_id, sigils="@")

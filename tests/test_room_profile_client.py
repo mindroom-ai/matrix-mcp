@@ -169,7 +169,7 @@ async def test_room_info_missing_state_is_unset(
     assert info.avatar_url is None
     assert info.encrypted is False
     assert info.joined_member_count == 1
-    assert info.own_power_level == 0
+    assert info.own_power_level is None
     assert info.room_type is None
     assert info.pinned_event_ids == []
 

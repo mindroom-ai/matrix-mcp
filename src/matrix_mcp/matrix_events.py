@@ -149,6 +149,10 @@ class ThreadPage(BaseModel):
 
     threads: list[ThreadSummary]
     next_batch: str | None = None
+    edit_resolution_truncated: bool = Field(
+        default=False,
+        description="Whether a bounded replacement-relation fallback scan was truncated.",
+    )
 
 
 class Reaction(BaseModel):
@@ -387,23 +391,36 @@ class MatrixEvents:
             room_id, [*roots, *(latest for latest in latest_events if latest is not None)]
         )
         decrypted_roots, decrypted_latest = decrypted[: len(roots)], iter(decrypted[len(roots) :])
+        # Resolve edits like history does, so agents never act on text already corrected.
+        relation_budget = _RelationFetchBudget()
         threads = []
+        truncated = False
         for root, bundle, latest in zip(decrypted_roots, bundles, latest_events, strict=True):
             latest_reply = None
             if latest is not None:
-                latest_reply = mark_encryption(
-                    normalize_timeline_event(room_id, next(decrypted_latest)), encryption
+                latest_event, latest_truncated = await self._expand_one(
+                    room_id, next(decrypted_latest), relation_budget=relation_budget
                 )
+                latest_reply = mark_encryption(latest_event, encryption)
+                truncated = truncated or latest_truncated
+            root_event, root_truncated = await self._expand_one(
+                room_id, root, relation_budget=relation_budget
+            )
+            truncated = truncated or root_truncated
             participated = bundle.get("current_user_participated")
             threads.append(
                 ThreadSummary(
-                    root=mark_encryption(normalize_timeline_event(room_id, root), encryption),
+                    root=mark_encryption(root_event, encryption),
                     reply_count=_optional_integer(bundle.get("count")),
                     latest_reply=latest_reply,
                     participated=participated if isinstance(participated, bool) else None,
                 )
             )
-        return ThreadPage(threads=threads, next_batch=_optional_string_field(payload, "next_batch"))
+        return ThreadPage(
+            threads=threads,
+            next_batch=_optional_string_field(payload, "next_batch"),
+            edit_resolution_truncated=truncated,
+        )
 
     async def reactions(self, room_id: str, event_id: str, *, limit: int = 200) -> ReactionSummary:
         """Count reactions on an event by key, scanning at most limit reaction events."""

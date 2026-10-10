@@ -44,7 +44,7 @@ class PowerLevels(BaseModel):
     own_level: int | None = Field(
         description=(
             "The connected user's power level in this room; null when they are a room "
-            "creator, which outranks every level."
+            "creator, which outranks every level, or when the room's creator is unknown."
         )
     )
 
@@ -74,11 +74,14 @@ class MatrixModeration:
         content = stored or {}
         defaults = PowerLevels(own_level=0)
         users = _level_map(content.get("users"))
+        unknown_creator = False
         if stored is None and not creators:
             # Without a power levels event, the room creator alone has level 100.
             creator = create.get("creator", sender)
             if isinstance(creator, str):
                 users = {creator: 100}
+            else:
+                unknown_creator = True
         users_default = _level(content.get("users_default"), defaults.users_default)
         # state_default is 50 when unspecified, but 0 when there is no power levels event.
         state_default = defaults.state_default if stored is not None else 0
@@ -94,7 +97,7 @@ class MatrixModeration:
             ban=_level(content.get("ban"), defaults.ban),
             redact=_level(content.get("redact"), defaults.redact),
             own_level=None
-            if self.http.user_id in creators
+            if self.http.user_id in creators or unknown_creator
             else users.get(self.http.user_id, users_default),
         )
 
@@ -106,56 +109,60 @@ class MatrixModeration:
         ):
             msg = f"level must be an integer between {-_MAX_LEVEL} and {_MAX_LEVEL}"
             raise ValueError(msg)
-        content = await self.http.room_state(room_id, _POWER_LEVELS)
-        if content is None:
-            msg = "Matrix room has no power levels event to update"
-            raise RuntimeError(msg)
-        if user_id in _creators(*await self._create_event(room_id)):
-            msg = "Room creators outrank every power level; their level cannot be set"
-            raise ValueError(msg)
-        users = content.get("users")
-        users = dict(users) if isinstance(users, dict) else {}
-        if user_id == self.http.user_id:
-            users_default = _level(content.get("users_default"), 0)
-            current = _level(users.get(user_id), users_default)
-            new = users_default if level is None else level
-            if new < current:
-                msg = (
-                    "Refusing to lower your own power level: it cannot be undone without "
-                    "someone else's help"
-                )
+        # Overlapping calls would each write back a users map missing the other's change.
+        async with self.http.write_lock(room_id, _POWER_LEVELS):
+            content = await self.http.room_state(room_id, _POWER_LEVELS)
+            if content is None:
+                msg = "Matrix room has no power levels event to update"
+                raise RuntimeError(msg)
+            if user_id in _creators(*await self._create_event(room_id)):
+                msg = "Room creators outrank every power level; their level cannot be set"
                 raise ValueError(msg)
-        if level is None:
-            users.pop(user_id, None)
-        else:
-            users[user_id] = level
-        payload = await self.http.json(
-            "PUT",
-            f"/_matrix/client/v3/rooms/{room}/state/{_POWER_LEVELS}",
-            body={**content, "users": users},
-        )
-        return _event_id(payload)
+            users = content.get("users")
+            users = dict(users) if isinstance(users, dict) else {}
+            if user_id == self.http.user_id:
+                users_default = _level(content.get("users_default"), 0)
+                current = _level(users.get(user_id), users_default)
+                new = users_default if level is None else level
+                if new < current:
+                    msg = (
+                        "Refusing to lower your own power level: it cannot be undone without "
+                        "someone else's help"
+                    )
+                    raise ValueError(msg)
+            if level is None:
+                users.pop(user_id, None)
+            else:
+                users[user_id] = level
+            payload = await self.http.json(
+                "PUT",
+                f"/_matrix/client/v3/rooms/{room}/state/{_POWER_LEVELS}",
+                body={**content, "users": users},
+            )
+            return _event_id(payload)
 
     async def pin(self, room_id: str, event_id: str) -> PinnedEvents:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         event = quote_matrix_id(event_id, sigil="$", label="event ID")
         # Only pin events that exist in this room.
         await self.http.json("GET", f"/_matrix/client/v3/rooms/{room}/event/{event}")
-        content, pinned = await self._pinned(room_id)
-        if event_id in pinned:
-            return PinnedEvents(pinned=pinned, changed=False)
-        pinned = [*pinned, event_id]
-        await self._put_pinned(room, content, pinned)
+        async with self.http.write_lock(room_id, _PINNED_EVENTS):
+            content, pinned = await self._pinned(room_id)
+            if event_id in pinned:
+                return PinnedEvents(pinned=pinned, changed=False)
+            pinned = [*pinned, event_id]
+            await self._put_pinned(room, content, pinned)
         return PinnedEvents(pinned=pinned, changed=True)
 
     async def unpin(self, room_id: str, event_id: str) -> PinnedEvents:
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
         quote_matrix_id(event_id, sigil="$", label="event ID")
-        content, pinned = await self._pinned(room_id)
-        if event_id not in pinned:
-            return PinnedEvents(pinned=pinned, changed=False)
-        pinned = [pinned_id for pinned_id in pinned if pinned_id != event_id]
-        await self._put_pinned(room, content, pinned)
+        async with self.http.write_lock(room_id, _PINNED_EVENTS):
+            content, pinned = await self._pinned(room_id)
+            if event_id not in pinned:
+                return PinnedEvents(pinned=pinned, changed=False)
+            pinned = [pinned_id for pinned_id in pinned if pinned_id != event_id]
+            await self._put_pinned(room, content, pinned)
         return PinnedEvents(pinned=pinned, changed=True)
 
     async def _membership_action(
