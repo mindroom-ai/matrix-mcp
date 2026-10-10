@@ -10,7 +10,7 @@
 **Give your AI agent a seat in every Matrix room.**
 
 A full-featured [MCP](https://modelcontextprotocol.io/) server for [Matrix](https://matrix.org/).
-Claude Code, Codex, and any other MCP client can catch up on your rooms, read threads and history, reply, share files, and manage rooms, including end-to-end encrypted ones.
+Claude Code, Codex, and any other MCP client can catch up on your rooms, search and read threads, reply, react, share files, and run rooms, including end-to-end encrypted ones.
 
 [![PyPI](https://img.shields.io/pypi/v/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
@@ -47,20 +47,21 @@ The server talks to your MCP client over stdio and opens no local port.
 | Ask your agent | Tools it reaches for |
 | --- | --- |
 | *"Catch me up: which rooms need me, and what was I mentioned in?"* | `matrix_get_unread`, `matrix_read_thread` |
-| *"Read the deploy thread and reply with the fix I just pushed."* | `matrix_read_thread`, `matrix_send_message` |
-| *"Post `coverage.html` to the CI room and ask the reviewer to take a look."* | `matrix_send_message` |
+| *"Find where we picked the release date and show me the discussion around it."* | `matrix_search_messages`, `matrix_get_event_context` |
+| *"Which threads in #dev are still active? Reply to the deploy one with my fix."* | `matrix_list_threads`, `matrix_send_message` |
+| *"Did anyone 👍 my proposal, and has Bob read it yet?"* | `matrix_get_reactions`, `matrix_get_read_receipts` |
+| *"DM Bob the coverage report from this repo."* | `matrix_create_dm`, `matrix_send_message` |
 | *"Download the screenshot Alice posted and tell me what's broken."* | `matrix_read_room_recent`, `matrix_download_media` |
-| *"Spin up a room for this incident and invite Bob and Carol."* | `matrix_create_room`, `matrix_search_users` |
-| *"Find where we picked the release date and show me the discussion around it."* | `matrix_read_history`, `matrix_get_event_context` |
+| *"Spin up a room for this incident, invite Carol, and pin the runbook link."* | `matrix_create_room`, `matrix_pin_message` |
 
 ## Highlights
 
-- 🧰 **30 tools.** Reading, threads, history, unread catch-up, replies, reactions, edits, redactions, invitations, rooms, profiles, and media.
+- 🧰 **43 tools.** Search, threads, history, unread catch-up, reactions, read receipts, replies, edits, direct chats, spaces, pins, moderation, profiles, and media.
 - 🔒 **End-to-end encryption.** Matrix MCP is its own Matrix device: encrypted rooms just work, files included, and older keys import from Element.
 - 🔑 **Every login your server allows.** Matrix SSO (even over SSH), password, login token, or access token, including homeservers behind Cloudflare Access and other gateways.
 - 🌐 **Local or hosted.** stdio for local agents, or [authenticated HTTP](https://matrix-mcp.mindroom.chat/hosted/) where every user signs in with their own Matrix account through OAuth and Matrix SSO. Container images on GHCR.
 - #️⃣ **Light on context.** Rooms and events get short numeric refs, so agents write `room_id=3` instead of copying long Matrix IDs.
-- 🛡️ **Careful by design.** Every tool declares whether it writes, reading never marks messages read, receipts are private by default, and transfers are size-bounded.
+- 🛡️ **Careful by design.** Every tool declares whether it writes and whether it is destructive, reading never marks messages read, receipts are private by default, transfers are size-bounded, and it won't kick, ban, or demote you.
 
 As far as we know, Matrix MCP is the only Matrix MCP server that runs both as a local server with end-to-end encryption and as a multi-user hosted service where everyone signs in with their own Matrix account.
 
@@ -68,10 +69,11 @@ As far as we know, Matrix MCP is the only Matrix MCP server that runs both as a 
 
 | Area | Tools |
 | --- | --- |
-| Session and rooms | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar` |
-| Reading | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_read_history`, `matrix_get_event_context` |
-| Writing | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event` |
-| Membership | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room` |
+| Session and rooms | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar`, `matrix_get_space_hierarchy` |
+| Reading | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_list_threads`, `matrix_read_history`, `matrix_get_event_context`, `matrix_search_messages`, `matrix_get_reactions`, `matrix_get_read_receipts` |
+| Writing | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event`, `matrix_pin_message`, `matrix_unpin_message` |
+| Membership | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room`, `matrix_create_dm` |
+| Moderation | `matrix_get_power_levels`, `matrix_set_power_level`, `matrix_kick_user`, `matrix_ban_user`, `matrix_unban_user` |
 | Profile | `matrix_get_profile`, `matrix_set_display_name`, `matrix_set_avatar` |
 | Media | `matrix_upload_media`, `matrix_download_media`, `matrix_send_media` |
 | Catch-up | `matrix_get_unread`, `matrix_mark_read` |

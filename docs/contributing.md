@@ -21,6 +21,14 @@ uv sync --extra dev --group docs
 uv run pytest
 ```
 
+Two opt-in tests run against a real homeserver: `tests/test_tools_live.py` exercises the room, search, and moderation tools, and `tests/test_e2ee_live.py` exercises encrypted rooms.
+Point them at a disposable homeserver that allows registration:
+
+```bash
+MATRIX_MCP_LIVE_HOMESERVER=http://127.0.0.1:8008 \
+MATRIX_MCP_LIVE_REGISTRATION_TOKEN=... uv run pytest tests/test_tools_live.py tests/test_e2ee_live.py
+```
+
 ## Code Quality
 
 ```bash
@@ -58,10 +66,11 @@ src/matrix_mcp/
 ├── http_headers.py        Static and command-generated HTTP headers
 ├── id_state.py            Stable numeric refs for rooms and events
 ├── matrix_client.py       Matrix client wrapper
-├── matrix_events.py       Room history, event context, and event sends
+├── matrix_events.py       History, search, threads, reactions, and event sends
 ├── matrix_http.py         Bounded Matrix HTTP requests
 ├── matrix_media.py        Media upload and download
-├── matrix_rooms.py        Invitations, membership, and unread catch-up
+├── matrix_moderation.py   Kicks, bans, power levels, and pins
+├── matrix_rooms.py        Invitations, direct chats, spaces, receipts, and unread catch-up
 ├── mcp_server.py          Local (stdio) tool registration
 └── tls.py                 TLS defaults
 ```
