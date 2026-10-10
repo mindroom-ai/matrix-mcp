@@ -36,6 +36,7 @@ from peewee import PeeweeException
 
 from matrix_mcp.config import default_config_path
 from matrix_mcp.http_headers import resolve_http_headers
+from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
@@ -126,6 +127,7 @@ class MatrixE2EE:
             msg = "End-to-end encryption needs a Matrix user, device ID, and access token"
             raise RuntimeError(msg)
         self._config = config
+        self._http = MatrixHTTP(config)
         self._user_id = config.user_id
         self._device_id = config.device_id
         self._access_token = token
@@ -184,10 +186,14 @@ class MatrixE2EE:
         if room is None:
             room = MatrixRoom(room_id, self._user_id, encrypted=True)
             client.rooms[room_id] = room
+        # Callers only encrypt for rooms with an m.room.encryption state event. The key-only
+        # catch-up sync can still list the room (Synapse does) without that state.
+        room.encrypted = True
         members = await client.joined_members(room_id)
         if not isinstance(members, JoinedMembersResponse):
             msg = f"Matrix joined_members failed: {members}"
             raise RuntimeError(msg)  # noqa: TRY004 - Upstream error response.
+        await self._track_invited_members(room, {member.user_id for member in members.members})
         # Refresh every member's devices so new devices receive the room key.
         olm.users_for_key_query.update(room.users)
         keys = await client.keys_query()
@@ -209,6 +215,37 @@ class MatrixE2EE:
                 raise RuntimeError(msg)
         encrypted_type, encrypted_content = client.encrypt(room_id, event_type, content)
         return encrypted_type, dict(encrypted_content)
+
+    async def _track_invited_members(self, room: MatrixRoom, joined: set[str]) -> None:
+        """Invited members get room keys too, unless the room hides history from them.
+
+        Without this, the other person in a new encrypted direct chat could never read
+        messages sent before they accepted the invitation.
+        """
+        visibility = await self._http.room_state(room.room_id, "m.room.history_visibility")
+        invited: set[str] = set()
+        if (visibility or {}).get("history_visibility", "shared") != "joined":
+            path = quote_matrix_id(room.room_id, sigil="!", label="room ID")
+            response = await self._http.json(
+                "GET",
+                f"/_matrix/client/v3/rooms/{path}/members",
+                params={"membership": "invite"},
+            )
+            chunk = response.get("chunk")
+            invited = {
+                event["state_key"]
+                for event in (chunk if isinstance(chunk, list) else [])
+                if isinstance(event, dict)
+                and event.get("type") == "m.room.member"
+                and isinstance(event.get("state_key"), str)
+                and isinstance(event.get("content"), dict)
+                and event["content"].get("membership") == "invite"
+            }
+        # Forget invitations that were declined or withdrawn since the last send.
+        for user_id in set(room.invited_users) - invited - joined:
+            room.remove_member(user_id)
+        for user_id in invited - joined:
+            room.add_member(user_id, None, None, invited=True)
 
     async def aclose(self) -> None:
         client, self._client = self._client, None
