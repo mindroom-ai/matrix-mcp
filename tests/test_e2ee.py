@@ -252,7 +252,7 @@ async def test_room_keys_reach_invited_members_unless_history_is_joined_only(
         await writer.aclose()
 
 
-async def test_failed_invitee_lookup_still_encrypts_for_joined_members(
+async def test_failed_invitee_lookup_refuses_to_encrypt(
     homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
 ) -> None:
     config, endpoint = homeserver
@@ -260,13 +260,11 @@ async def test_failed_invitee_lookup_still_encrypts_for_joined_members(
     endpoint.members_status = 500
     writer = MatrixE2EE(config, store_path=tmp_path)
     try:
-        event_type, _ = await writer.encrypt(ROOM, "m.room.message", {"body": "still sent"})
-        assert writer._client is not None  # noqa: SLF001
-        assert "@bob:example.com" not in writer._client.rooms[ROOM].users  # noqa: SLF001
+        # Bob could never read a message whose key skipped him, so it must not go out.
+        with pytest.raises(RuntimeError, match="invited members; the message was not sent"):
+            await writer.encrypt(ROOM, "m.room.message", {"body": "for bob"})
     finally:
         await writer.aclose()
-
-    assert event_type == "m.room.encrypted"
 
 
 async def test_encrypted_message_decrypts_in_a_later_session(

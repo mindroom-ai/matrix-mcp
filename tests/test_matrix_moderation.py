@@ -9,7 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from matrix_mcp.config import MatrixMCPConfig
-from matrix_mcp.matrix_http import MatrixHTTP, MatrixHTTPError
+from matrix_mcp.matrix_http import _WRITE_LOCKS, MatrixHTTP, MatrixHTTPError
 from matrix_mcp.matrix_moderation import MatrixModeration, PowerLevels
 
 if TYPE_CHECKING:
@@ -462,3 +462,5 @@ async def test_overlapping_writes_keep_every_change() -> None:
         "@carol:example.com": 50,
     }
     assert sorted(room.state["m.room.pinned_events"]["pinned"]) == ["$one", "$two"]
+    # Released locks are dropped, so a long-running server does not accumulate them.
+    assert not _WRITE_LOCKS.get(asyncio.get_running_loop())

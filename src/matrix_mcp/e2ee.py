@@ -224,10 +224,11 @@ class MatrixE2EE:
         """
         try:
             invited = await self._invited_members(room.room_id)
-        except RuntimeError:
-            # Best effort: without the lookup, keys still reach every joined member.
-            _LOGGER.warning("Could not look up invited members of %s", room.room_id)
-            invited = set()
+        except RuntimeError as exc:
+            # Like an undelivered room key: an invitee who could never read it must not be
+            # silently left out of a message.
+            msg = "Could not look up the room's invited members; the message was not sent"
+            raise RuntimeError(msg) from exc
         # Forget invitations that were declined or withdrawn since the last send.
         for user_id in set(room.invited_users) - invited - joined:
             room.remove_member(user_id)

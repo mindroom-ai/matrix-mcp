@@ -67,7 +67,7 @@ Remove it from your session list in another client if you no longer need it.
 
 - The device is not verified, so other clients list it as an unverified session. Clients set to withhold keys from unverified devices will not share room keys with it.
 - Matrix MCP does not verify other devices either, so it trusts the homeserver to name the sender of each message.
-- Room keys go to joined members and, unless the room's history visibility is `joined`, to invited members, so people can read what was sent while their invitation was pending. Users invited by other clients after a message was sent cannot read it.
+- Room keys go to joined members and, unless the room's history visibility is `joined`, to invited members, so people can read what was sent while their invitation was pending; if the invited members cannot be looked up, the message is not sent. Users invited by other clients after a message was sent cannot read it.
 - A message is not sent when its room key fails to reach a device that should get it. Devices that cannot be reached at all, such as devices out of one-time keys or on an unreachable server, are skipped, as in other clients.
 - Edits of encrypted messages count only when the edit is encrypted too.
 - The encryption check and the send are separate requests, so a room that turns on encryption between them can receive one plaintext message.
