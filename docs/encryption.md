@@ -6,7 +6,10 @@ icon: lucide/lock
 
 In stdio mode, Matrix MCP is its own Matrix device with end-to-end encryption.
 Encrypted rooms work with the same tools as any other room: reads are decrypted and sends are encrypted, including files.
-Authenticated HTTP mode does not support encrypted rooms.
+
+!!! note "Local mode only"
+
+    Authenticated HTTP mode holds no device keys and does not support encrypted rooms.
 
 ## Setup
 
@@ -36,13 +39,18 @@ Attachments in encrypted rooms show `media.encrypted: true`.
 To download one, pass its `media_url` together with the `room_id` and `event_id` of its message to `matrix_download_media`.
 
 To share a file in an encrypted room, use `matrix_send_message` with `file_path`; it uploads an encrypted copy.
-`matrix_upload_media` stores files unencrypted, and `matrix_send_media` refuses encrypted rooms.
+
+!!! warning
+
+    `matrix_upload_media` stores files unencrypted, and `matrix_send_media` refuses encrypted rooms.
 
 ## Where the Keys Live
 
 Keys are stored per device in the default config directory reported by `matrix-mcp config-path`, even when you use `--config`, and only your user can read them.
 Several `matrix-mcp serve` processes on one machine can share the device; they take turns using the keys.
-Log in separately on each machine instead of copying the config directory: two machines sharing one device would split its room keys between them.
+!!! tip "One device per machine"
+
+    Log in separately on each machine instead of copying the config directory: two machines sharing one device would split its room keys between them.
 
 `matrix-mcp auth logout` deletes the keys but leaves the device registered on the homeserver.
 Remove it from your session list in another client if you no longer need it.

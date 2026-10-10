@@ -1,9 +1,28 @@
+---
+icon: lucide/globe
+---
+
 # Authenticated HTTP
 
 `matrix-mcp serve` uses local stdio by default.
-HTTP mode lets each MCP client connect its own Matrix account through the configured homeserver's browser SSO.
+HTTP mode turns it into a shared service: each MCP client connects its own Matrix account through the configured homeserver's browser SSO.
 It uses FastMCP's OAuth proxy, client registration, consent, PKCE, and encrypted persistent storage.
 No shared Matrix access token or local auth config is used.
+
+```mermaid
+sequenceDiagram
+  participant C as MCP client
+  participant S as matrix-mcp (HTTP)
+  participant H as Matrix homeserver
+  C->>S: Register callback, start OAuth with PKCE
+  S->>C: Consent screen
+  C->>H: User signs in through Matrix SSO in the browser
+  H-->>S: Browser returns to /auth/callback with a single-use loginToken
+  S->>H: Exchange loginToken for a Matrix session
+  S->>C: Server-issued MCP tokens (never Matrix tokens)
+  C->>S: Tool call
+  S->>H: Check the session with whoami, then call Matrix as that user
+```
 
 ## Setup
 
@@ -20,9 +39,12 @@ openssl rand -hex 32
 
 Provide that value through `MATRIX_MCP_HOSTED_SECRET_KEY`.
 Use at least 32 random characters.
-Do not regenerate it at each startup or pass it on the command line.
-Losing the key loses access to stored registrations and sessions.
-The server refuses to open existing state with a different key or homeserver.
+
+!!! warning "Keep the secret key stable"
+
+    Do not regenerate it at each startup or pass it on the command line.
+    Losing the key loses access to stored registrations and sessions.
+    The server refuses to open existing state with a different key or homeserver.
 
 ```sh
 matrix-mcp serve --transport http \
@@ -55,13 +77,18 @@ For example, `MATRIX_MCP_HOSTED_ALLOWED_CLIENT_REDIRECT_URIS` may contain `["htt
 CLI values override environment values.
 Request input cannot choose the homeserver or API base.
 
-An HTTP `API_BASE_URL` carries Matrix bearer tokens without transport encryption.
-Use it only on a protected internal network; use HTTPS otherwise.
+!!! danger "Plain-HTTP API base"
+
+    An HTTP `API_BASE_URL` carries Matrix bearer tokens without transport encryption.
+    Use it only on a protected internal network; use HTTPS otherwise.
 
 Keep the state directory on a persistent local volume, accessible only to the service account.
-Run **one process per state directory**.
-Startup holds a file lock for the application lifetime; a second server fails to start.
-Multiple workers, replicas, and network filesystems are unsupported.
+
+!!! note "One process per state directory"
+
+    Startup holds a file lock for the application lifetime; a second server fails to start.
+    Multiple workers, replicas, and network filesystems are unsupported.
+
 Back up encrypted state and the secret securely together.
 Stop the server before restoring state.
 
@@ -110,9 +137,12 @@ Authorization and protected-resource discovery advertise the OAuth endpoints and
 The client registers its callback, opens the consent screen, then redirects to Matrix SSO.
 The browser returns to `https://mcp.example.com/auth/callback` with a single-use Matrix `loginToken`; that token is exchanged only by the server.
 
-The CLI disables HTTP access logs because callback queries contain login tokens.
-Configure reverse proxies and observability systems to omit callback query strings and authorization headers.
-Keep auth debug logging disabled.
+!!! warning "Keep login tokens out of logs"
+
+    The CLI disables HTTP access logs because callback queries contain login tokens.
+    Configure reverse proxies and observability systems to omit callback query strings and authorization headers.
+    Keep auth debug logging disabled.
+
 Deploy public registration and login endpoints behind appropriate request limits.
 OAuth request bodies are limited to 64 KiB and must arrive within ten seconds.
 Client body reception and response delivery occur outside the state mutation lock; discovery remains available while authorization state changes are in progress.
@@ -142,7 +172,7 @@ Revoke the Matrix device/session or the MCP connection.
 
 ## Tools and limits
 
-Hosted mode exposes the [conversation, room, membership, directory, and profile tools](usage.md#mcp-tools), with text-only `matrix_send_message`.
+Hosted mode exposes the [conversation, room, membership, directory, and profile tools](usage.md), with text-only `matrix_send_message`.
 Use raw Matrix room and event IDs.
 Numeric references and local-file upload remain stdio features.
 Both transports also expose [history, message actions, membership, media, and catch-up tools](usage.md#history-and-message-context) using raw Matrix IDs.
@@ -172,11 +202,13 @@ matrix_send_message(
 matrix_read_thread(room_id="!room:example.com", thread_id="$root")
 ```
 
-End-to-end encryption is unsupported in authenticated HTTP mode, which holds no device keys; use stdio mode for encrypted rooms.
-Encrypted messages are returned with `decryption_error` instead of content, and hosted sends transmit plaintext.
-Before each send, a best effort preflight checks `m.room.encryption` and refuses known encrypted rooms or any lookup result other than a definitive missing encryption state event.
-The check and send are separate, non-atomic operations: a room can enable encryption between them and still receive the plaintext message.
-Hosted sends provide no E2EE guarantee.
-Do not use them where end-to-end encryption is required.
+!!! danger "No end-to-end encryption in HTTP mode"
+
+    End-to-end encryption is unsupported in authenticated HTTP mode, which holds no device keys; use stdio mode for encrypted rooms.
+    Encrypted messages are returned with `decryption_error` instead of content, and hosted sends transmit plaintext.
+    Before each send, a best effort preflight checks `m.room.encryption` and refuses known encrypted rooms or any lookup result other than a definitive missing encryption state event.
+    The check and send are separate, non-atomic operations: a room can enable encryption between them and still receive the plaintext message.
+    Hosted sends provide no E2EE guarantee.
+    Do not use them where end-to-end encryption is required.
 
 No administration, account provisioning, administrator credentials, or appservice credentials are provided.

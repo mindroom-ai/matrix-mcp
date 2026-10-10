@@ -4,6 +4,8 @@ icon: lucide/rocket
 
 # Getting Started
 
+Three steps: install the CLI, log in to your homeserver, and register the server with your MCP client.
+
 ## Prerequisites
 
 You need:
@@ -110,8 +112,10 @@ If that machine is remote — an SSH session, a VM, a container — a browser on
 
     Then copy the file printed by `config-path` to the path that `matrix-mcp config-path` prints on the remote machine, creating the directory if needed.
 
-    Encrypted rooms do not work with copied credentials: the device's encryption keys stay on the machine that logged in, and the remote machine refuses to publish new ones for the same device.
-    Use one of the other methods when you need encrypted rooms on the remote machine.
+    !!! warning "No encrypted rooms with copied credentials"
+
+        The device's encryption keys stay on the machine that logged in, and the remote machine refuses to publish new ones for the same device.
+        Use one of the other methods when you need encrypted rooms on the remote machine.
 
 ### Existing Matrix Access Token
 
@@ -137,6 +141,45 @@ matrix-mcp e2ee import-keys element-keys.txt
 
 See [End-to-End Encryption](encryption.md) for details.
 
+### Access Gateways
+
+Some homeservers sit behind an access gateway that requires extra HTTP headers.
+Static headers can be stored during login:
+
+```bash
+matrix-mcp auth sso https://mindroom.chat \
+  --header "X-Access-Client-Id: ..." \
+  --header "X-Access-Client-Secret: ..."
+```
+
+For short-lived headers, store a command that prints the current value.
+Matrix MCP reruns this command when creating a Matrix client for later MCP tool calls:
+
+```bash
+matrix-mcp auth sso https://mindroom.chat \
+  --header-command "X-Access-Token: access-gateway-cli token --app https://mindroom.chat"
+```
+
+For Cloudflare Access, use the built-in preset instead.
+It stores a dynamic `cf-access-token` header command backed by the local `cloudflared` CLI.
+During setup, it runs `cloudflared access login` first if no token is available.
+On macOS with Homebrew, install it first:
+
+```bash
+brew install cloudflared
+matrix-mcp auth sso https://mindroom.chat --cloudflare-access
+```
+
+For other platforms, install `cloudflared` from Cloudflare's downloads page.
+
+### Log Out
+
+```bash
+matrix-mcp auth logout
+```
+
+Logout removes the stored credentials and the device's end-to-end encryption keys.
+
 ## Configure an MCP Client
 
 === "Claude Code"
@@ -151,10 +194,44 @@ See [End-to-End Encryption](encryption.md) for details.
     codex mcp add matrix -- matrix-mcp serve
     ```
 
+=== "Any MCP client"
+
+    Register a stdio server that runs:
+
+    ```bash
+    matrix-mcp serve
+    ```
 
 The server runs over stdio and does not expose a local HTTP port during normal MCP operation.
+To serve remote clients instead, see [Authenticated HTTP](hosted.md).
 
 ## Verify
 
 Ask the MCP client to call `matrix_whoami`.
 It should return the Matrix user and device saved by the login command.
+
+Then try a few real requests:
+
+- *"List my Matrix rooms."*
+- *"What did I miss? Check my unread rooms."*
+- *"Summarize the latest thread in the project room."*
+
+The [Tool Reference](usage.md) covers everything the agent can do.
+
+## Command Reference
+
+| Command | What it does |
+| --- | --- |
+| `matrix-mcp auth sso <homeserver>` | Log in through Matrix SSO in a browser |
+| `matrix-mcp auth providers <homeserver>` | List the homeserver's SSO provider IDs |
+| `matrix-mcp auth sso-url <homeserver> <redirect-url>` | Print an SSO URL for a manual login |
+| `matrix-mcp auth login-token <homeserver> <token>` | Exchange an SSO `loginToken` for a session |
+| `matrix-mcp auth password <homeserver> <user-id>` | Log in with a password |
+| `matrix-mcp auth token <homeserver> <user-id> <token>` | Store an existing access token |
+| `matrix-mcp auth logout` | Remove stored credentials and encryption keys |
+| `matrix-mcp e2ee setup` | Publish this device's encryption keys and show its fingerprint |
+| `matrix-mcp e2ee import-keys <file>` | Import room keys exported from another client |
+| `matrix-mcp serve` | Run the MCP server (stdio by default) |
+| `matrix-mcp config-path` | Print where credentials are stored |
+
+Run any command with `--help` for its options.

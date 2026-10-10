@@ -4,7 +4,8 @@ icon: lucide/git-pull-request
 
 # Contributing
 
-Contributions are welcome.
+Contributions are welcome, from typo fixes to new tools.
+Open an [issue](https://github.com/mindroom-ai/matrix-mcp/issues) to report a bug or discuss an idea before a larger change.
 
 ## Development Setup
 
@@ -39,10 +40,9 @@ uv run prek run --all-files
 ## Build Docs
 
 ```bash
-uv run zensical build
+uv run zensical serve   # live preview at http://localhost:8000
+uv run zensical build   # static site in site/
 ```
-
-The generated site is written to `site/`.
 
 ## Project Structure
 
