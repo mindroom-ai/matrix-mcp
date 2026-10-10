@@ -27,6 +27,7 @@ from matrix_mcp.matrix_client import (
     MatrixRoomMembers,
     MatrixUserSearch,
     NioMatrixDriver,
+    RoomSort,
 )
 from matrix_mcp.mcp_server import register_core_tools, register_room_profile_tools
 
@@ -63,10 +64,13 @@ class HostedMatrixTools:
         async with self.client() as client:
             return await client.whoami()
 
-    async def matrix_list_rooms(self) -> list[MatrixRoom]:
-        """List rooms visible to the connected Matrix account, using raw Matrix IDs."""
+    async def matrix_list_rooms(self, sort: RoomSort | None = None) -> list[MatrixRoom]:
+        """List rooms visible to the connected Matrix account, using raw Matrix IDs.
+
+        sort="activity" puts the rooms with the newest messages first; sort="name" is A to Z.
+        """
         async with self.client() as client:
-            return await client.list_rooms()
+            return await client.list_rooms(sort=sort)
 
     async def matrix_list_room_members(
         self,
@@ -176,8 +180,8 @@ def create_hosted_server(settings: HostedSettings) -> FastMCP:
             "Use raw Matrix room and event IDs. Read tools first. "
             "End-to-end encrypted rooms are not supported in this mode: their messages "
             "return a decryption_error, and sends to them are refused. "
-            "Send text, invite users, or change room/profile details only when the user "
-            "explicitly requests that action."
+            "Send text, invite users, pin messages, moderate members, or change room/profile "
+            "details only when the user explicitly requests that action."
         ),
     )
     tools = HostedMatrixTools(settings)

@@ -545,7 +545,16 @@ async def test_two_users_tools_use_request_identity_without_local_files(
         assert not ({"file_path", "homeserver", "access_token", "http_url"} & properties.keys())
         if tool["name"] == "matrix_send_message":
             assert not ({"filename", "content_type"} & properties.keys())
-        if tool["name"] not in {"matrix_invite_user", "matrix_get_profile"}:
+        # user_id may only name a target user, never the identity a tool acts as.
+        if tool["name"] not in {
+            "matrix_invite_user",
+            "matrix_get_profile",
+            "matrix_create_dm",
+            "matrix_kick_user",
+            "matrix_ban_user",
+            "matrix_unban_user",
+            "matrix_set_power_level",
+        }:
             assert "user_id" not in properties
         if "room_id" in properties:
             room_id = properties["room_id"]
@@ -739,8 +748,14 @@ async def test_room_profile_tools_use_each_callers_matrix_identity(browser: OAut
         "id": None,
         "room_id": "!room:example.com",
         "name": "bob's room",
+        "last_activity_ms": None,
         "topic": "Topic from bob",
         "avatar_url": "mxc://example.com/bob",
+        "encrypted": False,
+        "joined_member_count": 2,
+        "own_power_level": 0,
+        "room_type": None,
+        "pinned_event_ids": [],
     }
     members = await browser.call(
         alice["access_token"], "matrix_list_room_members", {**room, "limit": 1}
@@ -863,6 +878,9 @@ async def test_room_profile_tool_hints_and_input_boundaries(browser: OAuthBrowse
     tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
     for tool in tools.values():
         assert tool["annotations"]["readOnlyHint"] in {True, False}, tool["name"]
+    assert len(tools) == 43
+    assert tools["matrix_search_messages"]["annotations"]["readOnlyHint"] is True
+    assert tools["matrix_ban_user"]["annotations"]["destructiveHint"] is True
     assert tools["matrix_read_thread"]["annotations"]["readOnlyHint"] is True
     assert tools["matrix_send_message"]["annotations"]["readOnlyHint"] is False
     for name in (

@@ -5,7 +5,7 @@ import json
 import mimetypes
 import re
 from http import HTTPStatus
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from aiohttp import ContentTypeError
@@ -46,11 +46,17 @@ from matrix_mcp.matrix_events import (
 )
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_media import MatrixMedia
+from matrix_mcp.matrix_moderation import MatrixModeration
 from matrix_mcp.matrix_rooms import MatrixRooms
 from matrix_mcp.tls import default_ssl_context
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
 # Thread and recent reads keep undecryptable messages so agents know they exist.
 _THREAD_MESSAGE_TYPES = frozenset({"m.room.message", "m.room.encrypted"})
+
+type RoomSort = Literal["activity", "name"]
 
 
 class MatrixRoom(BaseModel):
@@ -59,11 +65,29 @@ class MatrixRoom(BaseModel):
     id: int | None = None
     room_id: str
     name: str | None = None
+    last_activity_ms: int | None = Field(
+        default=None,
+        description="Timestamp of the newest message; filled in when sorting by activity.",
+    )
 
 
 class MatrixRoomInfo(MatrixRoom):
     topic: str | None = None
     avatar_url: str | None = None
+    encrypted: bool | None = Field(
+        default=None,
+        description="Whether the room is end-to-end encrypted; null when it could not be checked.",
+    )
+    joined_member_count: int | None = None
+    own_power_level: int | None = Field(
+        default=None,
+        description=(
+            "The connected user's power level; null for a room creator in room version 12+, "
+            "which outranks every level, or when it could not be read."
+        ),
+    )
+    room_type: str | None = Field(default=None, description="'m.space' for spaces.")
+    pinned_event_ids: list[str] = Field(default_factory=list)
 
 
 class MatrixProfile(BaseModel):
@@ -185,6 +209,7 @@ class NioMatrixDriver:
         self.events = MatrixEvents(self.http, crypto=self.crypto)
         self.rooms = MatrixRooms(self.http, crypto=self.crypto)
         self.media = MatrixMedia(self.http)
+        self.moderation = MatrixModeration(self.http)
         self._client = AsyncClient(
             config.normalized_homeserver,
             config.user_id,
@@ -268,12 +293,41 @@ class NioMatrixDriver:
         raise RuntimeError(msg)
 
     async def get_room_info(self, room_id: str) -> MatrixRoomInfo:
-        name, topic, avatar_url = await asyncio.gather(
-            self._room_state_value(room_id, "m.room.name", "name"),
-            self._room_state_value(room_id, "m.room.topic", "topic"),
-            self._room_state_value(room_id, "m.room.avatar", "url"),
+        (
+            (name, topic, avatar_url, members),
+            (encrypted, levels, create, pins),
+        ) = await asyncio.gather(
+            asyncio.gather(
+                self._room_state_value(room_id, "m.room.name", "name"),
+                self._room_state_value(room_id, "m.room.topic", "topic"),
+                self._room_state_value(room_id, "m.room.avatar", "url"),
+                self._client.joined_members(room_id),
+            ),
+            # Extra details are best effort: rooms the user has left can still show state.
+            asyncio.gather(
+                _optional(self.http.room_is_encrypted(room_id)),
+                _optional(self.moderation.power_levels(room_id)),
+                _optional(self.http.room_state(room_id, "m.room.create")),
+                _optional(self.http.room_state(room_id, "m.room.pinned_events")),
+            ),
         )
-        return MatrixRoomInfo(room_id=room_id, name=name, topic=topic, avatar_url=avatar_url)
+        room_type = (create or {}).get("type")
+        pinned = (pins or {}).get("pinned")
+        return MatrixRoomInfo(
+            room_id=room_id,
+            name=name,
+            topic=topic,
+            avatar_url=avatar_url,
+            encrypted=encrypted,
+            joined_member_count=len(members.members)
+            if isinstance(members, JoinedMembersResponse)
+            else None,
+            own_power_level=None if levels is None else levels.own_level,
+            room_type=room_type if isinstance(room_type, str) else None,
+            pinned_event_ids=[event_id for event_id in pinned if isinstance(event_id, str)]
+            if isinstance(pinned, list)
+            else [],
+        )
 
     async def _room_state_value(self, room_id: str, event_type: str, key: str) -> str | None:
         response = await self._client.room_get_state_event(room_id, event_type, state_key="")
@@ -589,12 +643,35 @@ class MatrixAPIClient:
     def media(self) -> MatrixMedia:
         return cast("MatrixMedia", self._grouped_driver_property("media"))
 
+    @property
+    def moderation(self) -> MatrixModeration:
+        return cast("MatrixModeration", self._grouped_driver_property("moderation"))
+
     async def whoami(self) -> dict[str, str | None]:
         return await self._driver.whoami()
 
-    async def list_rooms(self) -> list[MatrixRoom]:
-        rooms = await self._driver.list_rooms()
-        return [self._with_room_ref(room) for room in rooms]
+    async def list_rooms(self, *, sort: RoomSort | None = None) -> list[MatrixRoom]:
+        rooms = [self._with_room_ref(room) for room in await self._driver.list_rooms()]
+        if sort == "name":
+            return sorted(
+                rooms,
+                key=lambda room: (room.name is None, (room.name or "").casefold(), room.room_id),
+            )
+        if sort == "activity":
+            activity = await self.rooms.latest_activity()
+            rooms = [
+                room.model_copy(update={"last_activity_ms": activity.get(room.room_id)})
+                for room in rooms
+            ]
+            return sorted(
+                rooms,
+                key=lambda room: (
+                    room.last_activity_ms is None,
+                    -(room.last_activity_ms or 0),
+                    room.room_id,
+                ),
+            )
+        return rooms
 
     async def list_room_members(
         self, room_id: str | int, *, limit: int = 100, offset: int = 0
@@ -724,6 +801,14 @@ class MatrixAPIClient:
             return value
         msg = f"The configured Matrix driver does not support {name} operations"
         raise RuntimeError(msg)
+
+
+async def _optional[T](awaitable: Awaitable[T]) -> T | None:
+    """Leave a best-effort detail unset when Matrix refuses or fails the request."""
+    try:
+        return await awaitable
+    except RuntimeError:
+        return None
 
 
 def _validate_limit(limit: int) -> None:

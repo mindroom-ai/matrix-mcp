@@ -19,6 +19,7 @@ from matrix_mcp.matrix_client import (
     MatrixRoomInfo,
     MatrixRoomMembers,
     MatrixUserSearch,
+    RoomSort,
 )
 
 if TYPE_CHECKING:
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 class MatrixMCPClient(ConversationClient, Protocol):
     async def whoami(self) -> dict[str, str | None]: ...
 
-    async def list_rooms(self) -> list[MatrixRoom]: ...
+    async def list_rooms(self, *, sort: RoomSort | None = None) -> list[MatrixRoom]: ...
 
     async def list_room_members(
         self, room_id: str | int, *, limit: int = 100, offset: int = 0
@@ -100,10 +101,14 @@ class MatrixMCPTools:
         async with self._client() as client:
             return await client.whoami()
 
-    async def matrix_list_rooms(self) -> list[MatrixRoom]:
-        """List joined Matrix rooms visible to the authenticated user."""
+    async def matrix_list_rooms(self, sort: RoomSort | None = None) -> list[MatrixRoom]:
+        """List joined Matrix rooms visible to the authenticated user.
+
+        sort="activity" puts the rooms with the newest messages first; sort="name" is A to Z.
+        """
         async with self._client() as client:
-            return await client.list_rooms()
+            # Custom clients written before sorting existed may not accept the argument.
+            return await (client.list_rooms() if sort is None else client.list_rooms(sort=sort))
 
     async def matrix_list_room_members(
         self,
@@ -232,9 +237,11 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
             "Use these tools to inspect and participate in Matrix conversations. "
             "Legacy read and list tools return stable numeric refs for legacy follow-up tools. "
             "Conversation tools require raw Matrix IDs. "
-            "Prefer read tools first. Send messages, invite users, or change room/profile details "
-            "only when the user explicitly requests that action. "
-            "End-to-end encrypted rooms work like any other room. To share a file in an "
+            "Prefer read tools first. Send messages, invite users, pin messages, moderate "
+            "members, or change room/profile details only when the user explicitly requests "
+            "that action. "
+            "End-to-end encrypted rooms work like any other room, except that homeserver "
+            "message search cannot see them. To share a file in an "
             "encrypted room, use matrix_send_message with file_path; matrix_upload_media "
             "stores files unencrypted. A decryption_error of 'missing room key' means this "
             "device never received the message's key, usually because the message predates "

@@ -1162,3 +1162,394 @@ async def test_undecryptable_reactions_are_recognizable_without_their_content(
 
     assert page.events[0].relation_type == "m.annotation"
     assert "relation_type" not in page.events[0].model_dump()
+
+
+SEARCH_PATH = "/_matrix/client/v3/search"
+THREADS_PATH = "/_matrix/client/v1/rooms/!room:example.com/threads"
+REACTIONS_PATH = f"{RELATIONS_PATH}/$target/m.annotation"
+
+
+def reaction(
+    event_id: str, *, key: str, sender: str = "@bob:example.com", target: str = "$target"
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "sender": sender,
+        "origin_server_ts": 100,
+        "type": "m.reaction",
+        "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": target, "key": key}},
+    }
+
+
+async def test_search_sends_room_filter_and_normalizes_hits(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    hit = {**message("$hit", body="release on Friday", timestamp=300), "room_id": ROOM}
+    endpoint.respond(
+        "POST",
+        SEARCH_PATH,
+        {
+            "search_categories": {
+                "room_events": {
+                    "results": [{"rank": 2, "result": hit}],
+                    "count": 7,
+                    "next_batch": "page-2",
+                }
+            }
+        },
+    )
+
+    page = await events.search(
+        "release", room_id=ROOM, limit=5, order_by="rank", next_batch="page-1"
+    )
+
+    request = endpoint.requests[-1]
+    assert request["query"] == {"next_batch": "page-1"}
+    assert request["body"] == {
+        "search_categories": {
+            "room_events": {
+                "search_term": "release",
+                "order_by": "rank",
+                "filter": {"limit": 5, "rooms": [ROOM]},
+            }
+        }
+    }
+    [result] = page.results
+    assert (result.room_id, result.rank, result.edit_of) == (ROOM, 2.0, None)
+    assert (result.event.event_id, result.event.body, result.event.timestamp_ms) == (
+        "$hit",
+        "release on Friday",
+        300,
+    )
+    assert (page.count, page.next_batch) == (7, "page-2")
+
+
+async def test_search_reports_edits_with_their_new_text_and_skips_redactions(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    edit = {**replacement("$edit", target="$original", body="ship Monday", timestamp=200)}
+    edit["room_id"] = "!other:example.com"
+    redacted = {
+        **message("$gone"),
+        "room_id": ROOM,
+        "unsigned": {"redacted_because": {"event_id": "$redaction"}},
+    }
+    endpoint.respond(
+        "POST",
+        SEARCH_PATH,
+        {
+            "search_categories": {
+                "room_events": {"results": [{"result": edit}, {"rank": 1, "result": redacted}]}
+            }
+        },
+    )
+
+    page = await events.search("ship")
+
+    assert endpoint.requests[-1]["body"]["search_categories"]["room_events"] == {
+        "search_term": "ship",
+        "order_by": "recent",
+        "filter": {"limit": 10},
+    }
+    assert endpoint.requests[-1]["query"] == {}
+    [result] = page.results
+    assert (result.room_id, result.edit_of, result.rank) == (
+        "!other:example.com",
+        "$original",
+        None,
+    )
+    assert (result.event.event_id, result.event.body) == ("$edit", "ship Monday")
+    assert (page.count, page.next_batch) == (None, None)
+
+
+async def test_search_without_room_events_is_an_empty_page(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("POST", SEARCH_PATH, {"search_categories": {}})
+    page = await events.search("anything", room_id=ROOM)
+    assert page.results == []
+
+
+async def test_search_falls_back_to_requested_room_and_rejects_missing_rooms(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    response = {"search_categories": {"room_events": {"results": [{"result": message("$a")}]}}}
+    endpoint.respond("POST", SEARCH_PATH, response)
+    endpoint.respond("POST", SEARCH_PATH, response)
+
+    page = await events.search("hello", room_id=ROOM)
+    assert page.results[0].room_id == ROOM
+    with pytest.raises(RuntimeError, match="room ID"):
+        await events.search("hello")
+
+
+async def test_search_enforces_the_requested_page_bound(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    hits = [{"result": {**message(f"$e{index}"), "room_id": ROOM}} for index in range(3)]
+    endpoint.respond("POST", SEARCH_PATH, {"search_categories": {"room_events": {"results": hits}}})
+    with pytest.raises(RuntimeError, match="exceeded requested limit"):
+        await events.search("hello", limit=2)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"search_term": " "},
+        {"search_term": "x", "limit": 0},
+        {"search_term": "x", "limit": 51},
+        {"search_term": "x", "room_id": "room"},
+        {"search_term": "x", "next_batch": ""},
+        {"search_term": "x", "order_by": "oldest"},
+    ],
+)
+async def test_search_rejects_invalid_input_before_http(
+    matrix: tuple[MatrixEvents, MatrixEndpoint], arguments: dict[str, Any]
+) -> None:
+    events, endpoint = matrix
+    with pytest.raises(ValueError, match=r"search_term|limit|room ID|cursor|order_by"):
+        await events.search(**arguments)
+    assert endpoint.requests == []
+
+
+async def test_threads_list_bundles_counts_latest_replies_and_cursor(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    latest = message("$latest", sender="@bob:example.com", body="done", timestamp=500)
+    root = message(
+        "$root",
+        body="Deploy plan",
+        timestamp=100,
+        unsigned={
+            "m.relations": {
+                "m.thread": {
+                    "latest_event": latest,
+                    "count": 4,
+                    "current_user_participated": True,
+                }
+            }
+        },
+    )
+    endpoint.respond(
+        "GET",
+        THREADS_PATH,
+        {"chunk": [root, message("$quiet", body="No bundle")], "next_batch": "older"},
+    )
+
+    page = await events.threads(ROOM, include="participated", limit=2, before="newer")
+
+    assert endpoint.requests[-1]["query"] == {
+        "include": "participated",
+        "limit": "2",
+        "from": "newer",
+    }
+    busy, quiet = page.threads
+    assert (busy.root.event_id, busy.root.body, busy.reply_count, busy.participated) == (
+        "$root",
+        "Deploy plan",
+        4,
+        True,
+    )
+    assert busy.latest_reply is not None
+    assert (busy.latest_reply.event_id, busy.latest_reply.body) == ("$latest", "done")
+    assert (quiet.root.event_id, quiet.reply_count, quiet.latest_reply, quiet.participated) == (
+        "$quiet",
+        None,
+        None,
+        None,
+    )
+    assert page.next_batch == "older"
+
+
+async def test_threads_decrypt_roots_and_latest_replies(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    latest = crypto.seal(
+        "$latest",
+        {"msgtype": "m.text", "body": "secret reply", "m.relates_to": THREAD},
+        readable=False,
+    )
+    root = crypto.seal(
+        "$root",
+        {"msgtype": "m.text", "body": "secret root"},
+        unsigned={"m.relations": {"m.thread": {"latest_event": latest, "count": 1}}},
+    )
+    endpoint.respond("GET", THREADS_PATH, {"chunk": [root]})
+
+    page = await events.threads(ROOM)
+
+    [thread] = page.threads
+    assert (thread.root.body, thread.root.encrypted, thread.root.decryption_error) == (
+        "secret root",
+        True,
+        None,
+    )
+    assert thread.latest_reply is not None
+    assert (
+        thread.latest_reply.body,
+        thread.latest_reply.encrypted,
+        thread.latest_reply.decryption_error,
+    ) == (None, True, MISSING_ROOM_KEY)
+    assert thread.reply_count == 1
+    assert crypto.decrypted == ["$root", "$latest"]
+    assert endpoint.requests[-1]["query"] == {"include": "all", "limit": "20"}
+
+
+async def test_threads_enforce_page_bound(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", THREADS_PATH, {"chunk": [message("$a"), message("$b")]})
+    with pytest.raises(RuntimeError, match="exceeded requested limit"):
+        await events.threads(ROOM, limit=1)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"room_id": "room"},
+        {"room_id": ROOM, "limit": 0},
+        {"room_id": ROOM, "limit": 51},
+        {"room_id": ROOM, "include": "mine"},
+        {"room_id": ROOM, "before": ""},
+    ],
+)
+async def test_threads_reject_invalid_input_before_http(
+    matrix: tuple[MatrixEvents, MatrixEndpoint], arguments: dict[str, Any]
+) -> None:
+    events, endpoint = matrix
+    with pytest.raises(ValueError, match=r"room ID|limit|include|cursor"):
+        await events.threads(**arguments)
+    assert endpoint.requests == []
+
+
+async def test_reactions_count_unique_senders_per_key(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond(
+        "GET",
+        REACTIONS_PATH,
+        {
+            "chunk": [
+                reaction("$r1", key="👍", sender="@carol:example.com"),
+                reaction("$r2", key="👍", sender="@bob:example.com"),
+                reaction("$r3", key="👍", sender="@bob:example.com"),
+                reaction("$r4", key="🎉"),
+                reaction("$r5", key="👀", target="$other"),
+                {**reaction("$r6", key="❌"), "unsigned": {"redacted_because": {}}},
+                {**message("$r7"), "content": {"msgtype": "m.text", "body": "not a reaction"}},
+            ]
+        },
+    )
+
+    summary = await events.reactions(ROOM, "$target")
+
+    assert endpoint.requests[-1]["query"] == {"dir": "b", "limit": "100"}
+    assert summary.model_dump() == {
+        "event_id": "$target",
+        "reactions": [
+            {"key": "👍", "count": 2, "senders": ["@bob:example.com", "@carol:example.com"]},
+            {"key": "🎉", "count": 1, "senders": ["@bob:example.com"]},
+        ],
+        "unreadable": 2,
+        "truncated": False,
+    }
+
+
+async def test_reactions_read_cleartext_keys_of_encrypted_reactions(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto],
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    relation = {"rel_type": "m.annotation", "event_id": "$target", "key": "🔥"}
+    readable = crypto.seal("$r1", {"m.relates_to": relation}, event_type="m.reaction")
+    sealed = crypto.seal(
+        "$r2",
+        {"m.relates_to": relation},
+        sender="@carol:example.com",
+        readable=False,
+        event_type="m.reaction",
+    )
+    keyless = crypto.seal("$r3", {}, readable=False, event_type="m.reaction")
+    endpoint.respond("GET", REACTIONS_PATH, {"chunk": [readable, sealed, keyless]})
+
+    summary = await events.reactions(ROOM, "$target")
+
+    assert [reaction.model_dump() for reaction in summary.reactions] == [
+        {"key": "🔥", "count": 2, "senders": ["@alice:example.com", "@carol:example.com"]}
+    ]
+    assert summary.unreadable == 1
+    assert crypto.decrypted == ["$r1", "$r2", "$r3"]
+
+
+async def test_reactions_page_until_the_scan_limit_and_report_truncation(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    first = [
+        reaction(f"$a{index}", key="a", sender=f"@u{index}:example.com") for index in range(100)
+    ]
+    second = [
+        reaction(f"$b{index}", key="b", sender=f"@v{index}:example.com") for index in range(50)
+    ]
+    endpoint.respond("GET", REACTIONS_PATH, {"chunk": first, "next_batch": "page-2"})
+    endpoint.respond("GET", REACTIONS_PATH, {"chunk": second, "next_batch": "page-3"})
+
+    summary = await events.reactions(ROOM, "$target", limit=150)
+
+    queries = [request["query"] for request in endpoint.requests]
+    assert queries == [
+        {"dir": "b", "limit": "100"},
+        {"dir": "b", "limit": "50", "from": "page-2"},
+    ]
+    assert [(reaction.key, reaction.count) for reaction in summary.reactions] == [
+        ("a", 100),
+        ("b", 50),
+    ]
+    assert summary.truncated is True
+
+
+async def test_reactions_stop_when_the_server_has_no_more_pages(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", REACTIONS_PATH, {"chunk": [reaction("$r", key="a")]})
+    summary = await events.reactions(ROOM, "$target", limit=500)
+    assert len(endpoint.requests) == 1
+    assert summary.truncated is False
+
+
+async def test_reactions_enforce_page_bound(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond(
+        "GET", REACTIONS_PATH, {"chunk": [reaction("$a", key="a"), reaction("$b", key="b")]}
+    )
+    with pytest.raises(RuntimeError, match="exceeded requested limit"):
+        await events.reactions(ROOM, "$target", limit=1)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"room_id": "room", "event_id": "$target"},
+        {"room_id": ROOM, "event_id": "target"},
+        {"room_id": ROOM, "event_id": "$target", "limit": 0},
+        {"room_id": ROOM, "event_id": "$target", "limit": 501},
+    ],
+)
+async def test_reactions_reject_invalid_input_before_http(
+    matrix: tuple[MatrixEvents, MatrixEndpoint], arguments: dict[str, Any]
+) -> None:
+    events, endpoint = matrix
+    with pytest.raises(ValueError, match=r"room ID|event ID|limit"):
+        await events.reactions(**arguments)
+    assert endpoint.requests == []

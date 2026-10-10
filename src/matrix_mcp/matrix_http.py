@@ -139,15 +139,22 @@ class MatrixHTTP:
 
     async def room_is_encrypted(self, room_id: str) -> bool:
         """Report room encryption; only a definitive missing state event means plaintext."""
+        return await self.room_state(room_id, "m.room.encryption") is not None
+
+    async def room_state(
+        self, room_id: str, event_type: str, state_key: str = ""
+    ) -> dict[str, Any] | None:
+        """Read one state event's content; None only for a definitive missing event."""
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
-        path = f"/_matrix/client/v3/rooms/{room}/state/m.room.encryption"
+        path = f"/_matrix/client/v3/rooms/{room}/state/{quote(event_type, safe='')}"
+        if state_key:
+            path = f"{path}/{quote(state_key, safe='')}"
         try:
-            await self.json("GET", path)
+            return await self.json("GET", path)
         except MatrixHTTPError as exc:
             if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
-                return False
+                return None
             raise
-        return True
 
 
 def quote_matrix_id(value: str, *, sigil: str, label: str) -> str:

@@ -114,6 +114,13 @@ async def test_member_page_bounds_reject_before_http(
     assert endpoint.requests == []
 
 
+def joined(endpoint: MatrixEndpoint, *users: str) -> None:
+    endpoint.responses[("GET", f"{ROOM_PATH}/joined_members")] = (
+        {"joined": {user: {} for user in users}},
+        200,
+    )
+
+
 async def test_room_info_reads_all_fields_and_keeps_numeric_reference(
     matrix: tuple[NioMatrixDriver, MatrixEndpoint], tmp_path: Path
 ) -> None:
@@ -122,8 +129,13 @@ async def test_room_info_reads_all_fields_and_keeps_numeric_reference(
         ("m.room.name", {"name": "General"}),
         ("m.room.topic", {"topic": "Room topic"}),
         ("m.room.avatar", {"url": "mxc://example.com/room"}),
+        ("m.room.encryption", {"algorithm": "m.megolm.v1.aes-sha2"}),
+        ("m.room.power_levels", {"users": {"@alice:example.com": 50}, "users_default": 0}),
+        ("m.room.create", {"type": "m.space", "room_version": "11"}),
+        ("m.room.pinned_events", {"pinned": ["$first", 7, "$second"]}),
     ]:
         endpoint.responses[("GET", f"{ROOM_PATH}/state/{event_type}")] = (content, 200)
+    joined(endpoint, "@alice:example.com", "@bob:example.com")
     ids = MatrixIdStore(tmp_path / "ids.json")
     client = MatrixAPIClient(driver=driver, id_store=ids)
 
@@ -134,8 +146,14 @@ async def test_room_info_reads_all_fields_and_keeps_numeric_reference(
         "id": 1,
         "room_id": ROOM,
         "name": "General",
+        "last_activity_ms": None,
         "topic": "Room topic",
         "avatar_url": "mxc://example.com/room",
+        "encrypted": True,
+        "joined_member_count": 2,
+        "own_power_level": 50,
+        "room_type": "m.space",
+        "pinned_event_ids": ["$first", "$second"],
     }
     assert second == first
 
@@ -143,11 +161,36 @@ async def test_room_info_reads_all_fields_and_keeps_numeric_reference(
 async def test_room_info_missing_state_is_unset(
     matrix: tuple[NioMatrixDriver, MatrixEndpoint],
 ) -> None:
-    driver, _ = matrix
+    driver, endpoint = matrix
+    joined(endpoint, "@alice:example.com")
     info = await driver.get_room_info(ROOM)
     assert info.name is None
     assert info.topic is None
     assert info.avatar_url is None
+    assert info.encrypted is False
+    assert info.joined_member_count == 1
+    assert info.own_power_level == 0
+    assert info.room_type is None
+    assert info.pinned_event_ids == []
+
+
+async def test_room_info_extras_are_best_effort_for_rooms_the_user_left(
+    matrix: tuple[NioMatrixDriver, MatrixEndpoint],
+) -> None:
+    driver, endpoint = matrix
+    endpoint.responses[("GET", f"{ROOM_PATH}/state/m.room.name")] = ({"name": "Old room"}, 200)
+    denied = ({"errcode": "M_FORBIDDEN", "error": "Not a member"}, 403)
+    endpoint.responses[("GET", f"{ROOM_PATH}/joined_members")] = denied
+    for event_type in ["m.room.encryption", "m.room.power_levels", "m.room.pinned_events"]:
+        endpoint.responses[("GET", f"{ROOM_PATH}/state/{event_type}")] = denied
+
+    info = await driver.get_room_info(ROOM)
+
+    assert info.name == "Old room"
+    assert info.encrypted is None
+    assert info.joined_member_count is None
+    assert info.own_power_level is None
+    assert info.pinned_event_ids == []
 
 
 @pytest.mark.parametrize("event_type", ["m.room.name", "m.room.topic", "m.room.avatar"])
@@ -156,6 +199,7 @@ async def test_room_info_does_not_hide_state_errors(
     matrix: tuple[NioMatrixDriver, MatrixEndpoint], event_type: str, error: str
 ) -> None:
     driver, endpoint = matrix
+    joined(endpoint, "@alice:example.com")
     endpoint.responses[("GET", f"{ROOM_PATH}/state/{event_type}")] = (
         {"errcode": error, "error": "Request denied"},
         403,
