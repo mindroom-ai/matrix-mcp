@@ -242,14 +242,25 @@ def create_mcp_server(client_factory: Callable[[], MatrixMCPClient] = MatrixAPIC
         ),
     )
     tools = MatrixMCPTools(client_factory=client_factory)
-    mcp.tool(tools.matrix_whoami)
-    mcp.tool(tools.matrix_list_rooms)
-    mcp.tool(tools.matrix_read_room_recent)
-    mcp.tool(tools.matrix_read_thread)
-    mcp.tool(tools.matrix_send_message)
+    register_core_tools(mcp, tools)
     register_room_profile_tools(mcp, tools)
     register_conversation_tools(mcp, ConversationTools(tools._client))  # noqa: SLF001
     return mcp
+
+
+def register_core_tools(server: FastMCP, tools: MatrixMCPTools | HostedMatrixTools) -> None:
+    """Register the session, room, thread, and send tools with accurate operation hints."""
+    for name in (
+        "matrix_whoami",
+        "matrix_list_rooms",
+        "matrix_read_room_recent",
+        "matrix_read_thread",
+    ):
+        server.tool(getattr(tools, name), annotations={"readOnlyHint": True})
+    server.tool(
+        tools.matrix_send_message,
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    )
 
 
 def register_room_profile_tools(server: FastMCP, tools: MatrixMCPTools | HostedMatrixTools) -> None:

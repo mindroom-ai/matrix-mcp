@@ -125,6 +125,27 @@ async def test_tools_return_pydantic_models() -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_stdio_tool_declares_whether_it_writes() -> None:
+    async with Client(create_mcp_server()) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+    for name in (
+        "matrix_whoami",
+        "matrix_list_rooms",
+        "matrix_read_room_recent",
+        "matrix_read_thread",
+    ):
+        assert tools[name].annotations is not None
+        assert tools[name].annotations.readOnlyHint is True
+    send = tools["matrix_send_message"].annotations
+    assert send is not None
+    assert send.readOnlyHint is False
+    assert send.destructiveHint is False
+    for tool in tools.values():
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is not None, tool.name
+
+
+@pytest.mark.asyncio
 async def test_registered_stdio_tool_dispatches_explicit_mentions() -> None:
     matrix = FakeMatrixClient()
     server = create_mcp_server(client_factory=lambda: cast("MatrixMCPClient", matrix))

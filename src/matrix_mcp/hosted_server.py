@@ -28,7 +28,7 @@ from matrix_mcp.matrix_client import (
     MatrixUserSearch,
     NioMatrixDriver,
 )
-from matrix_mcp.mcp_server import register_room_profile_tools
+from matrix_mcp.mcp_server import register_core_tools, register_room_profile_tools
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -181,11 +181,7 @@ def create_hosted_server(settings: HostedSettings) -> FastMCP:
         ),
     )
     tools = HostedMatrixTools(settings)
-    server.tool(tools.matrix_whoami)
-    server.tool(tools.matrix_list_rooms)
-    server.tool(tools.matrix_read_room_recent)
-    server.tool(tools.matrix_read_thread)
-    server.tool(tools.matrix_send_message)
+    register_core_tools(server, tools)
     register_room_profile_tools(server, tools)
     register_conversation_tools(server, ConversationTools(tools.client))
     return server

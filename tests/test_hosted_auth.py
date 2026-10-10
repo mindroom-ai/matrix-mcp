@@ -861,6 +861,10 @@ async def test_room_profile_tool_hints_and_input_boundaries(browser: OAuthBrowse
     access = tokens["access_token"]
     response = await browser.rpc(access, "tools/list", {})
     tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
+    for tool in tools.values():
+        assert tool["annotations"]["readOnlyHint"] in {True, False}, tool["name"]
+    assert tools["matrix_read_thread"]["annotations"]["readOnlyHint"] is True
+    assert tools["matrix_send_message"]["annotations"]["readOnlyHint"] is False
     for name in (
         "matrix_list_room_members",
         "matrix_get_room_info",
