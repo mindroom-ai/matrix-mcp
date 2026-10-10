@@ -300,8 +300,10 @@ def test_auth_sso_saves_login_result_after_browser_callback(
 
     assert result.exit_code == 0
     assert opened_urls == [
-        "https://matrix.example.com/_matrix/client/v3/login/sso/redirect/github?"
-        "redirectUrl=http%3A%2F%2F127.0.0.1%3A8767%2Fcallback"
+        (
+            "https://matrix.example.com/_matrix/client/v3/login/sso/redirect/github?"
+            "redirectUrl=http%3A%2F%2F127.0.0.1%3A8767%2Fcallback"
+        )
     ]
     assert callbacks[0].close_calls == 2
     saved = MatrixMCPConfig.load(config)

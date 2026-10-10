@@ -11,6 +11,29 @@ requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "MindRoom" }]
+keywords = [
+  "agents",
+  "ai",
+  "claude",
+  "codex",
+  "e2ee",
+  "matrix",
+  "mcp",
+  "model-context-protocol",
+  "sso",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Chat",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "anyio>=4",
   "certifi>=2024.2.2",
@@ -26,6 +49,13 @@ dependencies = [
   "rich>=14.0",
   "typer>=0.19",
 ]
+
+[project.urls]
+Homepage = "https://matrix-mcp.mindroom.chat/"
+Documentation = "https://matrix-mcp.mindroom.chat/"
+Repository = "https://github.com/mindroom-ai/matrix-mcp"
+Issues = "https://github.com/mindroom-ai/matrix-mcp/issues"
+Changelog = "https://github.com/mindroom-ai/matrix-mcp/releases"
 
 [project.optional-dependencies]
 dev = [
@@ -70,8 +100,10 @@ ignore = [
   "D",       # pydocstyle
   "ANN",     # annotations
   "COM812",  # trailing comma
+  "CPY001",  # no per-file copyright headers; see LICENSE
   "ISC001",  # implicit string concat
   "T20",     # print statements are acceptable for CLI output
+  "PLR0917", # PLR0913 already bounds argument counts, with targeted exceptions
 ]
 
 [tool.ruff.lint.per-file-ignores]
