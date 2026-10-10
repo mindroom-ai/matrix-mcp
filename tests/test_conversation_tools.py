@@ -6,9 +6,23 @@ import pytest
 from fastmcp import Client, FastMCP
 
 from matrix_mcp.matrix_client import MatrixAPIClient
-from matrix_mcp.matrix_events import EventContext, HistoryPage, TimelineEvent
+from matrix_mcp.matrix_events import (
+    EventContext,
+    HistoryPage,
+    ReactionSummary,
+    SearchPage,
+    ThreadPage,
+    TimelineEvent,
+)
 from matrix_mcp.matrix_media import DownloadedMedia, EventAttachment, UploadedMedia
-from matrix_mcp.matrix_rooms import InvitationPage, UnreadPage
+from matrix_mcp.matrix_moderation import PinnedEvents, PowerLevels
+from matrix_mcp.matrix_rooms import (
+    DirectRoom,
+    InvitationPage,
+    ReceiptList,
+    SpaceHierarchy,
+    UnreadPage,
+)
 from matrix_mcp.mcp_server import create_mcp_server
 
 if TYPE_CHECKING:
@@ -17,22 +31,37 @@ if TYPE_CHECKING:
 READ_TOOLS = {
     "matrix_read_history",
     "matrix_get_event_context",
+    "matrix_search_messages",
+    "matrix_list_threads",
+    "matrix_get_reactions",
+    "matrix_get_read_receipts",
+    "matrix_get_space_hierarchy",
+    "matrix_get_power_levels",
     "matrix_list_invitations",
     "matrix_get_unread",
     "matrix_download_media",
 }
+DESTRUCTIVE_TOOLS = {
+    "matrix_edit_message",
+    "matrix_redact_event",
+    "matrix_leave_room",
+    "matrix_kick_user",
+    "matrix_ban_user",
+    "matrix_set_power_level",
+}
 WRITE_TOOLS = {
     "matrix_reply",
     "matrix_react",
-    "matrix_edit_message",
-    "matrix_redact_event",
     "matrix_join_room",
-    "matrix_leave_room",
     "matrix_create_room",
+    "matrix_create_dm",
     "matrix_mark_read",
     "matrix_upload_media",
     "matrix_send_media",
-}
+    "matrix_pin_message",
+    "matrix_unpin_message",
+    "matrix_unban_user",
+} | DESTRUCTIVE_TOOLS
 
 
 class FakeEvents:
@@ -83,6 +112,18 @@ class FakeEvents:
         self.calls.append(("attachment", {"room_id": room_id, "event_id": event_id}))
         return EventAttachment(url="mxc://example.com/media", mimetype="text/plain")
 
+    async def search(self, search_term: str, **kwargs: Any) -> SearchPage:
+        self.calls.append(("search", {"search_term": search_term, **kwargs}))
+        return SearchPage(results=[])
+
+    async def threads(self, room_id: str, **kwargs: Any) -> ThreadPage:
+        self.calls.append(("threads", {"room_id": room_id, **kwargs}))
+        return ThreadPage(threads=[])
+
+    async def reactions(self, room_id: str, event_id: str, **kwargs: Any) -> ReactionSummary:
+        self.calls.append(("reactions", {"room_id": room_id, "event_id": event_id, **kwargs}))
+        return ReactionSummary(event_id=event_id, reactions=[])
+
 
 class FakeRooms:
     def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
@@ -109,6 +150,50 @@ class FakeRooms:
 
     async def mark_read(self, room_id: str, event_id: str, **kwargs: Any) -> None:
         self.calls.append(("mark_read", {"room_id": room_id, "event_id": event_id, **kwargs}))
+
+    async def create_dm(self, user_id: str, **kwargs: Any) -> DirectRoom:
+        self.calls.append(("create_dm", {"user_id": user_id, **kwargs}))
+        return DirectRoom(room_id="!dm", created=True)
+
+    async def receipts(self, room_id: str, **kwargs: Any) -> ReceiptList:
+        self.calls.append(("receipts", {"room_id": room_id, **kwargs}))
+        return ReceiptList(receipts=[], total=0)
+
+    async def hierarchy(self, space_id: str, **kwargs: Any) -> SpaceHierarchy:
+        self.calls.append(("hierarchy", {"space_id": space_id, **kwargs}))
+        return SpaceHierarchy(rooms=[])
+
+
+class FakeModeration:
+    def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
+        self.calls = calls
+
+    async def kick(self, room_id: str, user_id: str, **kwargs: Any) -> None:
+        self.calls.append(("kick", {"room_id": room_id, "user_id": user_id, **kwargs}))
+
+    async def ban(self, room_id: str, user_id: str, **kwargs: Any) -> None:
+        self.calls.append(("ban", {"room_id": room_id, "user_id": user_id, **kwargs}))
+
+    async def unban(self, room_id: str, user_id: str, **kwargs: Any) -> None:
+        self.calls.append(("unban", {"room_id": room_id, "user_id": user_id, **kwargs}))
+
+    async def power_levels(self, room_id: str) -> PowerLevels:
+        self.calls.append(("power_levels", {"room_id": room_id}))
+        return PowerLevels(own_level=100)
+
+    async def set_power_level(self, room_id: str, user_id: str, level: int | None) -> str:
+        self.calls.append(
+            ("set_power_level", {"room_id": room_id, "user_id": user_id, "level": level})
+        )
+        return "$levels"
+
+    async def pin(self, room_id: str, event_id: str) -> PinnedEvents:
+        self.calls.append(("pin", {"room_id": room_id, "event_id": event_id}))
+        return PinnedEvents(pinned=[event_id], changed=True)
+
+    async def unpin(self, room_id: str, event_id: str) -> PinnedEvents:
+        self.calls.append(("unpin", {"room_id": room_id, "event_id": event_id}))
+        return PinnedEvents(pinned=[], changed=True)
 
 
 class FakeMedia:
@@ -151,6 +236,7 @@ class GroupedDriver:
         self.events = FakeEvents(self.calls)
         self.rooms = FakeRooms(self.calls)
         self.media = FakeMedia(self.calls)
+        self.moderation = FakeModeration(self.calls)
 
 
 def grouped_server(driver: GroupedDriver) -> FastMCP:
@@ -177,6 +263,7 @@ async def test_conversation_tools_annotate_reads_and_mutations() -> None:
         assert name in tools
         assert tools[name].annotations is not None
         assert tools[name].annotations.readOnlyHint is False
+        assert tools[name].annotations.destructiveHint is (name in DESTRUCTIVE_TOOLS)
 
 
 @pytest.mark.parametrize("name", ["matrix_read_history", "matrix_get_event_context"])
@@ -345,6 +432,130 @@ async def test_history_dispatch_accepts_domainless_room_id_without_marking_read(
             ),
         ),
         (
+            "matrix_search_messages",
+            {"search_term": "release date", "room_id": "!v12hash", "limit": 5},
+            (
+                "search",
+                {
+                    "search_term": "release date",
+                    "room_id": "!v12hash",
+                    "limit": 5,
+                    "order_by": "recent",
+                    "next_batch": None,
+                },
+            ),
+        ),
+        (
+            "matrix_search_messages",
+            {"search_term": "plan", "order_by": "rank", "next_batch": "page-2"},
+            (
+                "search",
+                {
+                    "search_term": "plan",
+                    "room_id": None,
+                    "limit": 10,
+                    "order_by": "rank",
+                    "next_batch": "page-2",
+                },
+            ),
+        ),
+        (
+            "matrix_list_threads",
+            {"room_id": "!room:example.com", "include": "participated", "before": "older"},
+            (
+                "threads",
+                {
+                    "room_id": "!room:example.com",
+                    "include": "participated",
+                    "limit": 20,
+                    "before": "older",
+                },
+            ),
+        ),
+        (
+            "matrix_get_reactions",
+            {"room_id": "!room:example.com", "event_id": "$event", "limit": 50},
+            ("reactions", {"room_id": "!room:example.com", "event_id": "$event", "limit": 50}),
+        ),
+        (
+            "matrix_get_read_receipts",
+            {"room_id": "!room:example.com", "event_id": "$event"},
+            ("receipts", {"room_id": "!room:example.com", "event_id": "$event", "limit": 50}),
+        ),
+        (
+            "matrix_get_space_hierarchy",
+            {"space_id": "!space:example.com", "max_depth": 2, "next_batch": "more"},
+            (
+                "hierarchy",
+                {
+                    "space_id": "!space:example.com",
+                    "limit": 50,
+                    "max_depth": 2,
+                    "next_batch": "more",
+                },
+            ),
+        ),
+        (
+            "matrix_get_power_levels",
+            {"room_id": "!room:example.com"},
+            ("power_levels", {"room_id": "!room:example.com"}),
+        ),
+        (
+            "matrix_create_dm",
+            {"user_id": "@bob:example.com", "encrypted": True},
+            ("create_dm", {"user_id": "@bob:example.com", "encrypted": True}),
+        ),
+        (
+            "matrix_pin_message",
+            {"room_id": "!room:example.com", "event_id": "$event"},
+            ("pin", {"room_id": "!room:example.com", "event_id": "$event"}),
+        ),
+        (
+            "matrix_unpin_message",
+            {"room_id": "!room:example.com", "event_id": "$event"},
+            ("unpin", {"room_id": "!room:example.com", "event_id": "$event"}),
+        ),
+        (
+            "matrix_kick_user",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com", "reason": "spam"},
+            (
+                "kick",
+                {"room_id": "!room:example.com", "user_id": "@bob:example.com", "reason": "spam"},
+            ),
+        ),
+        (
+            "matrix_ban_user",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com"},
+            (
+                "ban",
+                {"room_id": "!room:example.com", "user_id": "@bob:example.com", "reason": None},
+            ),
+        ),
+        (
+            "matrix_unban_user",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com"},
+            (
+                "unban",
+                {"room_id": "!room:example.com", "user_id": "@bob:example.com", "reason": None},
+            ),
+        ),
+        (
+            "matrix_set_power_level",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com", "level": 50},
+            (
+                "set_power_level",
+                {"room_id": "!room:example.com", "user_id": "@bob:example.com", "level": 50},
+            ),
+        ),
+        (
+            "matrix_set_power_level",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com", "level": None},
+            (
+                "set_power_level",
+                {"room_id": "!room:example.com", "user_id": "@bob:example.com", "level": None},
+            ),
+        ),
+        (
             "matrix_get_unread",
             {"limit": 8, "offset": 2, "timeline_limit": 6},
             (
@@ -420,6 +631,19 @@ async def test_conversation_tool_dispatches_exact_arguments(
             {"room_id": "!room:example.com", "event_id": "$e", "limit": 51},
         ),
         ("matrix_get_unread", {"limit": 101}),
+        ("matrix_search_messages", {"search_term": ""}),
+        ("matrix_search_messages", {"search_term": "x", "limit": 51}),
+        ("matrix_search_messages", {"search_term": "x", "order_by": "oldest"}),
+        ("matrix_list_threads", {"room_id": "!room:example.com", "include": "mine"}),
+        ("matrix_get_reactions", {"room_id": "!room:example.com", "event_id": "event"}),
+        ("matrix_get_space_hierarchy", {"space_id": "!space:example.com", "max_depth": 6}),
+        ("matrix_create_dm", {"user_id": "bob"}),
+        ("matrix_kick_user", {"room_id": "!room:example.com", "user_id": "@bob"}),
+        (
+            "matrix_set_power_level",
+            {"room_id": "!room:example.com", "user_id": "@bob:example.com", "level": 2**53},
+        ),
+        ("matrix_set_power_level", {"room_id": "!room:example.com", "user_id": "@bob:example.com"}),
         (
             "matrix_send_media",
             {

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +20,10 @@ _MAX_RELATION_REQUESTS = 4
 _DECRYPTED = "matrix_mcp.decrypted"
 _EDITABLE_MSGTYPES = frozenset({"m.text", "m.notice", "m.emote"})
 _MEDIA_MSGTYPES = frozenset({"m.file", "m.image", "m.video", "m.audio"})
+_MAX_SEARCH_LIMIT = 50
+_MAX_THREAD_LIMIT = 50
+_MAX_REACTION_SCAN = 500
+_REACTION_PAGE_LIMIT = 100
 
 
 class MediaMetadata(BaseModel):
@@ -103,6 +107,70 @@ class EventContext(BaseModel):
     edit_resolution_truncated: bool = Field(
         default=False,
         description="Whether a bounded replacement-relation fallback scan was truncated.",
+    )
+
+
+class SearchResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    room_id: str
+    event: TimelineEvent
+    rank: float | None = None
+    edit_of: str | None = Field(
+        default=None,
+        description="Original event ID when the match is an edit; its body is the edited text.",
+    )
+
+
+class SearchPage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    results: list[SearchResult]
+    count: int | None = Field(
+        default=None,
+        description="Total matches reported by the homeserver; may be approximate.",
+    )
+    next_batch: str | None = None
+
+
+class ThreadSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    root: TimelineEvent
+    reply_count: int | None = None
+    latest_reply: TimelineEvent | None = None
+    participated: bool | None = Field(
+        default=None, description="Whether the connected user has posted in the thread."
+    )
+
+
+class ThreadPage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    threads: list[ThreadSummary]
+    next_batch: str | None = None
+    edit_resolution_truncated: bool = Field(
+        default=False,
+        description="Whether a bounded replacement-relation fallback scan was truncated.",
+    )
+
+
+class Reaction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    count: int
+    senders: list[str]
+
+
+class ReactionSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    event_id: str
+    reactions: list[Reaction]
+    unreadable: int = Field(default=0, description="Reaction events whose key could not be read.")
+    truncated: bool = Field(
+        default=False, description="Whether more reactions may exist beyond the scanned limit."
     )
 
 
@@ -203,6 +271,199 @@ class MatrixEvents:
             start=_optional_string_field(payload, "start"),
             end=_optional_string_field(payload, "end"),
             edit_resolution_truncated=center_truncated or before_truncated or after_truncated,
+        )
+
+    async def search(
+        self,
+        search_term: str,
+        *,
+        room_id: str | None = None,
+        limit: int = 10,
+        order_by: Literal["recent", "rank"] = "recent",
+        next_batch: str | None = None,
+    ) -> SearchPage:
+        """Search message text with the homeserver's full-text index.
+
+        Homeservers cannot index end-to-end encrypted rooms, so their messages never match.
+        """
+        if not isinstance(search_term, str) or not search_term.strip():
+            msg = "search_term must not be empty"
+            raise ValueError(msg)
+        page_limit = _page_limit(limit, maximum=_MAX_SEARCH_LIMIT)
+        if order_by not in {"recent", "rank"}:
+            msg = "order_by must be 'recent' or 'rank'"
+            raise ValueError(msg)
+        search_filter: dict[str, object] = {"limit": page_limit}
+        if room_id is not None:
+            quote_matrix_id(room_id, sigil="!", label="room ID")
+            search_filter["rooms"] = [room_id]
+        params: dict[str, str | int] = {}
+        if next_batch is not None:
+            params["next_batch"] = _require_cursor(next_batch)
+        payload = await self.http.json(
+            "POST",
+            "/_matrix/client/v3/search",
+            body={
+                "search_categories": {
+                    "room_events": {
+                        "search_term": search_term,
+                        "order_by": order_by,
+                        "filter": search_filter,
+                    }
+                }
+            },
+            params=params or None,
+        )
+        room_events = _mapping_field(_mapping_field(payload, "search_categories"), "room_events")
+        hits = _event_list(room_events, "results")
+        _require_page_bound(hits, page_limit)
+        results = []
+        for hit in hits:
+            raw = _mapping_field(hit, "result", required=True)
+            if _is_redacted(raw):
+                continue
+            result_room = raw.get("room_id", room_id)
+            if not isinstance(result_room, str) or not result_room:
+                msg = "Matrix search result did not include a room ID"
+                raise RuntimeError(msg)
+            event = _timeline_event(raw)
+            edit_of = _relationship_id(raw, "m.replace")
+            new_content = _mapping_field(raw, "content", required=True).get("m.new_content")
+            if edit_of is not None and isinstance(new_content, dict):
+                body = _optional_string(new_content.get("body"))
+                if body is not None:
+                    msgtype = _optional_string(new_content.get("msgtype"))
+                    event = event.model_copy(
+                        update={
+                            "msgtype": msgtype,
+                            "body": body,
+                            "media": _media_metadata(new_content, msgtype),
+                        }
+                    )
+            rank = hit.get("rank")
+            results.append(
+                SearchResult(
+                    room_id=result_room,
+                    event=event,
+                    rank=float(rank)
+                    if isinstance(rank, int | float) and not isinstance(rank, bool)
+                    else None,
+                    edit_of=edit_of,
+                )
+            )
+        return SearchPage(
+            results=results,
+            count=_optional_integer(room_events.get("count")),
+            next_batch=_optional_string_field(room_events, "next_batch"),
+        )
+
+    async def threads(
+        self,
+        room_id: str,
+        *,
+        include: Literal["all", "participated"] = "all",
+        limit: int = 20,
+        before: str | None = None,
+    ) -> ThreadPage:
+        """List a room's threads newest first, with reply counts and latest replies."""
+        room = quote_matrix_id(room_id, sigil="!", label="room ID")
+        if include not in {"all", "participated"}:
+            msg = "include must be 'all' or 'participated'"
+            raise ValueError(msg)
+        page_limit = _page_limit(limit, maximum=_MAX_THREAD_LIMIT)
+        params: dict[str, str | int] = {"include": include, "limit": page_limit}
+        if before is not None:
+            params["from"] = _require_cursor(before)
+        payload = await self.http.json(
+            "GET",
+            f"/_matrix/client/v1/rooms/{room}/threads",
+            params=params,
+        )
+        roots = _event_list(payload, "chunk", required=True)
+        _require_page_bound(roots, page_limit)
+        # Read the server's thread bundle from the raw roots, before decryption.
+        bundles = [_thread_bundle(raw) for raw in roots]
+        latest_events = [
+            latest if isinstance(latest := bundle.get("latest_event"), dict) else None
+            for bundle in bundles
+        ]
+        decrypted, encryption = await self.decrypt_raw(
+            room_id, [*roots, *(latest for latest in latest_events if latest is not None)]
+        )
+        decrypted_roots, decrypted_latest = decrypted[: len(roots)], iter(decrypted[len(roots) :])
+        # Resolve edits like history does, so agents never act on text already corrected.
+        relation_budget = _RelationFetchBudget()
+        threads = []
+        truncated = False
+        for root, bundle, latest in zip(decrypted_roots, bundles, latest_events, strict=True):
+            latest_reply = None
+            if latest is not None:
+                latest_event, latest_truncated = await self._expand_one(
+                    room_id, next(decrypted_latest), relation_budget=relation_budget
+                )
+                latest_reply = mark_encryption(latest_event, encryption)
+                truncated = truncated or latest_truncated
+            root_event, root_truncated = await self._expand_one(
+                room_id, root, relation_budget=relation_budget
+            )
+            truncated = truncated or root_truncated
+            participated = bundle.get("current_user_participated")
+            threads.append(
+                ThreadSummary(
+                    root=mark_encryption(root_event, encryption),
+                    reply_count=_optional_integer(bundle.get("count")),
+                    latest_reply=latest_reply,
+                    participated=participated if isinstance(participated, bool) else None,
+                )
+            )
+        return ThreadPage(
+            threads=threads,
+            next_batch=_optional_string_field(payload, "next_batch"),
+            edit_resolution_truncated=truncated,
+        )
+
+    async def reactions(self, room_id: str, event_id: str, *, limit: int = 200) -> ReactionSummary:
+        """Count reactions on an event by key, scanning at most limit reaction events."""
+        room = quote_matrix_id(room_id, sigil="!", label="room ID")
+        event = quote_matrix_id(event_id, sigil="$", label="event ID")
+        scan_limit = _page_limit(limit, maximum=_MAX_REACTION_SCAN)
+        # No event type filter: reactions in encrypted rooms are m.room.encrypted.
+        path = f"/_matrix/client/v1/rooms/{room}/relations/{event}/m.annotation"
+        senders_by_key: dict[str, set[str]] = {}
+        unreadable = 0
+        scanned = 0
+        cursor: str | None = None
+        while scanned < scan_limit:
+            page_limit = min(_REACTION_PAGE_LIMIT, scan_limit - scanned)
+            params: dict[str, str | int] = {"dir": "b", "limit": page_limit}
+            if cursor is not None:
+                params["from"] = cursor
+            payload = await self.http.json("GET", path, params=params)
+            chunk = _event_list(payload, "chunk", required=True)
+            _require_page_bound(chunk, page_limit)
+            decrypted, _ = await self.decrypt_raw(room_id, chunk)
+            for raw, readable in zip(chunk, decrypted, strict=True):
+                if _is_redacted(raw):
+                    continue
+                sender = _optional_string(raw.get("sender"))
+                relation = _reaction_relation(raw, readable)
+                if sender is None or relation is None or relation.get("event_id") != event_id:
+                    unreadable += 1
+                    continue
+                senders_by_key.setdefault(relation["key"], set()).add(sender)
+            scanned += len(chunk)
+            cursor = _optional_string_field(payload, "next_batch")
+            if cursor is None or not chunk:
+                break
+        reactions = [
+            Reaction(key=key, count=len(senders), senders=sorted(senders))
+            for key, senders in senders_by_key.items()
+        ]
+        return ReactionSummary(
+            event_id=event_id,
+            reactions=sorted(reactions, key=lambda reaction: (-reaction.count, reaction.key)),
+            unreadable=unreadable,
+            truncated=cursor is not None,
         )
 
     async def reply(
@@ -733,6 +994,34 @@ def _nested_event_id(relation: dict[str, Any], key: str) -> str | None:
     return _optional_string(nested.get("event_id")) if isinstance(nested, dict) else None
 
 
+def _thread_bundle(raw: dict[str, Any]) -> dict[str, Any]:
+    unsigned = raw.get("unsigned")
+    relations = unsigned.get("m.relations") if isinstance(unsigned, dict) else None
+    bundle = relations.get("m.thread") if isinstance(relations, dict) else None
+    return bundle if isinstance(bundle, dict) else {}
+
+
+def _reaction_relation(raw: dict[str, Any], readable: dict[str, Any]) -> dict[str, Any] | None:
+    # Encryption moves relations into the cleartext wrapper, so keys stay readable.
+    if readable.get("type") == "m.reaction":
+        return _annotation(readable) or _annotation(raw)
+    if readable.get("type") == "m.room.encrypted":
+        return _annotation(raw)
+    return None
+
+
+def _annotation(raw: dict[str, Any]) -> dict[str, Any] | None:
+    content = raw.get("content")
+    relation = content.get("m.relates_to") if isinstance(content, dict) else None
+    if (
+        isinstance(relation, dict)
+        and relation.get("rel_type") == "m.annotation"
+        and _optional_string(relation.get("key")) is not None
+    ):
+        return relation
+    return None
+
+
 def _require_own_event(raw: dict[str, Any], user_id: str) -> None:
     if raw.get("sender") != user_id:
         msg = "Matrix event was not sent by the connected user"
@@ -748,6 +1037,20 @@ def _bounded_limit(limit: int, *, maximum: int) -> int:
         msg = "limit must be a positive integer"
         raise ValueError(msg)
     return min(limit, maximum)
+
+
+def _page_limit(limit: int, *, maximum: int) -> int:
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= maximum:
+        msg = f"limit must be between 1 and {maximum}"
+        raise ValueError(msg)
+    return limit
+
+
+def _require_cursor(cursor: str) -> str:
+    if not isinstance(cursor, str) or not cursor:
+        msg = "Matrix pagination cursor must not be empty"
+        raise ValueError(msg)
+    return cursor
 
 
 def _require_page_bound(events: list[dict[str, Any]], limit: int) -> None:

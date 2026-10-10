@@ -233,3 +233,17 @@ async def test_matrix_mcp_reads_and_writes_an_encrypted_room(
     async with tool_call(config) as client:
         thread = await client.read_thread(room_id, question_id)
     assert [event.body for event in thread] == ["Encrypted question", "Encrypted answer, edited"]
+
+
+async def test_invitee_reads_an_encrypted_direct_chat_sent_before_joining(
+    accounts: tuple[AsyncClient, MatrixMCPConfig],
+) -> None:
+    chat_app, config = accounts
+    async with tool_call(config) as client:
+        direct = await client.rooms.create_dm(chat_app.user_id, encrypted=True)
+        await client.send_message(direct.room_id, "Sent before you joined")
+
+    await chat_app.join(direct.room_id)
+    events = await timeline(chat_app, direct.room_id)
+
+    assert "Sent before you joined" in [getattr(event, "body", None) for event in events]

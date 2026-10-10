@@ -47,6 +47,11 @@ class CryptoEndpoint:
     batch: int = 0
     whoami_device: str = DEVICE
     other_devices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Synapse lists joined rooms in the key-only catch-up sync, without their state.
+    sync_lists_room: bool = False
+    invited: list[str] = field(default_factory=list)
+    history_visibility: str | None = None
+    members_status: int = 200
 
     async def handle(self, request: web.Request) -> web.Response:  # noqa: PLR0911
         body = await request.json() if request.can_read_body else None
@@ -67,15 +72,32 @@ class CryptoEndpoint:
         if path == "/_matrix/client/v3/sync":
             self.batch += 1
             events = self.to_device_batches.pop(0) if self.to_device_batches else []
+            rooms: dict[str, Any] = {"join": {ROOM: {}}} if self.sync_lists_room else {}
             return web.json_response(
                 {
                     "next_batch": f"batch-{self.batch}",
                     "to_device": {"events": events},
                     "device_one_time_keys_count": {"signed_curve25519": self.one_time_keys},
+                    "rooms": rooms,
                 }
             )
         if path.endswith("/joined_members"):
             return web.json_response({"joined": {USER: {}}})
+        if path.endswith("/members"):
+            assert request.query["membership"] == "invite"
+            if self.members_status != 200:
+                return web.json_response({"errcode": "M_UNKNOWN"}, status=self.members_status)
+            chunk = [
+                {
+                    "type": "m.room.member",
+                    "state_key": user_id,
+                    "content": {"membership": "invite"},
+                }
+                for user_id in self.invited
+            ]
+            return web.json_response({"chunk": chunk})
+        if path.endswith("/state/m.room.history_visibility") and self.history_visibility:
+            return web.json_response({"history_visibility": self.history_visibility})
         if path == "/_matrix/client/v3/keys/query":
             devices = {DEVICE: self.device_keys} if self.device_keys else {}
             devices.update(self.other_devices)
@@ -174,8 +196,75 @@ async def test_catch_up_drains_to_device_and_resumes_from_stored_token(
     assert first_syncs[1]["query"]["since"] == "batch-1"
     assert endpoint.syncs()[2]["query"]["since"] == "batch-2"
     assert json.loads(first_syncs[0]["query"]["filter"])["room"] == {"rooms": []}
+    # A repeated identical sync could be answered from Synapse's cache, hiding new room keys.
+    filters = {sync["query"]["filter"] for sync in endpoint.syncs()}
+    assert len(filters) == len(endpoint.syncs())
     # Homeservers answer full_state syncs without a minimum long-poll.
     assert all(sync["query"]["full_state"] == "true" for sync in endpoint.syncs())
+
+
+async def test_encrypts_for_a_room_the_catch_up_sync_listed_without_state(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.sync_lists_room = True
+    writer = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        event_type, encrypted = await writer.encrypt(ROOM, "m.room.message", {"body": "secret"})
+    finally:
+        await writer.aclose()
+
+    assert event_type == "m.room.encrypted"
+    assert "secret" not in str(encrypted)
+
+
+def queried_users(endpoint: CryptoEndpoint) -> set[str]:
+    queries = [r["body"] for r in endpoint.requests if r["path"].endswith("/keys/query")]
+    return {user for query in queries for user in query["device_keys"]}
+
+
+@pytest.mark.parametrize(
+    ("visibility", "shared"),
+    [(None, True), ("shared", True), ("invited", True), ("joined", False)],
+)
+async def test_room_keys_reach_invited_members_unless_history_is_joined_only(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint],
+    tmp_path: Path,
+    visibility: str | None,
+    *,
+    shared: bool,
+) -> None:
+    config, endpoint = homeserver
+    endpoint.invited = ["@bob:example.com"]
+    endpoint.history_visibility = visibility
+    writer = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        await writer.encrypt(ROOM, "m.room.message", {"body": "before bob joins"})
+        assert writer._client is not None  # noqa: SLF001
+        room = writer._client.rooms[ROOM]  # noqa: SLF001
+        assert ("@bob:example.com" in room.users) is shared
+        assert ("@bob:example.com" in queried_users(endpoint)) is shared
+        # A withdrawn invitation stops further room keys from going to that user.
+        endpoint.invited = []
+        await writer.encrypt(ROOM, "m.room.message", {"body": "after the invite is withdrawn"})
+        assert "@bob:example.com" not in room.users
+    finally:
+        await writer.aclose()
+
+
+async def test_failed_invitee_lookup_refuses_to_encrypt(
+    homeserver: tuple[MatrixMCPConfig, CryptoEndpoint], tmp_path: Path
+) -> None:
+    config, endpoint = homeserver
+    endpoint.invited = ["@bob:example.com"]
+    endpoint.members_status = 500
+    writer = MatrixE2EE(config, store_path=tmp_path)
+    try:
+        # Bob could never read a message whose key skipped him, so it must not go out.
+        with pytest.raises(RuntimeError, match="invited members; the message was not sent"):
+            await writer.encrypt(ROOM, "m.room.message", {"body": "for bob"})
+    finally:
+        await writer.aclose()
 
 
 async def test_encrypted_message_decrypts_in_a_later_session(

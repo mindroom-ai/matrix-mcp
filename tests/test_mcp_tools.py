@@ -146,6 +146,21 @@ async def test_every_stdio_tool_declares_whether_it_writes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_rooms_passes_sort_only_when_requested() -> None:
+    calls: list[dict[str, object]] = []
+
+    class SortingClient(FakeMatrixClient):
+        async def list_rooms(self, **kwargs: object) -> list[MatrixRoom]:
+            calls.append(kwargs)
+            return []
+
+    tools = MatrixMCPTools(client_factory=lambda: cast("MatrixMCPClient", SortingClient()))
+    await tools.matrix_list_rooms()
+    await tools.matrix_list_rooms(sort="activity")
+    assert calls == [{}, {"sort": "activity"}]
+
+
+@pytest.mark.asyncio
 async def test_registered_stdio_tool_dispatches_explicit_mentions() -> None:
     matrix = FakeMatrixClient()
     server = create_mcp_server(client_factory=lambda: cast("MatrixMCPClient", matrix))

@@ -4,16 +4,17 @@ icon: lucide/wrench
 
 # Tool Reference
 
-Matrix MCP exposes 30 tools.
+Matrix MCP exposes 43 tools.
 Each one runs as the connected Matrix account, with that account's permissions, and declares whether it only reads or also writes.
 Unless a section says otherwise, the same tools are available in local stdio mode and in [authenticated HTTP](hosted.md) mode.
 
 | Area | Tools |
 | --- | --- |
-| [Session and rooms](#session-and-rooms) | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar` |
-| [Reading](#reading) | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_read_history`, `matrix_get_event_context` |
-| [Writing](#writing) | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event` |
-| [Membership](#membership) | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room` |
+| [Session and rooms](#session-and-rooms) | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar`, `matrix_get_space_hierarchy` |
+| [Reading](#reading) | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_list_threads`, `matrix_read_history`, `matrix_get_event_context`, `matrix_search_messages`, `matrix_get_reactions`, `matrix_get_read_receipts` |
+| [Writing](#writing) | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event`, `matrix_pin_message`, `matrix_unpin_message` |
+| [Membership](#membership) | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room`, `matrix_create_dm` |
+| [Moderation](#moderation) | `matrix_get_power_levels`, `matrix_set_power_level`, `matrix_kick_user`, `matrix_ban_user`, `matrix_unban_user` |
 | [Profiles](#profiles) | `matrix_get_profile`, `matrix_set_display_name`, `matrix_set_avatar` |
 | [Media](#media) | `matrix_upload_media`, `matrix_download_media`, `matrix_send_media` |
 | [Unread catch-up](#unread-catch-up) | `matrix_get_unread`, `matrix_mark_read` |
@@ -40,8 +41,9 @@ If a ref is unknown, list or read the relevant room or thread first.
 
 Matrix MCP is built so that an agent can read freely and writes only when asked:
 
-- Read tools carry MCP read-only hints; tools that post, change, or remove something are marked as mutations, and the destructive ones (edits, redactions, leaving, room and profile setters) say so.
-- The server instructs the agent to read first and to send messages, invite people, or change room and profile details only when the user explicitly asks.
+- Read tools carry MCP read-only hints; tools that post, change, or remove something are marked as mutations, and the destructive ones (edits, redactions, leaving, kicks, bans, power levels, room and profile setters) say so.
+- The server instructs the agent to read first and to send messages, invite people, pin messages, moderate members, or change room and profile details only when the user explicitly asks.
+- It refuses to kick or ban the connected account, to lower its own power level, or to change a room creator's level.
 - Reading never moves read markers.
   `matrix_mark_read` is a separate, explicit call that sends a private receipt by default.
 - Uploads and downloads are capped at 5 MiB, and sync snapshots at 2 MiB of JSON.
@@ -62,10 +64,14 @@ Returns the configured Matrix user and device.
 
 ```text
 matrix_list_rooms()
+matrix_list_rooms(sort="activity")
+matrix_list_rooms(sort="name")
 ```
 
 Returns joined rooms.
 Each room includes a stable numeric `id` ref and the raw Matrix `room_id`.
+`sort="activity"` puts the rooms with the newest messages first and fills in `last_activity_ms`; `sort="name"` sorts A to Z.
+Activity looks at each room's ten newest events, so a room whose recent events are all state changes, such as membership updates, may show no activity on some homeservers.
 
 ### Room Details
 
@@ -76,11 +82,27 @@ matrix_set_room_topic(room_id=1, topic="Plans and updates")
 matrix_set_room_avatar(room_id=1, avatar_url="mxc://example.com/room-avatar")
 ```
 
+`matrix_get_room_info` also reports whether the room is `encrypted`, its `joined_member_count`, the connected user's `own_power_level`, its `room_type` (`m.space` for spaces), and its `pinned_event_ids`.
+These extra details are best effort: for a room the connected user has left, they can be `null` while the name and topic still show.
+In room version 12 and later, room creators outrank every power level, so a creator's `own_power_level` is `null`.
+
 Read the current details before changing them.
 Each setter changes one field and returns its Matrix event ID.
 Pass an empty string to clear a name, topic, or avatar.
 Room permissions apply normally; permission failures are returned as tool errors.
 Avatars use existing `mxc://` media URIs; see [Media](#media) to upload one.
+
+### Spaces
+
+```text
+matrix_get_space_hierarchy(space_id="!space:example.com")
+matrix_get_space_hierarchy(space_id="!space:example.com", max_depth=2, next_batch="cursor")
+```
+
+Lists the space itself and the rooms and subspaces inside it, up to `max_depth` levels deep (1 to 5).
+Each entry has its name, topic, alias, `room_type`, `joined_member_count`, `join_rule`, its `children`, and whether the connected user has `joined` it.
+Rooms that another server describes invalidly are left out and counted in `skipped`.
+Join a listed room with `matrix_join_room`.
 
 ## Reading
 
@@ -113,6 +135,18 @@ matrix_read_thread(room_id=1, thread_id=42, limit=50)
 The result holds the thread root and its newest replies, with edits applied.
 `limit` counts every thread event, so non-message events such as polls can reduce the number of messages returned.
 
+### List Threads
+
+```text
+matrix_list_threads(room_id="!room:example.com")
+matrix_list_threads(room_id="!room:example.com", include="participated", before="cursor-from-next_batch")
+```
+
+Lists a room's threads, newest first, up to 50 per page.
+Each thread has its `root` message, `reply_count`, `latest_reply`, and whether the connected user `participated`, with edits resolved as in [history](#history-and-message-context).
+`include="participated"` keeps only threads the connected user has posted in.
+Pass `next_batch` unchanged as `before` for older threads, then read one with `matrix_read_thread`.
+
 ### History and Message Context
 
 ```text
@@ -125,6 +159,46 @@ History pages contain newest-first events and a `next_batch` cursor for older me
 Pass that cursor unchanged as `before`; `null` means the end.
 History supports up to 100 entries per page; context supports up to 50 surrounding entries.
 Results preserve message types, attachment metadata, reply and thread relationships, edits, and redacted placeholders.
+
+### Search
+
+```text
+matrix_search_messages(search_term="release date")
+matrix_search_messages(search_term="release date", room_id="!room:example.com", order_by="rank", limit=20)
+```
+
+Uses the homeserver's full-text search across joined rooms, or within one room.
+Results are newest first by default; `order_by="rank"` puts the best matches first.
+Each result has the `room_id`, the matching `event`, and the server's `rank`.
+When the match is an edit, `edit_of` names the original message and `body` shows the edited text.
+Pass `next_batch` unchanged for more results, and open a match with `matrix_get_event_context` to see the discussion around it.
+
+!!! note "Encrypted rooms are not searchable"
+
+    The homeserver cannot read end-to-end encrypted messages, so it cannot index them.
+    Search finds only messages in unencrypted rooms; page through encrypted rooms with `matrix_read_history` instead.
+    How matches are found (word stemming, partial words) depends on the homeserver.
+
+### Reactions
+
+```text
+matrix_get_reactions(room_id="!room:example.com", event_id="$proposal")
+```
+
+Summarizes the reactions on one event: each key, how many users used it, and who.
+Reactions in encrypted rooms are counted too.
+It scans up to `limit` reaction events (200 by default, at most 500); `truncated` reports when there were more.
+
+### Read Receipts
+
+```text
+matrix_get_read_receipts(room_id="!room:example.com")
+matrix_get_read_receipts(room_id="!room:example.com", event_id="$my-message")
+```
+
+Shows each member's latest read receipt, newest first: the event they have read up to, when, and in which thread.
+Pass `event_id` to check who has read that message: `read` is `true` when a member's receipt is on that event or a later one, by server timestamps, and `null` when it could not be checked, including receipts from a different thread than the message.
+Members who send private receipts or have receipts turned off do not appear; the connected user's own private receipt is marked `private`, though some homeservers (Tuwunel) do not report a private receipt on the user's own message.
 
 ??? info "How edits are resolved"
 
@@ -173,6 +247,17 @@ Redacting your reaction removes it.
 Event writes accept an optional `transaction_id`, so a client can retry the same intended operation without posting it twice.
 Reuse a transaction ID only for an identical operation.
 
+### Pins
+
+```text
+matrix_pin_message(room_id="!room:example.com", event_id="$runbook")
+matrix_unpin_message(room_id="!room:example.com", event_id="$runbook")
+```
+
+Pinning adds a message to the room's pinned list, which chat apps show at the top of the room; unpinning removes it.
+Both return the updated `pinned` list, and `changed: false` when nothing needed to change.
+Changing pins requires the room permission to send `m.room.pinned_events`.
+
 ## Membership
 
 ### Members and Invitations
@@ -209,10 +294,46 @@ Invitation pages return `next_offset`; each page reflects a new filtered sync sn
 New rooms use the private-chat preset, are not published in the public directory, and do not enable encryption.
 Other members still need to accept their invitations.
 
+### Direct Chats
+
+```text
+matrix_create_dm(user_id="@bob:example.com")
+matrix_create_dm(user_id="@bob:example.com", encrypted=true)
+```
+
+Opens a direct chat with one user and marks it as direct, so chat apps list it under people.
+An existing direct chat is reused, with `created: false`, only when it holds exactly the two of you (joined or invited) and suits the request: `encrypted=true` never reuses an unencrypted chat, and authenticated HTTP mode never reuses an encrypted one.
+`encrypted=true` creates an end-to-end encrypted chat; it needs local mode, because [authenticated HTTP](hosted.md) mode holds no encryption keys.
+Messages sent before the other user accepts the invitation are shared with their devices, so they can read them after joining.
+
 !!! note "Snapshot size"
 
     Invitation and catch-up offsets and limits are applied after the filtered sync snapshot is downloaded, so they do not reduce its upstream size.
     Snapshots over the 2 MiB JSON limit fail with a size error, whatever page limit you choose.
+
+## Moderation
+
+```text
+matrix_get_power_levels(room_id="!room:example.com")
+matrix_set_power_level(room_id="!room:example.com", user_id="@bob:example.com", level=50)
+matrix_set_power_level(room_id="!room:example.com", user_id="@bob:example.com", level=null)
+matrix_kick_user(room_id="!room:example.com", user_id="@spam:example.com", reason="Spam")
+matrix_ban_user(room_id="!room:example.com", user_id="@spam:example.com", reason="Spam")
+matrix_unban_user(room_id="!room:example.com", user_id="@spam:example.com")
+```
+
+`matrix_get_power_levels` shows who can do what: each user's level, the default level, the levels needed to invite, kick, ban, redact, and send each event type, the room `creators`, and the connected user's `own_level`.
+`matrix_set_power_level` changes one user's level and leaves the rest of the power levels untouched; `level=null` resets the user to the room default.
+A kick removes a user, who may rejoin if the room allows it; a ban keeps them out until `matrix_unban_user` lifts it.
+Unbanning does not invite the user back.
+
+All of these use the connected account's own permissions, so the homeserver rejects anything it may not do.
+The tools additionally refuse to kick or ban the connected account (use `matrix_leave_room`), to lower its own power level, and to change a room creator's level, since none of those can be undone by the account itself.
+
+!!! warning "Moderation is destructive"
+
+    Kicks, bans, and power level changes take effect for everyone in the room immediately.
+    MCP clients see these tools marked as destructive, and the server tells agents to use them only when the user explicitly asks.
 
 ## Profiles
 

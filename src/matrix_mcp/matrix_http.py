@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import weakref
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 
@@ -15,6 +18,7 @@ from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from contextlib import AbstractAsyncContextManager
 
     from matrix_mcp.config import MatrixMCPConfig
@@ -26,6 +30,11 @@ RATE_LIMIT_RETRIES = 2
 _CONTROL_CODE_BOUNDARY = 32
 _MAX_TRANSACTION_ID_LENGTH = 255
 _ERRCODE_PATTERN = re.compile(r"M_[A-Z_0-9]{1,80}")
+# Per event loop, since asyncio locks belong to the loop that first waits on them. Each
+# entry counts its holders and waiters, and is dropped when the last one leaves.
+_WRITE_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, ...], tuple[asyncio.Lock, int]]
+] = weakref.WeakKeyDictionary()
 
 
 class MatrixHTTPError(RuntimeError):
@@ -137,17 +146,57 @@ class MatrixHTTP:
         msg = "Matrix API request exhausted its retry budget"
         raise RuntimeError(msg)
 
+    @asynccontextmanager
+    async def write_lock(self, *scope: str) -> AsyncIterator[None]:
+        """Serialize read-modify-write updates of one piece of Matrix data in this process.
+
+        Matrix has no compare-and-swap for room state or account data, so two overlapping
+        tool calls would each write back a copy that lacks the other's change.
+        """
+        locks = _WRITE_LOCKS.setdefault(asyncio.get_running_loop(), {})
+        key = (self._homeserver, self.user_id, *scope)
+        lock, users = locks.get(key, (asyncio.Lock(), 0))
+        locks[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = locks[key]
+            if users == 1:
+                del locks[key]
+            else:
+                locks[key] = (lock, users - 1)
+
     async def room_is_encrypted(self, room_id: str) -> bool:
         """Report room encryption; only a definitive missing state event means plaintext."""
+        return await self.room_state(room_id, "m.room.encryption") is not None
+
+    async def room_state(
+        self, room_id: str, event_type: str, state_key: str = ""
+    ) -> dict[str, Any] | None:
+        """Read one state event's content; None only for a definitive missing event."""
         room = quote_matrix_id(room_id, sigil="!", label="room ID")
-        path = f"/_matrix/client/v3/rooms/{room}/state/m.room.encryption"
+        path = f"/_matrix/client/v3/rooms/{room}/state/{quote(event_type, safe='')}"
+        if state_key:
+            path = f"{path}/{quote(state_key, safe='')}"
         try:
-            await self.json("GET", path)
+            return await self.json("GET", path)
         except MatrixHTTPError as exc:
             if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
-                return False
+                return None
             raise
-        return True
+
+
+def uncached_sync_filter(sync_filter: dict[str, Any]) -> dict[str, Any]:
+    """Make a sync filter unique so the homeserver cannot answer from a response cache.
+
+    Synapse reuses the response to an identical sync request for minutes, which would serve
+    stale unread counts, receipts, invitations, or room keys. Excluding a random, nonexistent
+    presence event type changes the request without changing what it returns.
+    """
+    presence = dict(sync_filter.get("presence") or {})
+    presence["not_types"] = [f"matrix_mcp.snapshot.{uuid4().hex}"]
+    return {**sync_filter, "presence": presence}
 
 
 def quote_matrix_id(value: str, *, sigil: str, label: str) -> str:

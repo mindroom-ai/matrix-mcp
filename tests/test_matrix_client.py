@@ -1356,3 +1356,41 @@ async def test_thread_edit_of_encrypted_reply_must_be_encrypted(
 
     reply = thread[-1]
     assert (reply.body, reply.edited) == ("original reply", False)
+
+
+class SortableDriver(FakeDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rooms = self
+
+    async def list_rooms(self) -> list[MatrixRoom]:
+        return [
+            MatrixRoom(room_id="!quiet:example.com", name="quiet"),
+            MatrixRoom(room_id="!busy:example.com", name="Busy"),
+            MatrixRoom(room_id="!empty:example.com"),
+        ]
+
+    async def latest_activity(self) -> dict[str, int]:
+        return {"!quiet:example.com": 100, "!busy:example.com": 300}
+
+
+async def test_list_rooms_sorts_by_name_or_latest_activity(tmp_path: Path) -> None:
+    ids = MatrixIdStore(tmp_path / "ids.json")
+    client = MatrixAPIClient(driver=cast("MatrixDriver", SortableDriver()), id_store=ids)
+
+    unsorted = await client.list_rooms()
+    by_name = await client.list_rooms(sort="name")
+    by_activity = await client.list_rooms(sort="activity")
+
+    assert [room.name for room in unsorted] == ["quiet", "Busy", None]
+    assert all(room.last_activity_ms is None for room in unsorted)
+    assert [room.name for room in by_name] == ["Busy", "quiet", None]
+    assert [(room.room_id, room.last_activity_ms) for room in by_activity] == [
+        ("!busy:example.com", 300),
+        ("!quiet:example.com", 100),
+        ("!empty:example.com", None),
+    ]
+    # Sorting never renumbers the stable room refs.
+    assert {room.room_id: room.id for room in by_activity} == {
+        room.room_id: room.id for room in unsorted
+    }
