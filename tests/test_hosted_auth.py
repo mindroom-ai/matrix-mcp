@@ -140,26 +140,136 @@ async def test_discovery_and_redirect_registration(browser: OAuthBrowser) -> Non
         assert response.status_code == 400
 
 
-async def test_static_clients_disable_registration_without_writing_state(
-    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_anonymous_auth_requests_do_not_write_state(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str], *, static: bool, method: str
 ) -> None:
-    configured = settings.model_copy(update={"static_clients": {"desktop-client": [CALLBACK]}})
+    configured = settings.model_copy(
+        update={"static_clients": {"desktop-client": [CALLBACK]} if static else {}}
+    )
     async with browser_session(configured, matrix[0]) as browser:
+        client_id = "desktop-client" if static else await browser.register()
         before = {
             path: path.read_bytes()
             for path in settings.state_directory.rglob("*")
             if path.is_file()
         }
-        response = await browser.client.post("/register", json={"redirect_uris": [CALLBACK]})
-        assert response.status_code == 404
+        if static:
+            response = await browser.client.post("/register", json={"redirect_uris": [CALLBACK]})
+            assert response.status_code == 404
         metadata = await browser.client.get("/.well-known/oauth-authorization-server")
-        assert "registration_endpoint" not in metadata.json()
+        assert ("registration_endpoint" in metadata.json()) is not static
+        for index in range(20):
+            params = {
+                "client_id": client_id,
+                "redirect_uri": CALLBACK,
+                "response_type": "code",
+                "scope": "matrix",
+                "state": f"{index:04}" + "A" * 1020,
+                "code_challenge_method": "S256",
+                "code_challenge": "A" * 43,
+            }
+            response = (
+                await browser.client.get("/authorize", params=params)
+                if method == "GET"
+                else await browser.client.post("/authorize", data=params)
+            )
+            assert response.status_code == 302
+            assert urlsplit(response.headers["location"]).path == "/consent"
+            assert (await browser.client.get(response.headers["location"])).status_code == 200
+        # Consent approval and an invalid Matrix login token must stay memory-only too.
+        callback = await browser.consent(client_id)
+        assert (await browser.client.get(callback + "&loginToken=invalid")).status_code == 500
+        for request_method, path, expected, data in [
+            ("GET", "/consent?txn_id=unknown", 400, None),
+            ("POST", "/consent", 400, {"txn_id": "unknown", "action": "approve"}),
+            ("GET", "/auth/callback?state=unknown&loginToken=invalid", 400, None),
+            ("GET", "/.well-known/oauth-protected-resource/mcp", 200, None),
+            (
+                "POST",
+                "/token",
+                401,
+                {
+                    "client_id": client_id,
+                    "grant_type": "authorization_code",
+                    "code": "unknown",
+                    "redirect_uri": CALLBACK,
+                    "code_verifier": "invalid",
+                },
+            ),
+            (
+                "POST",
+                "/token",
+                401,
+                {
+                    "client_id": client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": "unknown",
+                },
+            ),
+            ("POST", "/revoke", 200, {"client_id": client_id, "token": "unknown"}),
+            ("POST", "/mcp", 401, None),
+        ]:
+            result = await browser.client.request(request_method, path, data=data)
+            assert result.status_code == expected, (path, result.text)
         after = {
             path: path.read_bytes()
             for path in settings.state_directory.rglob("*")
             if path.is_file()
         }
         assert after == before
+
+
+async def test_pending_authorizations_evict_oldest_and_allow_login(browser: OAuthBrowser) -> None:
+    client_id = await browser.register()
+    first = await browser.authorize(client_id)
+    for _ in range(1000):
+        latest = await browser.authorize(client_id)
+        assert latest.status_code == 302
+    assert (await browser.client.get(first.headers["location"])).status_code == 400
+    assert (await browser.client.get(latest.headers["location"])).status_code == 200
+    await browser.login(client_id)
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("state", "A" * 1025), ("code_challenge", "A" * 4096)],
+    ids=["state", "total"],
+)
+async def test_authorization_parameter_sizes_are_bounded(
+    browser: OAuthBrowser, method: str, field: str, value: str
+) -> None:
+    client_id = await browser.register()
+    params = {
+        "client_id": client_id,
+        "redirect_uri": CALLBACK,
+        "response_type": "code",
+        "scope": "matrix",
+        "state": "A" * 1024,
+        "code_challenge_method": "S256",
+        "code_challenge": "A" * 43,
+    }
+    accepted = await browser.client.get("/authorize", params=params)
+    assert urlsplit(accepted.headers["location"]).path == "/consent"
+    params[field] = value
+    rejected = (
+        await browser.client.get("/authorize", params=params)
+        if method == "GET"
+        else await browser.client.post("/authorize", data=params)
+    )
+    assert rejected.status_code == 302
+    assert parse_qs(urlsplit(rejected.headers["location"]).query)["error"] == ["invalid_request"]
+
+
+async def test_pending_authorization_is_lost_on_restart(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+) -> None:
+    async with browser_session(settings, matrix[0]) as browser:
+        first = await browser.authorize(await browser.register())
+    async with browser_session(settings, matrix[0]) as browser:
+        assert (await browser.client.get(first.headers["location"])).status_code == 400
 
 
 async def test_static_client_login_refresh_and_revocation_after_restart(

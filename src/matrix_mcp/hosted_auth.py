@@ -16,12 +16,20 @@ from authlib.jose.errors import JoseError
 from cryptography.fernet import Fernet, InvalidToken
 from fastmcp.server.auth import AccessToken, OAuthProxy, TokenVerifier
 from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+from fastmcp.server.auth.oauth_proxy.models import OAuthTransaction
 from filelock import FileLock, Timeout
+from key_value.aio.adapters.pydantic import PydanticAdapter
 from key_value.aio.stores.filetree import FileTreeStore
+from key_value.aio.stores.memory import MemoryStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import AccessToken as SDKAccessToken
-from mcp.server.auth.provider import RefreshToken, RegistrationError
+from mcp.server.auth.provider import (
+    AuthorizationParams,
+    AuthorizeError,
+    RefreshToken,
+    RegistrationError,
+)
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyHttpUrl, AnyUrl, Field, field_validator, model_validator
@@ -42,6 +50,9 @@ _ACCESS_TTL = 3600
 _REFRESH_TTL = 30 * 24 * 3600
 _MIN_KEY_LENGTH = 32
 _MAX_AUTH_BODY_BYTES = 64 * 1024
+_MAX_PENDING_TRANSACTIONS = 1000
+_MAX_AUTH_STATE_LENGTH = 1024
+_MAX_AUTH_PARAMS_BYTES = 4096
 _AUTH_BODY_TIMEOUT_SECONDS = 10
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
@@ -367,8 +378,9 @@ class MatrixOAuthProvider(OAuthProxy):
         directory = settings.state_directory
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
+        self._persistent_store = FileTreeStore(data_directory=directory / "oauth")
         store = FernetEncryptionWrapper(
-            FileTreeStore(data_directory=directory / "oauth"),
+            self._persistent_store,
             fernet=self._fernet,
             raise_on_decryption_error=True,
         )
@@ -390,6 +402,14 @@ class MatrixOAuthProvider(OAuthProxy):
             ),
             enable_cimd=False,
             require_authorization_consent=True,
+        )
+        # FastMCP 3.2.4 has no separate transaction-storage constructor option.
+        # Anonymous authorization/consent must not grow persistent session state.
+        self._transaction_store = PydanticAdapter[OAuthTransaction](
+            key_value=MemoryStore(max_entries_per_collection=_MAX_PENDING_TRANSACTIONS),
+            pydantic_model=OAuthTransaction,
+            default_collection="mcp-oauth-transactions",
+            raise_on_validation_error=True,
         )
         if settings.static_clients and self.client_registration_options is not None:
             self.client_registration_options.enabled = False
@@ -427,9 +447,33 @@ class MatrixOAuthProvider(OAuthProxy):
     async def lifespan(self, _server: FastMCP) -> AsyncIterator[dict[str, object]]:
         lock = self._open_state()
         try:
+            # FileTreeStore creates collection metadata even on missing-key reads.
+            # Do that at startup, so anonymous client/grant lookups write nothing.
+            for collection in (
+                "mcp-oauth-proxy-clients",
+                "mcp-authorization-codes",
+                "mcp-upstream-tokens",
+                "mcp-jti-mappings",
+                "mcp-refresh-tokens",
+            ):
+                await self._persistent_store.setup_collection(collection=collection)
             yield {}
         finally:
             lock.release()
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        # Bound all caller-controlled transaction fields, including GET parameters.
+        # ASCII JSON also accounts for Unicode escaping in the memory store.
+        if (
+            len(params.state or "") > _MAX_AUTH_STATE_LENGTH
+            or len(json.dumps(params.model_dump(mode="json"))) > _MAX_AUTH_PARAMS_BYTES
+        ):
+            raise AuthorizeError(
+                error="invalid_request", error_description="Authorization parameters are too large"
+            )
+        return await super().authorize(client, params)
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)

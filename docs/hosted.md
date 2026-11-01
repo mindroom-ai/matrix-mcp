@@ -99,6 +99,15 @@ Use pre-registered clients for any public deployment.
 Dynamic registration is anonymous: callers can persist client records even when callbacks are restricted.
 Those records have no expiry and can fill the state volume.
 Configuring at least one static client disables `/register` (404) and removes `registration_endpoint` from authorization server metadata.
+With static clients configured, anonymous requests write nothing to the state directory after startup.
+Startup initializes fixed collection metadata; client registrations, authorization codes issued after Matrix sign-in, and established sessions remain persistent.
+
+Pending authorization and consent transactions stay in memory, expire after 15 minutes, and are limited to 1,000 entries.
+When full, the store evicts the least recently used transaction, so its user must retry sign-in.
+OAuth `state` is limited to 1,024 characters, and all normalized authorization parameters together must fit in 4 KiB of ASCII JSON, including Unicode escapes.
+This bounds stored request data to about 4 MiB, plus transaction metadata and configured client IDs.
+A sign-in in progress is lost on restart; completed sign-ins and their tokens survive as before.
+Without static clients, `/register` still persists anonymous client registrations, but pending sign-ins use the same bounded memory store.
 
 Choose a stable client ID and configure it in both the server and the MCP client:
 

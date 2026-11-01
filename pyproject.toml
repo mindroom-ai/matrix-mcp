@@ -40,7 +40,7 @@ dependencies = [
   "fastmcp==3.2.4",
   "cryptography>=45",
   "filelock>=3.18",
-  "py-key-value-aio[filetree]>=0.4.4",
+  "py-key-value-aio[filetree,memory]>=0.4.4",
   "httpx>=0.28",
   "mindroom-nio[e2e]>=0.25.3",
   "platformdirs>=4.3",
