@@ -39,6 +39,11 @@ def serve(
         "--allowed-client-redirect-uri",
         help="Allowed OAuth callback URI; repeat as needed",
     ),
+    static_client: list[str] | None = typer.Option(
+        None,
+        "--static-client",
+        help="Pre-registered public OAuth client as CLIENT_ID=CALLBACK_URI; repeat as needed",
+    ),
 ) -> None:
     """Run stdio, or opt into authenticated HTTP using explicit hosted settings."""
     if transport == "stdio":
@@ -59,6 +64,15 @@ def serve(
         "state_directory": state_directory,
         "allowed_client_redirect_uris": allowed_client_redirect_uri,
     }
+    if static_client is not None:
+        clients: dict[str, list[str]] = {}
+        for entry in static_client:
+            client_id, separator, redirect = entry.partition("=")
+            if not separator:
+                msg = "Static clients must use CLIENT_ID=CALLBACK_URI"
+                raise typer.BadParameter(msg, param_hint="--static-client")
+            clients.setdefault(client_id, []).append(redirect)
+        overrides["static_clients"] = clients
     try:
         settings = HostedSettings(
             **{key: value for key, value in overrides.items() if value is not None}
