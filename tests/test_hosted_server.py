@@ -3,12 +3,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fastmcp import FastMCP
 from pydantic import ValidationError
 from rich.text import Text
 from typer.testing import CliRunner
 
+from matrix_mcp import hosted_server
 from matrix_mcp.cli import app
 from matrix_mcp.hosted_auth import HostedSettings
+from tests.hosted_helpers import CALLBACK
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -68,3 +71,99 @@ def test_missing_signing_key_has_no_default(tmp_path: Path) -> None:
                 "allowed_client_redirect_uris": ["https://client.example.com/callback"],
             }
         )
+
+
+def test_static_clients_from_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "MATRIX_MCP_HOSTED_STATIC_CLIENTS",
+        '{"desktop-client": ["https://client.example.com/callback", "http://127.0.0.1:8765/"]}',
+    )
+    settings = HostedSettings(
+        public_base_url="https://mcp.example.com",
+        homeserver="https://matrix.example.com",
+        state_directory=tmp_path,
+        secret_key="a-stable-test-key-with-at-least-32-characters",
+    )
+    assert settings.static_clients == {"desktop-client": [CALLBACK, "http://127.0.0.1:8765/"]}
+
+
+@pytest.mark.parametrize(
+    "clients",
+    [
+        {"": [CALLBACK]},
+        {"has spaces": [CALLBACK]},
+        {"https://client.example.com": [CALLBACK]},
+        {"../client": [CALLBACK]},
+        {"client": []},
+        {"client": ["http://client.example.com/callback"]},
+        {"client": ["https://*.example.com/callback"]},
+        {"client": [f"{CALLBACK}?query=value"]},
+        {"client": [f"{CALLBACK}#fragment"]},
+        {"client": ["https://user:password@client.example.com/callback"]},
+    ],
+)
+def test_invalid_static_clients_are_rejected(tmp_path: Path, clients: dict[str, list[str]]) -> None:
+    with pytest.raises(ValidationError) as error:
+        HostedSettings(
+            public_base_url="https://mcp.example.com",
+            homeserver="https://matrix.example.com",
+            state_directory=tmp_path,
+            secret_key="a-stable-test-key-with-at-least-32-characters",
+            allowed_client_redirect_uris=[CALLBACK],
+            static_clients=clients,
+        )
+    assert error.value.errors()[0]["type"] == "value_error"
+
+
+@pytest.mark.parametrize(
+    "entry", ["missing-separator", "bad id=https://client.example.com/callback"]
+)
+def test_cli_rejects_invalid_static_clients(entry: str) -> None:
+    result = CliRunner().invoke(app, ["serve", "--transport", "http", "--static-client", entry])
+    assert result.exit_code == 2
+    assert "No such option" not in result.output
+
+
+def test_cli_static_clients_override_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "MATRIX_MCP_HOSTED_SECRET_KEY", "a-stable-test-key-with-at-least-32-characters"
+    )
+    monkeypatch.setenv(
+        "MATRIX_MCP_HOSTED_STATIC_CLIENTS", '{"env-client": ["https://env.example.com/"]}'
+    )
+    received: list[HostedSettings] = []
+    create = hosted_server.create_hosted_server
+
+    def capture(settings: HostedSettings) -> FastMCP:
+        received.append(settings)
+        return create(settings)
+
+    monkeypatch.setattr(hosted_server, "create_hosted_server", capture)
+    monkeypatch.setattr(FastMCP, "run", lambda *_args, **_kwargs: None)
+    result = CliRunner().invoke(
+        app,
+        [
+            "serve",
+            "--transport",
+            "http",
+            "--public-base-url",
+            "https://mcp.example.com",
+            "--homeserver",
+            "https://matrix.example.com",
+            "--state-directory",
+            str(tmp_path),
+            "--static-client",
+            f"desktop-client={CALLBACK}",
+            "--static-client",
+            "desktop-client=http://127.0.0.1:8765/callback",
+            "--static-client",
+            "other-client=https://other.example.com/callback",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert received[0].static_clients == {
+        "desktop-client": [CALLBACK, "http://127.0.0.1:8765/callback"],
+        "other-client": ["https://other.example.com/callback"],
+    }

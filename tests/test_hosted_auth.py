@@ -140,6 +140,78 @@ async def test_discovery_and_redirect_registration(browser: OAuthBrowser) -> Non
         assert response.status_code == 400
 
 
+async def test_static_clients_disable_registration_without_writing_state(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+) -> None:
+    configured = settings.model_copy(update={"static_clients": {"desktop-client": [CALLBACK]}})
+    async with browser_session(configured, matrix[0]) as browser:
+        before = {
+            path: path.read_bytes()
+            for path in settings.state_directory.rglob("*")
+            if path.is_file()
+        }
+        response = await browser.client.post("/register", json={"redirect_uris": [CALLBACK]})
+        assert response.status_code == 404
+        metadata = await browser.client.get("/.well-known/oauth-authorization-server")
+        assert "registration_endpoint" not in metadata.json()
+        after = {
+            path: path.read_bytes()
+            for path in settings.state_directory.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+
+
+async def test_static_client_login_refresh_and_revocation_after_restart(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+) -> None:
+    configured = settings.model_copy(update={"static_clients": {"desktop-client": [CALLBACK]}})
+    async with browser_session(configured, matrix[0]) as browser:
+        tokens = await browser.login("desktop-client")
+        await browser.call(tokens["access_token"], "matrix_whoami", {})
+    async with browser_session(configured, matrix[0]) as browser:
+        refreshed = await browser.refresh("desktop-client", tokens["refresh_token"])
+        assert refreshed.status_code == 200, refreshed.text
+        renewed = refreshed.json()
+        await browser.call(renewed["access_token"], "matrix_whoami", {})
+        await browser.revoke("desktop-client", renewed["refresh_token"])
+        revoked = await browser.rpc(renewed["access_token"], "tools/list", {})
+        assert revoked.status_code == 401
+
+
+async def test_static_client_callbacks_are_exact_and_authoritative_on_restart(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+) -> None:
+    other = "https://other.example.com/callback"
+    configured = settings.model_copy(
+        update={"static_clients": {"desktop-client": [CALLBACK], "other-client": [other]}}
+    )
+    async with browser_session(configured, matrix[0]) as browser:
+        assert (await browser.authorize("desktop-client")).status_code == 302
+        for redirect in [other, f"{CALLBACK}/", f"{CALLBACK}?query=value"]:
+            rejected = await browser.authorize("desktop-client", redirect)
+            assert rejected.status_code == 400
+            assert "location" not in rejected.headers
+    changed = configured.model_copy(update={"static_clients": {"desktop-client": [other]}})
+    async with browser_session(changed, matrix[0]) as browser:
+        assert (await browser.authorize("desktop-client")).status_code == 400
+        assert (await browser.authorize("desktop-client", other)).status_code == 302
+        assert (await browser.authorize("other-client", other)).status_code == 400
+
+
+async def test_earlier_dynamic_clients_work_with_static_clients(
+    settings: HostedSettings, matrix: tuple[FakeMatrix, str]
+) -> None:
+    async with browser_session(settings, matrix[0]) as browser:
+        client_id = await browser.register()
+        tokens = await browser.login(client_id)
+    configured = settings.model_copy(update={"static_clients": {"desktop-client": [CALLBACK]}})
+    async with browser_session(configured, matrix[0]) as browser:
+        assert (await browser.client.post("/register", json={})).status_code == 404
+        assert (await browser.refresh(client_id, tokens["refresh_token"])).status_code == 200
+        await browser.login(client_id)
+
+
 async def test_registration_preserves_trailing_slash_in_callback(
     settings: HostedSettings,
     matrix: tuple[FakeMatrix, str],

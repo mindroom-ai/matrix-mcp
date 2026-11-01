@@ -72,6 +72,7 @@ Every setting also supports a `MATRIX_MCP_HOSTED_` environment variable:
 | `STATE_DIRECTORY` | Persistent directory for encrypted OAuth state |
 | `SECRET_KEY` | Required stable signing and encryption secret |
 | `ALLOWED_CLIENT_REDIRECT_URIS` | JSON array of exact allowed callback URIs |
+| `STATIC_CLIENTS` | JSON object mapping pre-registered client IDs to arrays of exact callback URIs |
 
 For example, `MATRIX_MCP_HOSTED_ALLOWED_CLIENT_REDIRECT_URIS` may contain `["https://client.example.com/oauth/callback"]`.
 CLI values override environment values.
@@ -91,6 +92,45 @@ Keep the state directory on a persistent local volume, accessible only to the se
 
 Back up encrypted state and the secret securely together.
 Stop the server before restoring state.
+
+## Pre-registered clients
+
+Use pre-registered clients for any public deployment.
+Dynamic registration is anonymous: callers can persist client records even when callbacks are restricted.
+Those records have no expiry and can fill the state volume.
+Configuring at least one static client disables `/register` (404) and removes `registration_endpoint` from authorization server metadata.
+
+Choose a stable client ID and configure it in both the server and the MCP client:
+
+```sh
+matrix-mcp serve --transport http \
+  --public-base-url https://mcp.example.com \
+  --homeserver https://matrix.example.com \
+  --state-directory ./matrix-mcp-state \
+  --static-client desktop-client=https://client.example.com/oauth/callback
+```
+
+Repeat `--static-client` for additional clients or callbacks for the same client ID.
+Client IDs may contain only ASCII letters, digits, underscores, and hyphens, and must not be empty.
+Alternatively, set `MATRIX_MCP_HOSTED_STATIC_CLIENTS` to a JSON object:
+
+```json
+{"desktop-client": ["https://client.example.com/oauth/callback", "http://127.0.0.1:8765/callback"]}
+```
+
+CLI static clients replace the entire environment mapping.
+Static clients are public PKCE clients with no client secret, the `authorization_code` and `refresh_token` grants, and the `matrix` scope.
+Each client can use only its own exact callbacks; wildcards, query strings, fragments, and credentials are rejected.
+Callbacks require HTTPS except for loopback development.
+
+Static callbacks automatically join the allowed callbacks, so `--allowed-client-redirect-uri` is optional with static clients.
+Keep any extra allowed callbacks needed by earlier dynamically registered clients; those clients and their stored sessions remain usable.
+Configuration takes precedence over a stored registration with the same ID on every start.
+Static client records are never persisted: changing or removing them takes effect at restart without altering earlier stored registrations.
+Removing a static client prevents it from authorizing or renewing sessions; already issued access tokens remain valid until expiry or revocation.
+
+Without static clients, dynamic registration remains enabled and requires `--allowed-client-redirect-uri` or its environment setting.
+Clients that require dynamic registration cannot create a new registration while static clients are configured.
 
 ## Container
 
@@ -134,7 +174,7 @@ On first publication, a package administrator must make the GHCR package public 
 
 Use `https://mcp.example.com/mcp` as the remote MCP URL.
 Authorization and protected-resource discovery advertise the OAuth endpoints and `matrix` scope.
-The client registers its callback, opens the consent screen, then redirects to Matrix SSO.
+The client uses its configured static ID or dynamically registers its callback, opens the consent screen, then redirects to Matrix SSO.
 The browser returns to `https://mcp.example.com/auth/callback` with a single-use Matrix `loginToken`; that token is exchanged only by the server.
 
 !!! warning "Keep login tokens out of logs"

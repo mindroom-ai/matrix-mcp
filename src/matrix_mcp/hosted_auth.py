@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path  # noqa: TC003 - Pydantic resolves settings annotations at runtime.
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, Self, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -23,8 +24,8 @@ from mcp.server.auth.provider import AccessToken as SDKAccessToken
 from mcp.server.auth.provider import RefreshToken, RegistrationError
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.shared.auth import OAuthClientInformationFull
-from pydantic import AnyHttpUrl, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AnyHttpUrl, AnyUrl, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -71,7 +72,8 @@ class HostedSettings(BaseSettings):
     api_base_url: str | None = None
     state_directory: Path
     secret_key: str = Field(min_length=_MIN_KEY_LENGTH, repr=False, exclude=True)
-    allowed_client_redirect_uris: list[str] = Field(min_length=1)
+    allowed_client_redirect_uris: list[str] = Field(default_factory=list)
+    static_clients: Annotated[dict[str, list[str]], NoDecode] = Field(default_factory=dict)
 
     @field_validator("public_base_url", "homeserver")
     @classmethod
@@ -103,6 +105,46 @@ class HostedSettings(BaseSettings):
     @classmethod
     def validate_callbacks(cls, values: list[str]) -> list[str]:
         return [_validated_url(value) for value in values]
+
+    @field_validator("static_clients", mode="before")
+    @classmethod
+    def parse_static_clients(cls, value: Any) -> Any:
+        # Decode after settings sources are combined so CLI mappings replace,
+        # rather than deep-merge with, the environment's JSON object.
+        return json.loads(value) if isinstance(value, str) else value
+
+    @field_validator("static_clients")
+    @classmethod
+    def validate_static_clients(cls, clients: dict[str, list[str]]) -> dict[str, list[str]]:
+        for client_id, redirects in clients.items():
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", client_id):
+                msg = "Static client IDs must contain only letters, digits, underscores, or hyphens"
+                raise ValueError(msg)
+            if not redirects:
+                msg = "Static clients require at least one callback URI"
+                raise ValueError(msg)
+        return {
+            client_id: [_validated_url(uri) for uri in redirects]
+            for client_id, redirects in clients.items()
+        }
+
+    @model_validator(mode="after")
+    def require_callbacks(self) -> Self:
+        if not self.client_redirect_uris:
+            msg = (
+                "Configure allowed_client_redirect_uris or static_clients with exact callback URIs"
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def client_redirect_uris(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                self.allowed_client_redirect_uris
+                + [uri for redirects in self.static_clients.values() for uri in redirects]
+            )
+        )
 
     @property
     def matrix_api_url(self) -> str:
@@ -337,7 +379,7 @@ class MatrixOAuthProvider(OAuthProxy):
             upstream_revocation_endpoint=f"{settings.matrix_api_url}/_matrix/client/v3/logout",
             upstream_client_id="matrix-mcp",
             token_verifier=MatrixWhoamiVerifier(settings.matrix_api_url),
-            allowed_client_redirect_uris=settings.allowed_client_redirect_uris,
+            allowed_client_redirect_uris=settings.client_redirect_uris,
             valid_scopes=["matrix"],
             forward_pkce=False,
             forward_resource=False,
@@ -349,6 +391,8 @@ class MatrixOAuthProvider(OAuthProxy):
             enable_cimd=False,
             require_authorization_consent=True,
         )
+        if settings.static_clients and self.client_registration_options is not None:
+            self.client_registration_options.enabled = False
 
     def _open_state(self) -> FileLock:
         lock = FileLock(self.settings.state_directory / "server.lock")
@@ -412,7 +456,7 @@ class MatrixOAuthProvider(OAuthProxy):
         return routes
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        allowed = self.settings.allowed_client_redirect_uris
+        allowed = self.settings.client_redirect_uris
         if not client_info.redirect_uris or any(
             str(uri) not in allowed for uri in client_info.redirect_uris
         ):
@@ -424,6 +468,17 @@ class MatrixOAuthProvider(OAuthProxy):
         await super().register_client(client_info)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        if client_id in self.settings.static_clients:
+            # Configuration wins over stored registrations without writing a client
+            # record. Removed static clients therefore leave no stale registration.
+            return OAuthClientInformationFull(
+                client_id=client_id,
+                redirect_uris=[AnyUrl(uri) for uri in self.settings.static_clients[client_id]],
+                token_endpoint_auth_method="none",  # noqa: S106 - Public OAuth client method.
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                scope="matrix",
+            )
         client = await super().get_client(client_id)
         if client is None:
             return None
@@ -434,7 +489,7 @@ class MatrixOAuthProvider(OAuthProxy):
         registered.redirect_uris = [
             uri
             for uri in registered.redirect_uris or []
-            if str(uri) in self.settings.allowed_client_redirect_uris
+            if str(uri) in self.settings.client_redirect_uris
         ]
         return registered
 
