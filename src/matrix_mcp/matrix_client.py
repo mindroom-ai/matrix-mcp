@@ -44,6 +44,7 @@ from matrix_mcp.matrix_events import (
     normalize_timeline_event,
     trusted_replacements,
 )
+from matrix_mcp.matrix_formatting import build_text_message_content
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_media import MatrixMedia
 from matrix_mcp.matrix_moderation import MatrixModeration
@@ -550,18 +551,16 @@ class NioMatrixDriver:
                 if re.fullmatch(r"@[^\s:]+:[^\s]+", user_id) is None:
                     msg = f"Invalid Matrix user ID: {user_id}"
                     raise ValueError(msg)
-        content: dict[str, object] = {
-            "body": body,
-            "msgtype": "m.text",
-        }
-        if mentions is not None:
-            content["m.mentions"] = {"user_ids": mentions}
-        if thread_id:
-            content["m.relates_to"] = {
+        relates_to = (
+            {
                 "event_id": thread_id,
                 "is_falling_back": False,
                 "rel_type": "m.thread",
             }
+            if thread_id
+            else None
+        )
+        content = build_text_message_content(body, mentions=mentions, relates_to=relates_to)
         return await self.events.send(room_id, "m.room.message", content)
 
     async def send_file(

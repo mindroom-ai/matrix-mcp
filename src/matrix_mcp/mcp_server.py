@@ -202,7 +202,8 @@ class MatrixMCPTools:
     ) -> dict[str, str]:
         """Send text or a local file, with optional thread and explicit text mentions.
 
-        Text and files sent to end-to-end encrypted rooms are encrypted, including the file.
+        Markdown text is rendered to Matrix HTML. Text and files sent to end-to-end
+        encrypted rooms are encrypted, including the file.
         """
         if file_path:
             if mentions is not None:

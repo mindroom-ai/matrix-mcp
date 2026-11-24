@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
+
+from markdown_it import MarkdownIt
+from markdown_it.common.utils import escapeHtml
+from markdown_it.token import Token
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from markdown_it.renderer import RendererHTML
+    from markdown_it.rules_inline import StateInline
+    from markdown_it.utils import EnvType, OptionsDict
+
+CUSTOM_HTML_FORMAT = "org.matrix.custom.html"
+
+# 45 KiB of ASCII-escaped JSON expands to ~60 KiB of base64 Megolm ciphertext,
+# leaving ~5.5 KiB headroom for Megolm and event envelope fields under Matrix's 65,536-byte limit.
+_MAX_FORMATTED_CONTENT_BYTES = 45_000
+_PLAIN_BLOCK_TYPES = frozenset({"paragraph_open", "inline", "paragraph_close"})
+_MATRIX_TO_SAFE = "@:._-"
+_ALLOWED_LINK_SCHEMES = ("http://", "https://", "ftp://", "mailto:", "magnet:", "matrix:", "mxc://")
+_LEADING_ASCII_WS_OR_CTRL = re.compile(r"^[\x00-\x20]+")
+_MULTI_BLANK_LINES = re.compile(r"\n{2,}")
+
+
+class _MatrixMarkdownIt(MarkdownIt):
+    def validateLink(self, url: str) -> bool:  # noqa: N802 - Overrides markdown-it method.
+        return _normalize_url_prefix(url).startswith(_ALLOWED_LINK_SCHEMES)
+
+
+def _normalize_url_prefix(url: str) -> str:
+    return _LEADING_ASCII_WS_OR_CTRL.sub("", url).lower()
+
+
+def _image_alt_text(tokens: Sequence[Token] | None) -> str:
+    parts: list[str] = []
+    for token in tokens or ():
+        if token.type in {"text", "text_special", "code_inline"}:
+            parts.append(token.content)
+        elif token.type in {"softbreak", "hardbreak"}:
+            parts.append("\n")
+        elif token.type == "image":
+            parts.append(_image_alt_text(token.children))
+    return "".join(parts)
+
+
+def _render_matrix_image(
+    renderer: RendererHTML,
+    tokens: Sequence[Token],
+    idx: int,
+    options: OptionsDict,
+    env: EnvType,
+) -> str:
+    token = tokens[idx]
+    raw_src = token.attrGet("src")
+    src = raw_src if isinstance(raw_src, str) else ""
+    scheme_src = _normalize_url_prefix(src)
+    alt = _image_alt_text(token.children)
+    if scheme_src.startswith("mxc://"):
+        token.attrSet("alt", alt)
+        return renderer.renderToken(tokens, idx, options, env)
+    label = escapeHtml(alt or src)
+    if scheme_src.startswith(("http://", "https://")) and not token.meta.get("inside_link"):
+        return f'<a href="{escapeHtml(src)}">{label}</a>'
+    return label
+
+
+def _collect_suppressed_run(
+    tokens: Sequence[Token],
+    run: Sequence[tuple[int, int, int]],
+    pattern: re.Pattern[str],
+    suppressed: set[int],
+) -> None:
+    joined = "".join(tokens[i].content for i, _, _ in run)
+    run_idx = 0
+    for match in pattern.finditer(joined):
+        m_start, m_end = match.span()
+        while run_idx < len(run) and run[run_idx][2] <= m_start:
+            run_idx += 1
+        scan = run_idx
+        while scan < len(run) and run[scan][1] < m_end:
+            suppressed.add(run[scan][0])
+            scan += 1
+
+
+def _suppress_mention_delimiters(state: StateInline) -> None:
+    pattern = state.env.get("mention_pattern")
+    if not isinstance(pattern, re.Pattern) or not state.delimiters:
+        return
+    suppressed: set[int] = set()
+    link_depth = 0
+    idx = 0
+    tokens = state.tokens
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token.type == "text" and link_depth == 0:
+            run: list[tuple[int, int, int]] = []
+            offset = 0
+            while idx < len(tokens) and tokens[idx].type == "text":
+                end = offset + len(tokens[idx].content)
+                run.append((idx, offset, end))
+                offset = end
+                idx += 1
+            _collect_suppressed_run(tokens, run, pattern, suppressed)
+            continue
+        if token.type == "link_open":
+            link_depth += 1
+        elif token.type == "link_close":
+            link_depth = max(0, link_depth - 1)
+        idx += 1
+    for delimiter in state.delimiters:
+        if delimiter.token in suppressed:
+            delimiter.open = False
+            delimiter.close = False
+
+
+def _build_markdown_parser() -> MarkdownIt:
+    md = _MatrixMarkdownIt("commonmark", {"html": False, "breaks": True, "linkify": True}).enable(
+        ["table", "strikethrough", "linkify"]
+    )
+    if md.linkify is not None:
+        md.linkify.set({"fuzzy_link": False, "fuzzy_email": False, "fuzzy_ip": False})
+    md.inline.ruler2.before(
+        "balance_pairs", "matrix_mention_delimiters", _suppress_mention_delimiters
+    )
+    md.add_render_rule("image", _render_matrix_image)
+    return md
+
+
+_MARKDOWN = _build_markdown_parser()
+
+
+def render_markdown_html(body: str, *, mentions: Sequence[str] | None = None) -> str | None:
+    """Render Markdown to Matrix HTML, returning None for pure plain text."""
+    if len(body.encode("utf-8")) > _MAX_FORMATTED_CONTENT_BYTES:
+        return None
+    pattern = _compile_mention_pattern(mentions)
+    env: dict[str, Any] = {"mention_pattern": pattern} if pattern is not None else {}
+    tokens = _MARKDOWN.parse(body, env)
+    if not tokens:
+        return None
+    _rewrite_inline_tokens(tokens, pattern)
+    if _is_plain_text(tokens, body):
+        return None
+    html = _MARKDOWN.renderer.render(tokens, _MARKDOWN.options, env).strip()
+    return html or None
+
+
+def build_text_message_content(
+    body: str,
+    *,
+    msgtype: str = "m.text",
+    mentions: Sequence[str] | None = None,
+    relates_to: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an m.room.message payload with optional Markdown HTML and mentions."""
+    content: dict[str, Any] = {"msgtype": msgtype, "body": body}
+    formatted_body = render_markdown_html(body, mentions=mentions)
+    if formatted_body is not None:
+        content["format"] = CUSTOM_HTML_FORMAT
+        content["formatted_body"] = formatted_body
+    if mentions is not None:
+        content["m.mentions"] = {"user_ids": list(mentions)}
+    if relates_to is not None:
+        content["m.relates_to"] = relates_to
+    if "formatted_body" in content and _encoded_json_size(content) > _MAX_FORMATTED_CONTENT_BYTES:
+        content.pop("format", None)
+        content.pop("formatted_body", None)
+    return content
+
+
+def build_edit_message_content(
+    body: str,
+    *,
+    event_id: str,
+    msgtype: str = "m.text",
+) -> dict[str, Any]:
+    """Build an m.replace edit payload, dropping HTML if it exceeds the Matrix size budget."""
+    new_content = build_text_message_content(body, msgtype=msgtype)
+    replacement: dict[str, Any] = {
+        "msgtype": msgtype,
+        "body": f"* {body}",
+        "m.new_content": new_content,
+        "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
+    }
+    if "formatted_body" in new_content:
+        replacement["format"] = CUSTOM_HTML_FORMAT
+        replacement["formatted_body"] = f"* {new_content['formatted_body']}"
+        if _encoded_json_size(replacement) > _MAX_FORMATTED_CONTENT_BYTES:
+            for payload in (replacement, new_content):
+                payload.pop("format", None)
+                payload.pop("formatted_body", None)
+    return replacement
+
+
+def _encoded_json_size(content: Mapping[str, Any]) -> int:
+    return len(json.dumps(content, ensure_ascii=True, separators=(",", ":")).encode("ascii"))
+
+
+def _compile_mention_pattern(mentions: Sequence[str] | None) -> re.Pattern[str] | None:
+    unique = sorted(
+        {mention for mention in mentions or () if mention},
+        key=lambda user_id: (-len(user_id), user_id),
+    )
+    if not unique:
+        return None
+    alternation = "|".join(re.escape(user_id) for user_id in unique)
+    return re.compile(
+        rf"(?<![A-Za-z0-9.=/+-])(?<![A-Za-z0-9]_)"
+        rf"({alternation})"
+        rf"(?![A-Za-z0-9-]|(?:\.[A-Za-z0-9-])|(?::[0-9]))"
+    )
+
+
+def _rewrite_inline_tokens(tokens: Sequence[Token], pattern: re.Pattern[str] | None) -> None:
+    for token in tokens:
+        if token.type == "inline" and token.children:
+            token.children = _rewrite_inline_children(token.children, pattern)
+
+
+def _append_unwrapped_mxc_href(updated: list[Token], start_idx: int, href: str) -> None:
+    label_text = _image_alt_text(updated[start_idx:]).strip()
+    if not label_text:
+        updated.append(Token("text", "", 0, content=href))
+    elif label_text != href:
+        updated.append(Token("text", "", 0, content=f" ({href})"))
+
+
+def _rewrite_inline_children(
+    children: Sequence[Token], pattern: re.Pattern[str] | None
+) -> list[Token]:
+    unwrap_stack: list[tuple[bool, str, int]] = []
+    link_depth = 0
+    updated: list[Token] = []
+    for child in children:
+        if child.type == "link_open":
+            raw_href = child.attrGet("href")
+            href = raw_href if isinstance(raw_href, str) else ""
+            is_mxc = bool(href) and _normalize_url_prefix(href).startswith("mxc://")
+            unwrap_stack.append((is_mxc, href, len(updated)))
+            if not is_mxc:
+                link_depth += 1
+                updated.append(child)
+        elif child.type == "link_close" and unwrap_stack:
+            is_mxc, href, start_idx = unwrap_stack.pop()
+            if is_mxc:
+                _append_unwrapped_mxc_href(updated, start_idx, href)
+            else:
+                link_depth = max(0, link_depth - 1)
+                updated.append(child)
+        elif child.type == "image":
+            if link_depth > 0:
+                child.meta["inside_link"] = True
+            updated.append(child)
+        elif child.type == "text" and pattern is not None and link_depth == 0:
+            updated.extend(_linkify_text_token(child, pattern))
+        else:
+            updated.append(child)
+    return updated
+
+
+def _linkify_text_token(token: Token, pattern: re.Pattern[str]) -> list[Token]:
+    text = token.content
+    matches = list(pattern.finditer(text)) if text else []
+    if not matches:
+        return [token]
+    result: list[Token] = []
+    pos = 0
+    for match in matches:
+        start, end = match.span()
+        if start > pos:
+            result.append(Token("text", "", 0, content=text[pos:start]))
+        user_id = match.group(1)
+        link_open = Token("link_open", "a", 1)
+        link_open.attrSet("href", f"https://matrix.to/#/{quote(user_id, safe=_MATRIX_TO_SAFE)}")
+        result.extend(
+            [link_open, Token("text", "", 0, content=user_id), Token("link_close", "a", -1)]
+        )
+        pos = end
+    if pos < len(text):
+        result.append(Token("text", "", 0, content=text[pos:]))
+    return result
+
+
+def _is_plain_text(tokens: Sequence[Token], body: str) -> bool:
+    paragraph_texts: list[str] = []
+    for token in tokens:
+        if token.type not in _PLAIN_BLOCK_TYPES:
+            return False
+        if token.type != "inline":
+            continue
+        parts: list[str] = []
+        for child in token.children or ():
+            if child.type == "text":
+                parts.append(child.content)
+            elif child.type == "softbreak":
+                parts.append("\n")
+            else:
+                return False
+        paragraph_texts.append("".join(parts))
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").strip(" \t\n")
+    lines = [line.strip(" \t") for line in normalized.split("\n")]
+    return "\n\n".join(paragraph_texts) == _MULTI_BLANK_LINES.sub("\n\n", "\n".join(lines))
