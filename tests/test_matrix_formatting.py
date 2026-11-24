@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 import pytest
+import vodozemac
 
 from matrix_mcp.matrix_formatting import (
     CUSTOM_HTML_FORMAT,
@@ -72,7 +75,10 @@ def test_plain_text_returns_none(body: str) -> None:
         ),
         (
             "https://en.wikipedia.org/wiki/_foo_",
-            '<p><a href="https://en.wikipedia.org/wiki/_foo_">https://en.wikipedia.org/wiki/_foo_</a></p>',
+            (
+                '<p><a href="https://en.wikipedia.org/wiki/_foo_">'
+                "https://en.wikipedia.org/wiki/_foo_</a></p>"
+            ),
         ),
     ],
 )
@@ -116,8 +122,16 @@ def test_markdown_constructs_render_to_html(body: str, expected: str) -> None:
             '<p><img src="mxc://example.com/abc" alt="photo" /></p>',
         ),
         (
+            "![Use `curl` here](mxc://example.org/plot)",
+            '<p><img src="mxc://example.org/plot" alt="Use curl here" /></p>',
+        ),
+        (
             "![plot](https://example.com/plot.png)",
             '<p><a href="https://example.com/plot.png">plot</a></p>',
+        ),
+        (
+            "![Use `curl` here](https://example.org/plot.png)",
+            '<p><a href="https://example.org/plot.png">Use curl here</a></p>',
         ),
         (
             "![](https://example.com/plot.png)",
@@ -126,6 +140,10 @@ def test_markdown_constructs_render_to_html(body: str, expected: str) -> None:
         (
             "[![badge](https://example.com/badge.svg)](https://example.com/build)",
             '<p><a href="https://example.com/build">badge</a></p>',
+        ),
+        (
+            "[![badge](https://example.com/badge.svg)](mxc://example.com/abc)",
+            '<p><a href="https://example.com/badge.svg">badge</a></p>',
         ),
         (
             "![pic](ftp://example.com/pic.png)",
@@ -191,6 +209,10 @@ def test_disallowed_link_and_image_schemes_stay_plain_text(body: str) -> None:
             "(@alice:example.com)",
             '<p>(<a href="https://matrix.to/#/@alice:example.com">@alice:example.com</a>)</p>',
         ),
+        (
+            "_@alice:example.com_",
+            '<p><em><a href="https://matrix.to/#/@alice:example.com">@alice:example.com</a></em></p>',
+        ),
     ],
 )
 def test_mention_linkification_and_punctuation(body: str, expected: str) -> None:
@@ -201,6 +223,7 @@ def test_mention_linkification_and_punctuation(body: str, expected: str) -> None
     "body",
     [
         "email@alice:example.com",
+        "foo_@alice:example.com",
         "@alice:example.com.evil",
         "@alice:example.com:8448",
         "@alice:example.com2",
@@ -252,6 +275,9 @@ def test_mentions_with_underscores_are_preserved() -> None:
         '<p><strong><a href="https://matrix.to/#/@_ops_:example.org">'
         "@_ops_:example.org</a></strong></p>"
     )
+    assert render_markdown_html("cc _@_ops_:example.org_", mentions=mentions) == (
+        '<p>cc <em><a href="https://matrix.to/#/@_ops_:example.org">@_ops_:example.org</a></em></p>'
+    )
     assert render_markdown_html("Hi @_ops_:example.org and _italic_", mentions=mentions) == (
         '<p>Hi <a href="https://matrix.to/#/@_ops_:example.org">@_ops_:example.org</a>'
         " and <em>italic</em></p>"
@@ -290,6 +316,23 @@ def test_security_escapes_raw_html_and_rejects_javascript_links() -> None:
     assert "href=" not in js_link_html
 
 
+def _megolm_encrypted_event_bytes(content: dict[str, object]) -> int:
+    session = vodozemac.GroupSession()
+    inner = json.dumps(
+        {"type": "m.room.message", "room_id": "!room:example.com", "content": content},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    encrypted_content = {
+        "algorithm": "m.megolm.v1.aes-sha2",
+        "ciphertext": session.encrypt(inner).to_base64(),
+        "device_id": "TESTDEVICE",
+        "sender_key": "k" * 43,
+        "session_id": session.session_id,
+    }
+    return len(json.dumps(encrypted_content, separators=(",", ":")).encode("ascii"))
+
+
 def test_build_text_message_content_handles_plain_formatted_and_size_limit() -> None:
     plain = build_text_message_content("hello", mentions=[])
     assert plain == {
@@ -315,7 +358,7 @@ def test_build_text_message_content_handles_plain_formatted_and_size_limit() -> 
         "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
     }
 
-    oversized_body = "**a** " * 6_000
+    oversized_body = "**" + ("x" * 25_000) + "**"
     oversized = build_text_message_content(
         oversized_body,
         mentions=["@alice:example.com"],
@@ -326,11 +369,26 @@ def test_build_text_message_content_handles_plain_formatted_and_size_limit() -> 
     assert oversized["body"] == oversized_body
     assert oversized["m.mentions"] == {"user_ids": ["@alice:example.com"]}
     assert oversized["m.relates_to"] == {"rel_type": "m.thread", "event_id": "$root"}
+    assert _megolm_encrypted_event_bytes(oversized) < 65_536
+
+    non_ascii_body = "**bold** " + ("é" * 8_000)
+    non_ascii = build_text_message_content(non_ascii_body)
+    assert "format" not in non_ascii
+    assert "formatted_body" not in non_ascii
+    assert _megolm_encrypted_event_bytes(non_ascii) < 65_536
+
+    # 4,000 accented characters fit UTF-8 with HTML (~16 KiB) but exceed 45 KiB when ASCII-escaped.
+    ascii_escaped_overflow = build_text_message_content("**bold** " + ("é" * 4_000))
+    assert "format" not in ascii_escaped_overflow
+    assert "formatted_body" not in ascii_escaped_overflow
+    assert _megolm_encrypted_event_bytes(ascii_escaped_overflow) < 65_536
 
 
 def test_build_edit_message_content_drops_html_from_both_payloads_when_oversized() -> None:
-    body = "**" + ("a" * 18_000) + "**"
-    assert "formatted_body" in build_text_message_content(body)
+    body = "**" + ("x" * 12_500) + "**"
+    single = build_text_message_content(body)
+    assert "formatted_body" in single
+    assert _megolm_encrypted_event_bytes(single) < 65_536
 
     edit = build_edit_message_content(body, event_id="$target", msgtype="m.notice")
     assert edit == {
@@ -339,3 +397,4 @@ def test_build_edit_message_content_drops_html_from_both_payloads_when_oversized
         "m.new_content": {"msgtype": "m.notice", "body": body},
         "m.relates_to": {"rel_type": "m.replace", "event_id": "$target"},
     }
+    assert _megolm_encrypted_event_bytes(edit) < 65_536

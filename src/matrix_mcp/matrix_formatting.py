@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 CUSTOM_HTML_FORMAT = "org.matrix.custom.html"
 
-_MAX_FORMATTED_CONTENT_BYTES = 56_000
+# 45 KiB of ASCII-escaped JSON expands to ~60 KiB of base64 Megolm ciphertext,
+# leaving ~5.5 KiB headroom for Megolm and event envelope fields under Matrix's 65,536-byte limit.
+_MAX_FORMATTED_CONTENT_BYTES = 45_000
 _PLAIN_BLOCK_TYPES = frozenset({"paragraph_open", "inline", "paragraph_close"})
 _MATRIX_TO_SAFE = "@:._-"
 _ALLOWED_LINK_SCHEMES = ("http://", "https://", "ftp://", "mailto:", "magnet:", "matrix:", "mxc://")
@@ -35,6 +37,18 @@ def _normalize_url_prefix(url: str) -> str:
     return _LEADING_ASCII_WS_OR_CTRL.sub("", url).lower()
 
 
+def _image_alt_text(tokens: Sequence[Token] | None) -> str:
+    parts: list[str] = []
+    for token in tokens or ():
+        if token.type in {"text", "code_inline"}:
+            parts.append(token.content)
+        elif token.type in {"softbreak", "hardbreak"}:
+            parts.append("\n")
+        elif token.type == "image":
+            parts.append(_image_alt_text(token.children))
+    return "".join(parts)
+
+
 def _render_matrix_image(
     renderer: RendererHTML,
     tokens: Sequence[Token],
@@ -46,18 +60,12 @@ def _render_matrix_image(
     raw_src = token.attrGet("src")
     src = raw_src if isinstance(raw_src, str) else ""
     scheme_src = _normalize_url_prefix(src)
+    alt = _image_alt_text(token.children)
     if scheme_src.startswith("mxc://"):
-        return renderer.image(tokens, idx, options, env)
-    alt = renderer.renderInlineAsText(token.children, options, env) if token.children else ""
+        token.attrSet("alt", alt)
+        return renderer.renderToken(tokens, idx, options, env)
     label = escapeHtml(alt or src)
-    inside_link = (
-        sum(
-            1 if t.type == "link_open" else -1 if t.type == "link_close" else 0
-            for t in tokens[:idx]
-        )
-        > 0
-    )
-    if scheme_src.startswith(("http://", "https://")) and not inside_link:
+    if scheme_src.startswith(("http://", "https://")) and not token.meta.get("inside_link"):
         return f'<a href="{escapeHtml(src)}">{label}</a>'
     return label
 
@@ -174,7 +182,7 @@ def build_edit_message_content(
 
 
 def _encoded_json_size(content: Mapping[str, Any]) -> int:
-    return len(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return len(json.dumps(content, ensure_ascii=True, separators=(",", ":")).encode("ascii"))
 
 
 def _compile_mention_pattern(mentions: Sequence[str] | None) -> re.Pattern[str] | None:
@@ -186,34 +194,45 @@ def _compile_mention_pattern(mentions: Sequence[str] | None) -> re.Pattern[str] 
         return None
     alternation = "|".join(re.escape(user_id) for user_id in unique)
     return re.compile(
-        rf"(?<![A-Za-z0-9._=/+-])({alternation})(?![A-Za-z0-9-]|(?:\.[A-Za-z0-9-])|(?::[0-9]))"
+        rf"(?<![A-Za-z0-9.=/+-])(?<![A-Za-z0-9]_)"
+        rf"({alternation})"
+        rf"(?![A-Za-z0-9-]|(?:\.[A-Za-z0-9-])|(?::[0-9]))"
     )
 
 
 def _rewrite_inline_tokens(tokens: Sequence[Token], pattern: re.Pattern[str] | None) -> None:
     for token in tokens:
-        if token.type != "inline" or not token.children:
-            continue
-        unwrap_stack: list[bool] = []
-        link_depth = 0
-        updated: list[Token] = []
-        for child in token.children:
-            if child.type == "link_open":
-                href = child.attrGet("href")
-                is_mxc = isinstance(href, str) and _normalize_url_prefix(href).startswith("mxc://")
-                unwrap_stack.append(is_mxc)
-                if not is_mxc:
-                    link_depth += 1
-                    updated.append(child)
-            elif child.type == "link_close":
-                if unwrap_stack and not unwrap_stack.pop():
-                    link_depth = max(0, link_depth - 1)
-                    updated.append(child)
-            elif child.type == "text" and pattern is not None and link_depth == 0:
-                updated.extend(_linkify_text_token(child, pattern))
-            else:
+        if token.type == "inline" and token.children:
+            token.children = _rewrite_inline_children(token.children, pattern)
+
+
+def _rewrite_inline_children(
+    children: Sequence[Token], pattern: re.Pattern[str] | None
+) -> list[Token]:
+    unwrap_stack: list[bool] = []
+    link_depth = 0
+    updated: list[Token] = []
+    for child in children:
+        if child.type == "link_open":
+            href = child.attrGet("href")
+            is_mxc = isinstance(href, str) and _normalize_url_prefix(href).startswith("mxc://")
+            unwrap_stack.append(is_mxc)
+            if not is_mxc:
+                link_depth += 1
                 updated.append(child)
-        token.children = updated
+        elif child.type == "link_close":
+            if unwrap_stack and not unwrap_stack.pop():
+                link_depth = max(0, link_depth - 1)
+                updated.append(child)
+        elif child.type == "image":
+            if link_depth > 0:
+                child.meta["inside_link"] = True
+            updated.append(child)
+        elif child.type == "text" and pattern is not None and link_depth == 0:
+            updated.extend(_linkify_text_token(child, pattern))
+        else:
+            updated.append(child)
+    return updated
 
 
 def _linkify_text_token(token: Token, pattern: re.Pattern[str]) -> list[Token]:
