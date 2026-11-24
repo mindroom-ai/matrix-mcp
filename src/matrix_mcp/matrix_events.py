@@ -6,6 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from matrix_mcp.e2ee import E2EE_UNSUPPORTED, DecryptedEvent
+from matrix_mcp.matrix_formatting import CUSTOM_HTML_FORMAT, build_text_message_content
 from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, quote_transaction_id
 from matrix_mcp.matrix_media import EventAttachment
 
@@ -479,7 +480,7 @@ class MatrixEvents:
         transaction = _transaction_path(transaction_id)
         _validate_body(body)
         target = await self._fetch_event(room_id, event_id)
-        relation: dict[str, object] = {"m.in_reply_to": {"event_id": event_id}}
+        relation: dict[str, Any] = {"m.in_reply_to": {"event_id": event_id}}
         thread_id = _relationship_id(target, "m.thread")
         if thread_id is not None:
             relation.update(
@@ -492,7 +493,7 @@ class MatrixEvents:
         return await self._send(
             room_id,
             "m.room.message",
-            {"msgtype": "m.text", "body": body, "m.relates_to": relation},
+            build_text_message_content(body, relates_to=relation),
             transaction,
         )
 
@@ -549,18 +550,23 @@ class MatrixEvents:
             raise ValueError(msg)
         content = _mapping_field(target, "content", required=True)
         msgtype = content.get("msgtype")
-        if msgtype not in _EDITABLE_MSGTYPES:
+        if not isinstance(msgtype, str) or msgtype not in _EDITABLE_MSGTYPES:
             msg = "Only Matrix text, notice, or emote messages can be edited"
             raise ValueError(msg)
+        new_content = build_text_message_content(body, msgtype=msgtype)
+        replacement: dict[str, Any] = {
+            "msgtype": msgtype,
+            "body": f"* {body}",
+            "m.new_content": new_content,
+            "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
+        }
+        if "formatted_body" in new_content:
+            replacement["format"] = CUSTOM_HTML_FORMAT
+            replacement["formatted_body"] = f"* {new_content['formatted_body']}"
         return await self._send(
             room_id,
             "m.room.message",
-            {
-                "msgtype": msgtype,
-                "body": f"* {body}",
-                "m.new_content": {"msgtype": msgtype, "body": body},
-                "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
-            },
+            replacement,
             transaction,
         )
 

@@ -1247,6 +1247,54 @@ async def test_send_message_goes_through_the_encrypting_send_path(
     assert FakeNioClient.instances[0].room_send_calls == []
 
 
+async def test_send_message_renders_markdown_and_linkifies_mentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = nio_driver(monkeypatch)
+    sends = record_sends(driver, monkeypatch, encrypted=False)
+
+    event_id = await driver.send_message(
+        "!room:example.com",
+        "Hi **@alice:example.com**, see `code`",
+        thread_id="$root",
+        mentions=["@alice:example.com"],
+    )
+
+    assert event_id == "$sent1"
+    assert sends == [
+        (
+            "!room:example.com",
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": "Hi **@alice:example.com**, see `code`",
+                "format": "org.matrix.custom.html",
+                "formatted_body": (
+                    '<p>Hi <strong><a href="https://matrix.to/#/@alice:example.com">'
+                    "@alice:example.com</a></strong>, see <code>code</code></p>"
+                ),
+                "m.mentions": {"user_ids": ["@alice:example.com"]},
+                "m.relates_to": {
+                    "event_id": "$root",
+                    "is_falling_back": False,
+                    "rel_type": "m.thread",
+                },
+            },
+        )
+    ]
+
+    await driver.send_message("!room:example.com", "plain text", mentions=[])
+    assert sends[-1] == (
+        "!room:example.com",
+        "m.room.message",
+        {
+            "msgtype": "m.text",
+            "body": "plain text",
+            "m.mentions": {"user_ids": []},
+        },
+    )
+
+
 async def test_send_file_encrypts_attachment_for_encrypted_rooms(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

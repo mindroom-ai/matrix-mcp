@@ -621,6 +621,60 @@ async def test_edit_own_text_preserves_msgtype_and_uses_replacement_payload(
     }
 
 
+async def test_reply_renders_markdown_formatted_body(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$target", message("$target"))
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.message/md-reply", {"event_id": "$reply"})
+
+    event_id = await events.reply(
+        ROOM, "$target", "**answer** with `code`", transaction_id="md-reply"
+    )
+
+    assert event_id == "$reply"
+    assert endpoint.requests[-1]["body"] == {
+        "msgtype": "m.text",
+        "body": "**answer** with `code`",
+        "format": "org.matrix.custom.html",
+        "formatted_body": "<p><strong>answer</strong> with <code>code</code></p>",
+        "m.relates_to": {"m.in_reply_to": {"event_id": "$target"}},
+    }
+
+
+async def test_edit_renders_markdown_formatted_body_and_omits_for_plain_text(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$target", message("$target", msgtype="m.text"))
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.message/md-edit", {"event_id": "$edit1"})
+
+    event_id = await events.edit(ROOM, "$target", "**updated**", transaction_id="md-edit")
+
+    assert event_id == "$edit1"
+    assert endpoint.requests[-1]["body"] == {
+        "msgtype": "m.text",
+        "body": "* **updated**",
+        "format": "org.matrix.custom.html",
+        "formatted_body": "* <p><strong>updated</strong></p>",
+        "m.new_content": {
+            "msgtype": "m.text",
+            "body": "**updated**",
+            "format": "org.matrix.custom.html",
+            "formatted_body": "<p><strong>updated</strong></p>",
+        },
+        "m.relates_to": {"rel_type": "m.replace", "event_id": "$target"},
+    }
+
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$target", message("$target", msgtype="m.text"))
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.message/plain-edit", {"event_id": "$edit2"})
+    await events.edit(ROOM, "$target", "line 1\nline 2", transaction_id="plain-edit")
+    plain_body = endpoint.requests[-1]["body"]
+    assert "format" not in plain_body
+    assert "formatted_body" not in plain_body
+    assert plain_body["m.new_content"] == {"msgtype": "m.text", "body": "line 1\nline 2"}
+
+
 async def test_redact_checks_sender_and_sends_reason_without_encryption_lookup(
     matrix: tuple[MatrixEvents, MatrixEndpoint],
 ) -> None:
@@ -953,6 +1007,43 @@ async def test_actions_in_encrypted_rooms_send_only_ciphertext(
     assert put["body"]["ciphertext"] == "sealed"
     assert "answer" not in str(put["body"])
     assert "fixed" not in str(put["body"])
+
+
+@pytest.mark.parametrize("action", ["reply", "edit"])
+async def test_encrypted_markdown_reply_and_edit_encrypt_formatted_body(
+    encrypted_matrix: tuple[MatrixEvents, MatrixEndpoint, FakeCrypto], action: str
+) -> None:
+    events, endpoint, crypto = encrypted_matrix
+    endpoint.respond("GET", f"{ROOM_PATH}/state/m.room.encryption", ENCRYPTION_STATE)
+    endpoint.respond(
+        "GET",
+        f"{ROOM_PATH}/event/$target",
+        crypto.seal("$target", {"msgtype": "m.text", "body": "mine"}),
+    )
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.encrypted/md-txn", {"event_id": "$sent"})
+
+    body = "**secret** `code`"
+    expected_html = "<p><strong>secret</strong> <code>code</code></p>"
+    if action == "reply":
+        event_id = await events.reply(ROOM, "$target", body, transaction_id="md-txn")
+    else:
+        event_id = await events.edit(ROOM, "$target", body, transaction_id="md-txn")
+
+    assert event_id == "$sent"
+    [(room_id, event_type, content)] = crypto.encrypted
+    assert room_id == ROOM
+    assert event_type == "m.room.message"
+    assert content["format"] == "org.matrix.custom.html"
+    if action == "reply":
+        assert content["formatted_body"] == expected_html
+    else:
+        assert content["formatted_body"] == f"* {expected_html}"
+        assert content["m.new_content"]["format"] == "org.matrix.custom.html"
+        assert content["m.new_content"]["formatted_body"] == expected_html
+    put = endpoint.requests[-1]
+    assert put["path"] == f"{ROOM_PATH}/send/m.room.encrypted/md-txn"
+    assert "secret" not in str(put["body"])
+    assert "<strong>" not in str(put["body"])
 
 
 async def test_send_encrypts_arbitrary_events_for_encrypted_rooms(
