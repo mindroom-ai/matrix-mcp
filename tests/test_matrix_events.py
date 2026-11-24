@@ -675,6 +675,23 @@ async def test_edit_renders_markdown_formatted_body_and_omits_for_plain_text(
     assert plain_body["m.new_content"] == {"msgtype": "m.text", "body": "line 1\nline 2"}
 
 
+async def test_edit_drops_formatted_body_when_replacement_exceeds_size_budget(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    body = "**" + ("a" * 18_000) + "**"
+    endpoint.respond("GET", f"{ROOM_PATH}/event/$target", message("$target", msgtype="m.text"))
+    endpoint.respond("PUT", f"{ROOM_PATH}/send/m.room.message/big-edit", {"event_id": "$edit"})
+
+    event_id = await events.edit(ROOM, "$target", body, transaction_id="big-edit")
+
+    assert event_id == "$edit"
+    sent = endpoint.requests[-1]["body"]
+    assert "format" not in sent
+    assert "formatted_body" not in sent
+    assert sent["m.new_content"] == {"msgtype": "m.text", "body": body}
+
+
 async def test_redact_checks_sender_and_sends_reason_without_encryption_lookup(
     matrix: tuple[MatrixEvents, MatrixEndpoint],
 ) -> None:

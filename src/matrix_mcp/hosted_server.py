@@ -156,8 +156,9 @@ class HostedMatrixTools:
     ) -> dict[str, str]:
         """Send plaintext as the connected user, with optional thread and explicit mentions.
 
-        The encryption preflight is best effort. A room enabling encryption between
-        the check and send can receive plaintext. Do not use where E2EE is required.
+        Markdown text is rendered to Matrix HTML. The encryption preflight is best effort.
+        A room enabling encryption between the check and send can receive plaintext.
+        Do not use where E2EE is required.
         """
         async with self.client() as client:
             return {

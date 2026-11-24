@@ -134,7 +134,10 @@ class ConversationTools:
         body: Annotated[str, Field(min_length=1)],
         transaction_id: TransactionID | None = None,
     ) -> EventActionResult:
-        """Reply as the connected user only when the user explicitly requests a reply."""
+        """Reply as the connected user only when the user explicitly requests a reply.
+
+        Markdown text is rendered to Matrix HTML.
+        """
         async with self.client() as client:
             result = await client.events.reply(
                 room_id,
@@ -168,7 +171,10 @@ class ConversationTools:
         body: Annotated[str, Field(min_length=1)],
         transaction_id: TransactionID | None = None,
     ) -> EventActionResult:
-        """Edit an owned message only when the user explicitly requests that change."""
+        """Edit an owned message only when the user explicitly requests that change.
+
+        Markdown text is rendered to Matrix HTML.
+        """
         async with self.client() as client:
             result = await client.events.edit(
                 room_id,
