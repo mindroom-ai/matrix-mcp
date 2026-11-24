@@ -110,12 +110,16 @@ def test_markdown_constructs_render_to_html(body: str, expected: str) -> None:
             '<p><a href="matrix:u/alice:example.com">ok</a></p>',
         ),
         (
-            "[x](mxc://example.com/abc)",
-            "<p>x</p>",
+            "Download [the report](mxc://example.org/report123)",
+            "<p>Download the report (mxc://example.org/report123)</p>",
         ),
         (
-            "<mxc://example.com/abc>",
-            "<p>mxc://example.com/abc</p>",
+            "<mxc://example.org/report123>",
+            "<p>mxc://example.org/report123</p>",
+        ),
+        (
+            "[](mxc://example.org/report123)",
+            "<p>mxc://example.org/report123</p>",
         ),
         (
             "![photo](mxc://example.com/abc)",
@@ -126,12 +130,28 @@ def test_markdown_constructs_render_to_html(body: str, expected: str) -> None:
             '<p><img src="mxc://example.org/plot" alt="Use curl here" /></p>',
         ),
         (
+            "![Sales &amp; Marketing](mxc://example.org/chart)",
+            '<p><img src="mxc://example.org/chart" alt="Sales &amp; Marketing" /></p>',
+        ),
+        (
+            r"![C\+\+ logo](mxc://example.org/logo)",
+            '<p><img src="mxc://example.org/logo" alt="C++ logo" /></p>',
+        ),
+        (
             "![plot](https://example.com/plot.png)",
             '<p><a href="https://example.com/plot.png">plot</a></p>',
         ),
         (
             "![Use `curl` here](https://example.org/plot.png)",
             '<p><a href="https://example.org/plot.png">Use curl here</a></p>',
+        ),
+        (
+            "![Sales &amp; Marketing](https://example.org/chart.png)",
+            '<p><a href="https://example.org/chart.png">Sales &amp; Marketing</a></p>',
+        ),
+        (
+            r"![C\+\+ logo](https://example.org/logo.png)",
+            '<p><a href="https://example.org/logo.png">C++ logo</a></p>',
         ),
         (
             "![](https://example.com/plot.png)",
@@ -143,7 +163,7 @@ def test_markdown_constructs_render_to_html(body: str, expected: str) -> None:
         ),
         (
             "[![badge](https://example.com/badge.svg)](mxc://example.com/abc)",
-            '<p><a href="https://example.com/badge.svg">badge</a></p>',
+            '<p><a href="https://example.com/badge.svg">badge</a> (mxc://example.com/abc)</p>',
         ),
         (
             "![pic](ftp://example.com/pic.png)",
@@ -398,3 +418,14 @@ def test_build_edit_message_content_drops_html_from_both_payloads_when_oversized
         "m.relates_to": {"rel_type": "m.replace", "event_id": "$target"},
     }
     assert _megolm_encrypted_event_bytes(edit) < 65_536
+
+
+def test_render_markdown_html_short_circuits_oversized_body_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_parse(*_args: object, **_kwargs: object) -> object:
+        msg = "Markdown parser must not run on bodies exceeding the size budget"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("matrix_mcp.matrix_formatting._MARKDOWN.parse", fail_parse)
+    assert render_markdown_html("_a" * 30_000) is None

@@ -40,7 +40,7 @@ def _normalize_url_prefix(url: str) -> str:
 def _image_alt_text(tokens: Sequence[Token] | None) -> str:
     parts: list[str] = []
     for token in tokens or ():
-        if token.type in {"text", "code_inline"}:
+        if token.type in {"text", "text_special", "code_inline"}:
             parts.append(token.content)
         elif token.type in {"softbreak", "hardbreak"}:
             parts.append("\n")
@@ -70,6 +70,24 @@ def _render_matrix_image(
     return label
 
 
+def _collect_suppressed_run(
+    tokens: Sequence[Token],
+    run: Sequence[tuple[int, int, int]],
+    pattern: re.Pattern[str],
+    suppressed: set[int],
+) -> None:
+    joined = "".join(tokens[i].content for i, _, _ in run)
+    run_idx = 0
+    for match in pattern.finditer(joined):
+        m_start, m_end = match.span()
+        while run_idx < len(run) and run[run_idx][2] <= m_start:
+            run_idx += 1
+        scan = run_idx
+        while scan < len(run) and run[scan][1] < m_end:
+            suppressed.add(run[scan][0])
+            scan += 1
+
+
 def _suppress_mention_delimiters(state: StateInline) -> None:
     pattern = state.env.get("mention_pattern")
     if not isinstance(pattern, re.Pattern) or not state.delimiters:
@@ -88,10 +106,7 @@ def _suppress_mention_delimiters(state: StateInline) -> None:
                 run.append((idx, offset, end))
                 offset = end
                 idx += 1
-            joined = "".join(tokens[i].content for i, _, _ in run)
-            for match in pattern.finditer(joined):
-                m_start, m_end = match.span()
-                suppressed.update(i for i, start, end in run if start < m_end and end > m_start)
+            _collect_suppressed_run(tokens, run, pattern, suppressed)
             continue
         if token.type == "link_open":
             link_depth += 1
@@ -122,6 +137,8 @@ _MARKDOWN = _build_markdown_parser()
 
 def render_markdown_html(body: str, *, mentions: Sequence[str] | None = None) -> str | None:
     """Render Markdown to Matrix HTML, returning None for pure plain text."""
+    if len(body.encode("utf-8")) > _MAX_FORMATTED_CONTENT_BYTES:
+        return None
     pattern = _compile_mention_pattern(mentions)
     env: dict[str, Any] = {"mention_pattern": pattern} if pattern is not None else {}
     tokens = _MARKDOWN.parse(body, env)
@@ -206,22 +223,34 @@ def _rewrite_inline_tokens(tokens: Sequence[Token], pattern: re.Pattern[str] | N
             token.children = _rewrite_inline_children(token.children, pattern)
 
 
+def _append_unwrapped_mxc_href(updated: list[Token], start_idx: int, href: str) -> None:
+    label_text = _image_alt_text(updated[start_idx:]).strip()
+    if not label_text:
+        updated.append(Token("text", "", 0, content=href))
+    elif label_text != href:
+        updated.append(Token("text", "", 0, content=f" ({href})"))
+
+
 def _rewrite_inline_children(
     children: Sequence[Token], pattern: re.Pattern[str] | None
 ) -> list[Token]:
-    unwrap_stack: list[bool] = []
+    unwrap_stack: list[tuple[bool, str, int]] = []
     link_depth = 0
     updated: list[Token] = []
     for child in children:
         if child.type == "link_open":
-            href = child.attrGet("href")
-            is_mxc = isinstance(href, str) and _normalize_url_prefix(href).startswith("mxc://")
-            unwrap_stack.append(is_mxc)
+            raw_href = child.attrGet("href")
+            href = raw_href if isinstance(raw_href, str) else ""
+            is_mxc = bool(href) and _normalize_url_prefix(href).startswith("mxc://")
+            unwrap_stack.append((is_mxc, href, len(updated)))
             if not is_mxc:
                 link_depth += 1
                 updated.append(child)
-        elif child.type == "link_close":
-            if unwrap_stack and not unwrap_stack.pop():
+        elif child.type == "link_close" and unwrap_stack:
+            is_mxc, href, start_idx = unwrap_stack.pop()
+            if is_mxc:
+                _append_unwrapped_mxc_href(updated, start_idx, href)
+            else:
                 link_depth = max(0, link_depth - 1)
                 updated.append(child)
         elif child.type == "image":
