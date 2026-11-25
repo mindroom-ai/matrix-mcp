@@ -1381,6 +1381,20 @@ async def test_search_without_room_events_is_an_empty_page(
     assert page.results == []
 
 
+async def test_search_treats_an_empty_next_batch_as_the_last_page(
+    matrix: tuple[MatrixEvents, MatrixEndpoint],
+) -> None:
+    events, endpoint = matrix
+    hit = {"result": {**message("$a"), "room_id": ROOM}}
+    endpoint.respond(
+        "POST",
+        SEARCH_PATH,
+        {"search_categories": {"room_events": {"results": [hit], "next_batch": ""}}},
+    )
+    page = await events.search("hello", room_id=ROOM)
+    assert (len(page.results), page.next_batch) == (1, None)
+
+
 async def test_search_falls_back_to_requested_room_and_rejects_missing_rooms(
     matrix: tuple[MatrixEvents, MatrixEndpoint],
 ) -> None:

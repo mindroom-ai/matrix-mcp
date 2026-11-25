@@ -355,7 +355,9 @@ class MatrixEvents:
         return SearchPage(
             results=results,
             count=_optional_integer(room_events.get("count")),
-            next_batch=_optional_string_field(room_events, "next_batch"),
+            next_batch=None
+            if room_events.get("next_batch") == ""
+            else _optional_string_field(room_events, "next_batch"),
         )
 
     async def threads(
