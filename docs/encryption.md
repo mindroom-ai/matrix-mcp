@@ -33,6 +33,25 @@ To read them, export your room keys from another Matrix client to a passphrase-p
 matrix-mcp e2ee import-keys element-keys.txt
 ```
 
+## Verifying the Device
+
+If your account has cross-signing and secret storage (the recovery key or passphrase other clients ask for), sign the device with your self-signing key:
+
+```bash
+matrix-mcp e2ee verify
+```
+
+It prompts for the recovery key; pass `--passphrase` to use the secret storage passphrase instead.
+Your other clients then list the device as verified.
+
+Without the recovery key, compare emoji with another verified client instead:
+
+```bash
+matrix-mcp e2ee verify --emoji
+```
+
+While it waits, open the session list in the other client, select the Matrix MCP device, and choose to verify it; confirm in the terminal when both show the same emoji.
+
 ## Encrypted Direct Chats and Search
 
 `matrix_create_dm` with `encrypted=true` opens an end-to-end encrypted direct chat.
@@ -65,7 +84,7 @@ Remove it from your session list in another client if you no longer need it.
 
 ## Limitations
 
-- The device is not verified, so other clients list it as an unverified session. Clients set to withhold keys from unverified devices will not share room keys with it.
+- Until `matrix-mcp e2ee verify` runs, the device is not verified, so other clients list it as an unverified session. Clients set to withhold keys from unverified devices will not share room keys with it.
 - Matrix MCP does not verify other devices either, so it trusts the homeserver to name the sender of each message.
 - Room keys go to joined members and, unless the room's history visibility is `joined`, to invited members, so people can read what was sent while their invitation was pending; if the invited members cannot be looked up, the message is not sent. Users invited by other clients after a message was sent cannot read it.
 - A message is not sent when its room key fails to reach a device that should get it. Devices that cannot be reached at all, such as devices out of one-time keys or on an unreachable server, are skipped, as in other clients.

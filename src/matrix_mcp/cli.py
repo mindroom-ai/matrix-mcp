@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import shutil
 import subprocess
+import threading
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -15,6 +17,7 @@ if TYPE_CHECKING:
     from matrix_mcp.config import MatrixMCPConfig
     from matrix_mcp.e2ee import E2EEStatus
     from matrix_mcp.http_headers import HTTPHeaderConfig
+    from matrix_mcp.sas_verification import SasVerification
 
 _E2EE_LOCK_TIMEOUT_SECONDS = 60.0
 
@@ -378,6 +381,97 @@ def e2ee_import_keys(
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"Imported room keys from {file}")
+
+
+@e2ee_app.command("verify")
+def e2ee_verify(
+    use_passphrase: bool = typer.Option(
+        False,
+        "--passphrase",
+        help="Unlock secret storage with its passphrase instead of the recovery key",
+    ),
+    emoji: bool = typer.Option(
+        False,
+        "--emoji",
+        help="Compare emoji with another of your verified devices instead of using secret storage",
+    ),
+    config: Path | None = typer.Option(None, "--config", help="Config file to read"),
+) -> None:
+    """Verify this device with the account's cross-signing key from secret storage."""
+    from matrix_mcp.e2ee import MatrixE2EE
+
+    settings = _load_credentials(config)
+    if emoji:
+        _verify_with_emoji(settings)
+        return
+    secret = typer.prompt(
+        "Secret storage passphrase" if use_passphrase else "Recovery key", hide_input=True
+    )
+    credentials = {"passphrase": secret} if use_passphrase else {"recovery_key": secret}
+    try:
+        result = asyncio.run(MatrixE2EE(settings).verify_device(**credentials))
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    if result.already_signed:
+        typer.echo(f"Device {result.device_id} is already verified")
+        return
+    typer.echo(
+        f"Verified device {result.device_id} with self-signing key {result.self_signing_key}"
+    )
+
+
+def _verify_with_emoji(settings: MatrixMCPConfig) -> None:
+    from matrix_mcp.e2ee import MatrixE2EE
+
+    async def confirm(verification: SasVerification) -> bool:
+        typer.echo("  ".join(f"{symbol} {name}" for symbol, name in verification.emoji))
+        if verification.decimals is not None:
+            typer.echo(" ".join(str(number) for number in verification.decimals))
+        return await _ask("Does the other device show the same emoji, in the same order?")
+
+    typer.echo(
+        f"Waiting for a verification request for device {settings.device_id}. In another "
+        "verified client of this account, open the session list, select this device, and "
+        "choose Verify."
+    )
+    try:
+        result = asyncio.run(MatrixE2EE(settings).verify_with_device(confirm, typer.echo))
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    if not result.signed:
+        typer.echo(
+            f"Verified with device {result.verified_by}, but it has not signed this device "
+            "yet; check the session list there"
+        )
+        return
+    typer.echo(f"Device {settings.device_id} verified by device {result.verified_by}")
+
+
+async def _ask(question: str) -> bool:
+    loop = asyncio.get_running_loop()
+    answer: asyncio.Future[bool] = loop.create_future()
+
+    def settle(result: bool | None, error: BaseException | None) -> None:
+        if answer.done():
+            return
+        if error is not None:
+            answer.set_exception(error)
+            return
+        answer.set_result(bool(result))
+
+    def ask() -> None:
+        try:
+            result: bool | None = typer.confirm(question)
+            error: BaseException | None = None
+        except Exception as exc:  # noqa: BLE001
+            result, error = None, exc
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(settle, result, error)
+
+    threading.Thread(target=ask, daemon=True).start()
+    return await answer
 
 
 def _setup_e2ee(config: MatrixMCPConfig) -> None:

@@ -14,7 +14,9 @@ import logging
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import quote
 
 from aiohttp import ClientError
 from filelock import AsyncFileLock, Timeout
@@ -28,6 +30,8 @@ from nio import (
     ShareGroupSessionResponse,
     SyncResponse,
     ToDeviceEvent,
+    ToDeviceMessage,
+    ToDeviceResponse,
     WhoamiResponse,
 )
 from nio.exceptions import EncryptionError
@@ -35,12 +39,36 @@ from nio.rooms import MatrixRoom
 from peewee import PeeweeException
 
 from matrix_mcp.config import default_config_path
+from matrix_mcp.cross_signing import (
+    SELF_SIGNING_SECRET,
+    SecretStorageError,
+    check_key,
+    decode_recovery_key,
+    decrypt_secret,
+    passphrase_key,
+    public_key,
+    sign_json,
+    signature_is_valid,
+    signing_key,
+)
 from matrix_mcp.http_headers import resolve_http_headers
-from matrix_mcp.matrix_http import MatrixHTTP, quote_matrix_id, uncached_sync_filter
+from matrix_mcp.matrix_http import (
+    MatrixHTTP,
+    MatrixHTTPError,
+    quote_matrix_id,
+    uncached_sync_filter,
+)
+from matrix_mcp.sas_verification import (
+    MISMATCHED_SAS,
+    SAS_METHOD,
+    UNEXPECTED_MESSAGE,
+    SasVerification,
+    VerificationCancelledError,
+)
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Awaitable, Callable, Iterable
     from pathlib import Path
 
     from nio.crypto import Olm
@@ -63,6 +91,10 @@ _MAX_CATCH_UP_SYNCS = 10
 _LOCK_TIMEOUT_SECONDS = 60.0
 _REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_RETRIES = 3
+_VERIFICATION_TIMEOUT_SECONDS = 300.0
+_VERIFICATION_POLL_MILLISECONDS = 10_000
+_SIGNATURE_CHECKS = 5
+_SIGNATURE_CHECK_INTERVAL_SECONDS = 2.0
 _DEDICATED_DEVICE_HINT = (
     "log in with `matrix-mcp auth sso` or `matrix-mcp auth password` to create a dedicated device"
 )
@@ -104,6 +136,19 @@ class E2EEStatus:
     store_path: Path
 
 
+@dataclass(frozen=True)
+class InteractiveVerification:
+    verified_by: str
+    signed: bool
+
+
+@dataclass(frozen=True)
+class DeviceVerification:
+    device_id: str
+    self_signing_key: str
+    already_signed: bool
+
+
 class RoomCrypto(Protocol):
     async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent: ...
 
@@ -137,6 +182,7 @@ class MatrixE2EE:
         self._client: AsyncClient | None = None
         self._file_lock: AsyncFileLock | None = None
         self._error: E2EEUnavailableError | None = None
+        self._verification_backlog: list[tuple[str, dict[str, Any]]] | None = None
 
     @property
     def store_path(self) -> Path:
@@ -165,6 +211,290 @@ class MatrixE2EE:
                 raise ValueError(msg) from exc
         finally:
             await self.aclose()
+
+    async def verify_device(
+        self, *, recovery_key: str | None = None, passphrase: str | None = None
+    ) -> DeviceVerification:
+        """Sign this device with the account's self-signing key from secret storage.
+
+        Other clients of the account then trust the device, as after an interactive
+        verification. Secret storage is unlocked with its recovery key or passphrase.
+        """
+        if (recovery_key is None) == (passphrase is None):
+            msg = "Give either the recovery key or the passphrase"
+            raise ValueError(msg)
+        try:
+            client = await self._session()
+            key_id, key_description = await self._default_secret_storage_key()
+            if recovery_key is not None:
+                key = decode_recovery_key(recovery_key)
+            else:
+                key = passphrase_key(passphrase or "", key_description)
+            check_key(key, key_description)
+            self_signing = signing_key(await self._secret(SELF_SIGNING_SECRET, key_id, key))
+            self_signing_id = public_key(self_signing)
+            device = await self._published_device(self_signing_id)
+            if not self._lists_our_keys(client, device):
+                msg = "The homeserver lists other encryption keys for this device; not signing them"
+                raise RuntimeError(msg)
+            if signature_is_valid(device, self._user_id, self_signing_id):
+                return DeviceVerification(self._device_id, self_signing_id, already_signed=True)
+            signed = sign_json(device, self_signing, self._user_id)
+            response = await self._http.json(
+                "POST",
+                "/_matrix/client/v3/keys/signatures/upload",
+                body={self._user_id: {self._device_id: signed}},
+            )
+            if response.get("failures"):
+                msg = "The homeserver rejected this device's signature"
+                raise RuntimeError(msg)
+            return DeviceVerification(self._device_id, self_signing_id, already_signed=False)
+        finally:
+            await self.aclose()
+
+    async def verify_with_device(
+        self,
+        confirm: Callable[[SasVerification], Awaitable[bool]],
+        notify: Callable[[str], None],
+        *,
+        max_wait: float = _VERIFICATION_TIMEOUT_SECONDS,
+    ) -> InteractiveVerification:
+        """Answer an emoji verification started from another of the user's devices.
+
+        That device then signs this one with the account's self-signing key, if it holds it.
+        """
+        self._verification_backlog = []
+        try:
+            client = await self._session()
+            try:
+                async with asyncio.timeout(max_wait):
+                    verification = await self._run_verification(client, confirm, notify)
+            except TimeoutError as exc:
+                msg = "No verification finished in time; start it again from the other device"
+                raise RuntimeError(msg) from exc
+            signed = await self._wait_for_self_signature(client)
+            return InteractiveVerification(verification.their_device_id, signed=signed)
+        finally:
+            self._verification_backlog = None
+            await self.aclose()
+
+    async def _run_verification(
+        self,
+        client: AsyncClient,
+        confirm: Callable[[SasVerification], Awaitable[bool]],
+        notify: Callable[[str], None],
+    ) -> SasVerification:
+        store = client.store
+        if store is None:
+            msg = "End-to-end encryption store is not loaded"
+            raise E2EEUnavailableError(msg)
+        since = store.load_sync_token()
+        events = list(self._verification_backlog or [])
+        verification: SasVerification | None = None
+        their_done = done_sent = False
+        while True:
+            for event_type, content in events:
+                if event_type == "m.key.verification.request" and verification is None:
+                    verification = await self._answer_request(client, content, notify)
+                    continue
+                if verification is None or content.get("transaction_id") != (
+                    verification.transaction_id
+                ):
+                    continue
+                their_done = (
+                    await self._step_or_cancel(client, verification, event_type, content, confirm)
+                    or their_done
+                )
+            if since is not None:
+                store.save_sync_token(since)
+            if verification is not None and verification.finished and not done_sent:
+                await _send_verification(
+                    client, verification, "m.key.verification.done", verification.done()
+                )
+                done_sent = True
+            if verification is not None and done_sent and their_done:
+                return verification
+            response = await client.sync(
+                timeout=_VERIFICATION_POLL_MILLISECONDS,
+                since=since,
+                sync_filter=uncached_sync_filter(_CATCH_UP_FILTER),
+                set_presence="offline",
+            )
+            if not isinstance(response, SyncResponse):
+                msg = "Matrix sync failed during the verification"
+                raise RuntimeError(msg)  # noqa: TRY004
+            since = response.next_batch
+            events = self._verification_events(response)
+
+    def _verification_events(self, response: SyncResponse) -> list[tuple[str, dict[str, Any]]]:
+        events = []
+        for event in response.to_device_events:
+            source = getattr(event, "source", None)
+            if not isinstance(source, dict) or source.get("sender") != self._user_id:
+                continue
+            event_type, content = source.get("type"), source.get("content")
+            if isinstance(event_type, str) and event_type.startswith("m.key.verification."):
+                events.append((event_type, content if isinstance(content, dict) else {}))
+        return events
+
+    async def _answer_request(
+        self, client: AsyncClient, content: dict[str, Any], notify: Callable[[str], None]
+    ) -> SasVerification | None:
+        from_device, transaction_id = content.get("from_device"), content.get("transaction_id")
+        if not isinstance(from_device, str) or not isinstance(transaction_id, str):
+            return None
+        methods = content.get("methods")
+        if not isinstance(methods, list) or SAS_METHOD not in methods:
+            notify(f"Ignored a request from device {from_device}: it does not offer emoji")
+            return None
+        olm = _olm(client)
+        olm.users_for_key_query.add(self._user_id)
+        keys = await client.keys_query()
+        if not isinstance(keys, KeysQueryResponse) or keys.failures:
+            msg = "Matrix key query failed; cannot look up the requesting device"
+            raise RuntimeError(msg)
+        device = next(
+            (d for d in olm.device_store.active_user_devices(self._user_id) if d.id == from_device),
+            None,
+        )
+        if device is None:
+            notify(f"Ignored a request from unknown device {from_device}")
+            return None
+        verification = SasVerification(
+            user_id=self._user_id,
+            device_id=self._device_id,
+            device_key=olm.account.identity_keys["ed25519"],
+            their_device_id=from_device,
+            their_device_key=device.ed25519,
+            transaction_id=transaction_id,
+        )
+        await _send_verification(
+            client, verification, "m.key.verification.ready", verification.ready()
+        )
+        notify(f"Verification requested by device {from_device}; choose emoji verification there")
+        return verification
+
+    async def _step_or_cancel(
+        self,
+        client: AsyncClient,
+        verification: SasVerification,
+        event_type: str,
+        content: dict[str, Any],
+        confirm: Callable[[SasVerification], Awaitable[bool]],
+    ) -> bool:
+        try:
+            return await self._verification_step(client, verification, event_type, content, confirm)
+        except VerificationCancelledError as exc:
+            await _send_verification(
+                client,
+                verification,
+                "m.key.verification.cancel",
+                {
+                    "transaction_id": verification.transaction_id,
+                    "code": exc.code,
+                    "reason": exc.reason,
+                },
+            )
+            raise
+
+    async def _verification_step(
+        self,
+        client: AsyncClient,
+        verification: SasVerification,
+        event_type: str,
+        content: dict[str, Any],
+        confirm: Callable[[SasVerification], Awaitable[bool]],
+    ) -> bool:
+        if event_type == "m.key.verification.cancel":
+            msg = f"The other device cancelled the verification: {content.get('reason')}"
+            raise RuntimeError(msg)
+        if event_type == "m.key.verification.start":
+            accept = verification.receive_start(content)
+            await _send_verification(client, verification, "m.key.verification.accept", accept)
+        elif event_type == "m.key.verification.key":
+            key = verification.receive_key(content)
+            await _send_verification(client, verification, "m.key.verification.key", key)
+            if not await confirm(verification):
+                raise VerificationCancelledError(*MISMATCHED_SAS)
+            mac = verification.confirm()
+            await _send_verification(client, verification, "m.key.verification.mac", mac)
+        elif event_type == "m.key.verification.mac":
+            verification.receive_mac(content)
+        elif event_type != "m.key.verification.done":
+            raise VerificationCancelledError(*UNEXPECTED_MESSAGE)
+        return event_type == "m.key.verification.done"
+
+    async def _wait_for_self_signature(self, client: AsyncClient) -> bool:
+        for _ in range(_SIGNATURE_CHECKS):
+            response = await self._http.json(
+                "POST", "/_matrix/client/v3/keys/query", body={"device_keys": {self._user_id: []}}
+            )
+            ssk = response.get("self_signing_keys", {}).get(self._user_id, {}).get("keys", {})
+            device = response.get("device_keys", {}).get(self._user_id, {}).get(self._device_id)
+            if (
+                isinstance(device, dict)
+                and self._lists_our_keys(client, device)
+                and any(
+                    key_id == f"ed25519:{key}" and signature_is_valid(device, self._user_id, key)
+                    for key_id, key in ssk.items()
+                )
+            ):
+                return True
+            await asyncio.sleep(_SIGNATURE_CHECK_INTERVAL_SECONDS)
+        return False
+
+    def _lists_our_keys(self, client: AsyncClient, device: dict[str, Any]) -> bool:
+        keys = device.get("keys", {})
+        ours = _olm(client).account.identity_keys
+        return bool(
+            keys.get(f"ed25519:{self._device_id}") == ours["ed25519"]
+            and keys.get(f"curve25519:{self._device_id}") == ours["curve25519"]
+        )
+
+    async def _default_secret_storage_key(self) -> tuple[str, dict[str, Any]]:
+        default = await self._account_data("m.secret_storage.default_key")
+        key_id = (default or {}).get("key")
+        if not isinstance(key_id, str) or not key_id:
+            msg = "This account has no secret storage; set up recovery in another Matrix client"
+            raise SecretStorageError(msg)
+        description = await self._account_data(f"m.secret_storage.key.{key_id}")
+        if description is None:
+            msg = "The default secret storage key is missing from the account"
+            raise SecretStorageError(msg)
+        return key_id, description
+
+    async def _secret(self, name: str, key_id: str, key: bytes) -> str:
+        stored = await self._account_data(name)
+        encrypted = (stored or {}).get("encrypted", {})
+        if not isinstance(encrypted, dict) or not isinstance(encrypted.get(key_id), dict):
+            msg = f"Secret storage holds no {name} secret; set up cross-signing in another client"
+            raise SecretStorageError(msg)
+        return decrypt_secret(key, name, encrypted[key_id])
+
+    async def _account_data(self, event_type: str) -> dict[str, Any] | None:
+        user = quote_matrix_id(self._user_id, sigil="@", label="user ID")
+        try:
+            return await self._http.json(
+                "GET", f"/_matrix/client/v3/user/{user}/account_data/{quote(event_type, safe='')}"
+            )
+        except MatrixHTTPError as exc:
+            if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
+                return None
+            raise
+
+    async def _published_device(self, self_signing_id: str) -> dict[str, Any]:
+        response = await self._http.json(
+            "POST", "/_matrix/client/v3/keys/query", body={"device_keys": {self._user_id: []}}
+        )
+        published = response.get("self_signing_keys", {}).get(self._user_id, {}).get("keys", {})
+        if published.get(f"ed25519:{self_signing_id}") != self_signing_id:
+            msg = "The self-signing key in secret storage is not the account's published one"
+            raise SecretStorageError(msg)
+        device = response.get("device_keys", {}).get(self._user_id, {}).get(self._device_id)
+        if not isinstance(device, dict):
+            msg = "The homeserver does not list this device's encryption keys"
+            raise RuntimeError(msg)  # noqa: TRY004
+        return device
 
     async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
         try:
@@ -300,7 +630,7 @@ class MatrixE2EE:
             client = self._new_client(path)
             await self._check_device_identity(client)
             await _upload_keys(client)
-            await _catch_up(client)
+            await _catch_up(client, self._keep_verification_events)
             await _upload_keys(client)
             await _send_queued_to_device(client)
         except BaseException as exc:
@@ -392,7 +722,13 @@ class MatrixE2EE:
         if client.olm is None:
             msg = "End-to-end encryption support is not installed"
             raise E2EEUnavailableError(msg)
+        if self._verification_backlog is not None:
+            client.olm.handle_key_verification = _ignore_verification_event  # ty: ignore[invalid-assignment]
         return client
+
+    def _keep_verification_events(self, response: SyncResponse) -> None:
+        if self._verification_backlog is not None:
+            self._verification_backlog.extend(self._verification_events(response))
 
 
 async def _upload_keys(client: AsyncClient) -> None:
@@ -404,7 +740,9 @@ async def _upload_keys(client: AsyncClient) -> None:
         raise E2EEUnavailableError(msg)
 
 
-async def _catch_up(client: AsyncClient) -> None:
+async def _catch_up(
+    client: AsyncClient, on_sync: Callable[[SyncResponse], None] | None = None
+) -> None:
     """Receive queued room keys; the homeserver delivers to-device messages in batches.
 
     The sync token acknowledges the batch to the homeserver, so it is saved only after
@@ -431,6 +769,8 @@ async def _catch_up(client: AsyncClient) -> None:
         if not isinstance(response, SyncResponse):
             msg = "Matrix sync for end-to-end encryption keys failed"
             raise E2EEUnavailableError(msg)
+        if on_sync is not None:
+            on_sync(response)
         since = response.next_batch
         store.save_sync_token(since)
         # nio ignores a count of zero, which would stop one-time key uploads for good
@@ -454,6 +794,22 @@ async def _send_queued_to_device(client: AsyncClient) -> None:
         await client.send_to_device_messages()
     except (ClientError, TimeoutError):
         _LOGGER.info("Could not send queued Olm session repairs")
+
+
+async def _send_verification(
+    client: AsyncClient, verification: SasVerification, event_type: str, content: dict[str, Any]
+) -> None:
+    message = ToDeviceMessage(
+        event_type, verification.user_id, verification.their_device_id, content
+    )
+    response = await client.to_device(message)
+    if not isinstance(response, ToDeviceResponse):
+        msg = f"Could not send the {event_type} message"
+        raise RuntimeError(msg)  # noqa: TRY004
+
+
+def _ignore_verification_event(_event: object) -> None:
+    return None
 
 
 class _CryptoClient(AsyncClient):  # type: ignore[misc]  # nio ships no type stubs.

@@ -231,6 +231,7 @@ The [Tool Reference](usage.md) covers everything the agent can do.
 | `matrix-mcp auth logout` | Remove stored credentials and encryption keys |
 | `matrix-mcp e2ee setup` | Publish this device's encryption keys and show its fingerprint |
 | `matrix-mcp e2ee import-keys <file>` | Import room keys exported from another client |
+| `matrix-mcp e2ee verify [--emoji]` | Verify this device with the recovery key, passphrase, or emoji |
 | `matrix-mcp serve` | Run the MCP server (stdio by default) |
 | `matrix-mcp config-path` | Print where credentials are stored |
 
